@@ -103,10 +103,10 @@ def ODE(x: np.ndarray, u: np.ndarray, d: np.ndarray, p: np.ndarray):
                                 a[106] + a[107] - a[153] - a[110] - a[111] - a[109] +
                                 a[112] + a[119])
 
-    # 过去 24 小时内的平均冠层温度
-    dxdt[21] = (1. / 86400.) * x[4] - x[21]
+    # Average canopy temperature in last 24 hours
+    dxdt[21] = (1. / 86400.) * (x[4] - x[21])
 
-    # 缓冲池中的碳水化合物变化 [mg{CH2O} m^{-2} s^{-1}]
+    # Carbohydrates in the buffer [mg{CH2O} m^{-2} s^{-1}]
     dxdt[22] = a[200] - a[208] - a[206] - a[207] - a[209]
 
     # 叶片中的碳水化合物变化 [mg{CH2O} m^{-2} s^{-1}]

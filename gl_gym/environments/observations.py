@@ -146,7 +146,7 @@ class TimeObservations(BaseObservations):
     """
     def __init__(self, env) -> None:
         self.env = env
-        self.obs_names = ["timestep", "day of year sin", "day of year cos", "hour of day sin", "hour of day cos"]
+        self.obs_names = ["day of year sin", "day of year cos", "hour of day sin", "hour of day cos"]
         self.n_obs = len(self.obs_names)
 
     def observation_space(self):
@@ -164,7 +164,7 @@ class TimeObservations(BaseObservations):
         hour_of_day_sin = np.sin(2 * np.pi * self.env.hour_of_day / 24.0)
         hour_of_day_cos = np.cos(2 * np.pi * self.env.hour_of_day / 24.0)
 
-        return np.array([self.env.timestep, day_of_year_sin, day_of_year_cos, hour_of_day_sin, hour_of_day_cos])
+        return np.array([day_of_year_sin, day_of_year_cos, hour_of_day_sin, hour_of_day_cos])
 
 class WeatherForecastObservations(BaseObservations):
     """

@@ -17,34 +17,34 @@ def init_state(d0, rhMax=90, time_in_days=0):
     """
     state = np.zeros(28)
 
-    state[0] = d0[3]  # 空气 CO2 浓度 (co2Air)
-    state[1] = state[0]  # 顶部隔间 CO2 浓度 (co2Top)
-    state[2] = 16.5  # 空气温度 (tAir)
-    state[3] = state[2]  # 顶部温度 (tTop)
-    state[4] = state[2] + 4  # 冠层温度 (tCan)
-    state[5] = state[2]  # 内覆盖层温度 (tCovIn)
-    state[6] = state[2]  # 外覆盖层温度 (tCovE)
-    state[7] = state[2]  # 热遮阳网温度 (tThScr)
-    state[8] = state[2]  # 地面温度 (tFlr)
-    state[9] = state[2]  # 加热管道温度 (tPipe)
-    state[10] = state[2]  # 第 1 层土壤温度 (tSoil1)
-    state[11] = 0.25 * (3. * state[2] + d0[6])  # 第 2 层土壤温度 (tSoil2)
-    state[12] = 0.25 * (2. * state[2] + 2 * d0[6])  # 第 3 层土壤温度 (tSoil3)
-    state[13] = 0.25 * (state[2] + 3 * d0[6])  # 第 4 层土壤温度 (tSoil4)
-    state[14] = d0[6]  # 第 5 层土壤温度 (tSoil5)
-    state[15] = rhMax / 100. * satVp(state[2])  # 空气水蒸气压 (vpAir)
-    state[16] = state[15]  # 顶部水蒸气压 (vpTop)
-    state[17] = state[2]  # 灯具温度 (tLamp)
-    state[18] = state[2]  # 内部灯具温度 (tIntLamp)
-    state[19] = state[2]  # 生长管道温度 (tGroPipe)
-    state[20] = state[2]  # 黑体遮阳网温度 (tBlScr)
-    state[21] = state[4]  # 24小时平均冠层温度 (tCan24)
-    state[22] = 0.  # 碳水化合物缓冲库 (cBuf)
-    state[23] = 9.5283e4  # 叶片总碳量 (cLeaf)
-    state[24] = 2.5107e5  # 茎干总碳量 (cStem)
-    state[25] = 5.5338e4  # 果实总碳量 (cFruit)
-    state[26] = 3.0978e3  # 累计积温 (tCanSum)
-    state[27] = time_in_days  # 时间（天）
+    state[0] = d0[3]  # co2Air
+    state[1] = state[0]  # co2Top
+    state[2] = 18.5  # tAir
+    state[3] = state[2]  # tTop
+    state[4] = state[2] + 2  # tCan
+    state[5] = state[2]  # tCovIn
+    state[6] = state[2]  # tCovE
+    state[7] = state[2]  # tThScr
+    state[8] = state[2]  # tFlr
+    state[9] = state[2]  # tPipe
+    state[10] = state[2]  # tSoil1
+    state[11] = 0.25 * (3. * state[2] + d0[6])  # tSoil2
+    state[12] = 0.25 * (2. * state[2] + 2 * d0[6])  # tSoil3
+    state[13] = 0.25 * (state[2] + 3 * d0[6])  # tSoil4
+    state[14] = d0[6]  # tSoil5
+    state[15] = rhMax / 100. * satVp(state[2])  # vpAir
+    state[16] = state[15]  # vpTop
+    state[17] = state[2]  # tLamp
+    state[18] = state[2]  # tIntLamp
+    state[19] = state[2]  # tGroPipe
+    state[20] = state[2]  # tBlScr
+    state[21] = state[4]  # tCan24
+    state[22] = 1000.  # cBuf
+    state[23] = 26000.  # cLeaf
+    state[24] = 18000.  # cStem
+    state[25] = 0.  # cFruit
+    state[26] = 0.  # tCanSum
+    state[27] = time_in_days  # time
 
     return state
 

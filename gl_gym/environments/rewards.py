@@ -62,6 +62,7 @@ class GreenhouseReward(BaseReward):
             pen_weights: List[float],
             pen_lamp: float,
             dmfm: float,
+            include_fixed_costs_in_reward: bool = False,
     ) -> None:
         super(GreenhouseReward, self).__init__()
 
@@ -86,6 +87,11 @@ class GreenhouseReward(BaseReward):
         self.dmfm = dmfm  # 干鲜比转化系数
         self.pen_weights = np.array(pen_weights)  # 惩罚权重数组
         self.pen_lamp = pen_lamp  # 灯具违规惩罚值
+        self.include_fixed_costs_in_reward = include_fixed_costs_in_reward
+        self._obs_name_to_idx = {}
+        if hasattr(self.env, "get_obs_names"):
+            names = self.env.get_obs_names()
+            self._obs_name_to_idx = {name: idx for idx, name in enumerate(names)}
 
         # 初始化状态
         self._init_costs()
@@ -183,9 +189,14 @@ class GreenhouseReward(BaseReward):
         计算违反环境约束（温度、CO2、湿度）的绝对数值惩罚。
         对比环境观测值与预设的上下限。
         """
-        lowerbound = self.env.constraints_low[:] - self.env.obs[[0, 1, 2]]
+        co2_air = self._obs_value("co2_air", 0)
+        temp_air = self._obs_value("temp_air", 1)
+        rh_air = self._obs_value("rh_air", 2)
+        state_vec = np.array([co2_air, temp_air, rh_air], dtype=np.float32)
+
+        lowerbound = self.env.constraints_low[:] - state_vec
         lowerbound[lowerbound < 0] = 0
-        upperbound = self.env.obs[[0, 1, 2]] - self.env.constraints_high[:]
+        upperbound = state_vec - self.env.constraints_high[:]
         upperbound[upperbound < 0] = 0
 
         self.co2_violation = lowerbound[0] + upperbound[0]
@@ -207,6 +218,14 @@ class GreenhouseReward(BaseReward):
                 return
         self.lamp_violation = 0
 
+    def _obs_value(self, name: str, fallback_idx: int) -> float:
+        idx = self._obs_name_to_idx.get(name, fallback_idx)
+        obs = np.asarray(self.env.obs)
+        if obs.size == 0:
+            return 0.0
+        idx = min(max(int(idx), 0), obs.size - 1)
+        return float(obs[idx])
+
     def control_penalty(self):
         """返回控制违规的惩罚值"""
         self.control_violation()
@@ -222,6 +241,8 @@ class GreenhouseReward(BaseReward):
         self.variable_costs = self._variable_costs()
         self.gains = self._gains()
         self.profit = self.gains - self.variable_costs
+        if self.include_fixed_costs_in_reward:
+            self.profit -= self.fixed_costs
 
         violations = self.output_violations()
         self.penalty = self.output_penalty_reward(violations)

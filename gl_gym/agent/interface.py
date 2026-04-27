@@ -12,7 +12,8 @@ from collections import deque
 import numpy as np
 
 from gymnasium import spaces
-from gl_gym.common.utils import load_model_hyperparams, calculate_vpd_kpa
+from gl_gym.common.utils import load_model_hyperparams, calculate_vpd_kpa, calculate_dew_point_c
+from gl_gym.environments.utils import vaporPres2rh
 
 
 @dataclass
@@ -53,6 +54,16 @@ class GreenhouseState:
     co2_out: float  # 室外 CO2 浓度 (ppm)
     wind_speed: float  # 风速 (m/s)
     dli: float # 日累积光量 (MJ/m2)
+    dew_point_air: float
+    dew_margin_air: float
+    canopy_dew_margin: float
+    forecast_rad_mean_1h: float
+    forecast_rad_peak_2h: float
+    forecast_temp_out_delta_1h: float
+    forecast_rh_out_mean_1h: float
+    forecast_wind_peak_1h: float
+    forecast_humidity_risk: float
+    time_to_sunrise_steps: int
     
     # --- 强化学习反馈 ---
     reward: float = 0.0  # 当前步获得的奖励值
@@ -145,6 +156,72 @@ class GreenhouseAgentInterface:
             return self.env._get_obs()
         return np.zeros(30) # 兜底防止报错
 
+    def _get_future_weather_window(self, steps: int) -> np.ndarray:
+        env = self.env
+        if not hasattr(env, "weather_data") or not hasattr(env, "timestep"):
+            return np.empty((0, 0), dtype=float)
+
+        start = int(getattr(env, "timestep", 0)) + 1
+        end = min(start + max(int(steps), 0), len(env.weather_data))
+        if start >= end:
+            return np.empty((0, 0), dtype=float)
+        return np.asarray(env.weather_data[start:end], dtype=float)
+
+    def _compute_forecast_features(self) -> Dict[str, float]:
+        steps_per_hour = max(1, int(round(3600.0 / float(getattr(self.env, "dt", 900.0)))))
+        window_1h = self._get_future_weather_window(steps_per_hour)
+        window_2h = self._get_future_weather_window(2 * steps_per_hour)
+
+        current_rad = 0.0
+        if hasattr(self.env, "weather_data") and hasattr(self.env, "timestep"):
+            idx = int(getattr(self.env, "timestep", 0))
+            if 0 <= idx < len(self.env.weather_data):
+                current_rad = float(self.env.weather_data[idx, 0])
+
+        if window_1h.size == 0:
+            return {
+                "forecast_rad_mean_1h": current_rad,
+                "forecast_rad_peak_2h": current_rad,
+                "forecast_temp_out_delta_1h": 0.0,
+                "forecast_rh_out_mean_1h": 0.0,
+                "forecast_wind_peak_1h": 0.0,
+                "forecast_humidity_risk": 0.0,
+                "time_to_sunrise_steps": steps_per_hour,
+            }
+
+        rad_1h = window_1h[:, 0]
+        temp_1h = window_1h[:, 1]
+        rh_1h = vaporPres2rh(window_1h[:, 1], window_1h[:, 2])
+        wind_1h = window_1h[:, 4]
+
+        rad_2h = window_2h[:, 0] if window_2h.size else rad_1h
+        sunrise_steps = steps_per_hour
+        sunrise_candidates = np.where(rad_2h >= 20.0)[0]
+        if sunrise_candidates.size > 0:
+            sunrise_steps = int(sunrise_candidates[0]) + 1
+
+        rad_mean = float(np.mean(rad_1h))
+        rad_peak = float(np.max(rad_2h))
+        rh_mean = float(np.mean(rh_1h))
+        wind_peak = float(np.max(wind_1h))
+        temp_delta = float(temp_1h[-1] - temp_1h[0]) if len(temp_1h) > 1 else 0.0
+
+        humidity_risk = 0.0
+        humidity_risk += np.clip((rh_mean - 82.0) / 12.0, 0.0, 1.0) * 0.55
+        humidity_risk += np.clip((8.0 - rad_mean) / 8.0, 0.0, 1.0) * 0.20
+        humidity_risk += np.clip((6.0 - temp_1h[0]) / 10.0, 0.0, 1.0) * 0.15
+        humidity_risk += np.clip((2.0 - wind_peak) / 2.0, 0.0, 1.0) * 0.10
+
+        return {
+            "forecast_rad_mean_1h": rad_mean,
+            "forecast_rad_peak_2h": rad_peak,
+            "forecast_temp_out_delta_1h": temp_delta,
+            "forecast_rh_out_mean_1h": rh_mean,
+            "forecast_wind_peak_1h": wind_peak,
+            "forecast_humidity_risk": float(np.clip(humidity_risk, 0.0, 1.0)),
+            "time_to_sunrise_steps": sunrise_steps,
+        }
+
     def get_state(self) -> GreenhouseState:
         """
         获取当前完整的结构化状态。
@@ -160,18 +237,26 @@ class GreenhouseAgentInterface:
                     return float(obs[idx])
             return default
 
+        forecast_features = self._compute_forecast_features()
+        temp_air = _get_obs_value("temp_air", 20)
+        rh_air = _get_obs_value("rh_air", 70)
+        canopy_temp = _get_obs_value("24CanTemp", 20)
+        dew_point_air = float(calculate_dew_point_c(temp_air, rh_air))
+        dew_margin_air = float(temp_air - dew_point_air)
+        canopy_dew_margin = float(canopy_temp - dew_point_air)
+
         state = GreenhouseState(
             timestep=getattr(self.env, 'timestep', 0),
             day_of_year=getattr(self.env, 'day_of_year', 0),
             hour_of_day=getattr(self.env, 'hour_of_day', 0),
             
             co2_air=_get_obs_value("co2_air", 400),
-            temp_air=_get_obs_value("temp_air", 20),
-            rh_air=_get_obs_value("rh_air", 70),
+            temp_air=temp_air,
+            rh_air=rh_air,
             pipe_temp=_get_obs_value("pipe_temp", 40),
             
-            fruit_weight=_get_obs_value("cFruit", 0),
-            canopy_temp_24h=_get_obs_value("24CanTemp", 20),
+            fruit_weight=_get_obs_value("cFruit", 0) * 1e-6, # mg/m2 -> kg/m2
+            canopy_temp_24h=canopy_temp,
             temperature_sum=_get_obs_value("tSum", 0),
             
             # 获取上一时刻的动作状态 (环境通常会记录在 env.u 中)
@@ -188,6 +273,16 @@ class GreenhouseAgentInterface:
             co2_out=_get_obs_value("co2_out", 400),
             wind_speed=_get_obs_value("wind_speed", 3),
             dli=_get_obs_value("dli", 0),
+            dew_point_air=dew_point_air,
+            dew_margin_air=dew_margin_air,
+            canopy_dew_margin=canopy_dew_margin,
+            forecast_rad_mean_1h=forecast_features["forecast_rad_mean_1h"],
+            forecast_rad_peak_2h=forecast_features["forecast_rad_peak_2h"],
+            forecast_temp_out_delta_1h=forecast_features["forecast_temp_out_delta_1h"],
+            forecast_rh_out_mean_1h=forecast_features["forecast_rh_out_mean_1h"],
+            forecast_wind_peak_1h=forecast_features["forecast_wind_peak_1h"],
+            forecast_humidity_risk=forecast_features["forecast_humidity_risk"],
+            time_to_sunrise_steps=int(forecast_features["time_to_sunrise_steps"]),
             
             reward=self.last_reward,
             terminated=self.last_terminated,
@@ -220,38 +315,25 @@ class GreenhouseAgentInterface:
             return "基本恒定 (热平衡)"
 
     def _get_forecast_summary(self) -> str:
-        """获取未来 1 小时天气预报摘要"""
-        obs = self._get_current_obs()
-        
-        def val(name):
-            idx = self._obs_name_to_index.get(name)
-            return float(obs[idx]) if idx is not None and idx < len(obs) else None
+        """获取未来 1 小时 (4步) 天气预报数据"""
+        forecast = self._compute_forecast_features()
+        rad_mean = forecast["forecast_rad_mean_1h"]
+        rad_peak = forecast["forecast_rad_peak_2h"]
+        temp_delta = forecast["forecast_temp_out_delta_1h"]
+        rh_mean = forecast["forecast_rh_out_mean_1h"]
+        sunrise_steps = int(forecast["time_to_sunrise_steps"])
 
-        # 检查是否有预报数据
-        if val("glob_rad_t+1") is None:
-            return "无可用预报数据"
-
-        # 提取未来 4 步 (1小时) 的数据
-        rads = []
-        temps = []
-        for i in range(1, 5):
-            r = val(f"glob_rad_t+{i}")
-            t = val(f"temp_out_t+{i}")
-            if r is not None: rads.append(r)
-            if t is not None: temps.append(t)
-            
-        if not rads:
-            return "预报数据不完整"
-            
-        avg_rad = sum(rads) / len(rads)
-        avg_temp = sum(temps) / len(temps)
-        
-        # 趋势判断
         rad_trend = "平稳"
-        if rads[-1] - rads[0] > 50: rad_trend = "显著增强"
-        elif rads[-1] - rads[0] < -50: rad_trend = "显著减弱"
-        
-        return f"未来1h均温 {avg_temp:.1f}°C，辐射均值 {avg_rad:.0f} W/m² ({rad_trend})"
+        if rad_peak - rad_mean > 80.0:
+            rad_trend = "增强"
+        elif rad_mean - rad_peak > 40.0:
+            rad_trend = "减弱"
+
+        return (
+            f"1h辐射均值 {rad_mean:.0f} W/m², 2h峰值 {rad_peak:.0f} W/m², "
+            f"1h外温变化 {temp_delta:+.1f}°C, 1h外湿均值 {rh_mean:.0f}%, "
+            f"约 {sunrise_steps} 步后日出 ({rad_trend})"
+        )
 
     def get_state_description(self) -> str:
         """
@@ -270,6 +352,13 @@ class GreenhouseAgentInterface:
         if vpd < 0.4: vpd_status = "(过湿! 需除湿)"
         elif vpd > 1.6: vpd_status = "(过干! 需加湿/降温)"
         else: vpd_status = "(适宜)"
+        dew_margin = min(float(s.dew_margin_air), float(s.canopy_dew_margin))
+        if dew_margin < 0.5:
+            dew_status = "(高结露风险)"
+        elif dew_margin < 1.5:
+            dew_status = "(接近露点)"
+        else:
+            dew_status = "(露点安全)"
 
         # DLI 换算
         dli_mol = s.dli * 2.0  # MJ -> mol (approx)
@@ -284,6 +373,7 @@ class GreenhouseAgentInterface:
 - 相对湿度: {s.rh_air:.1f}% (目标范围 50-85%)
 - 饱和水汽压差 (VPD): {vpd:.2f} kPa {vpd_status}
   * 建议范围: 0.4 - 1.2 kPa (最佳 0.8-1.0)
+- 露点温度: {s.dew_point_air:.1f}°C, 空气露点裕度: {s.dew_margin_air:.1f}°C, 冠层露点裕度: {s.canopy_dew_margin:.1f}°C {dew_status}
 - CO2 浓度: {s.co2_air:.0f} ppm (建议 400-1000 ppm)
 - 加热管道温度: {s.pipe_temp:.1f}°C
 
@@ -300,4 +390,6 @@ class GreenhouseAgentInterface:
 - 辐射强度: {s.glob_rad:.1f} W/m² (影响光合作用与自然升温)
 - 室外环境: 温度 {s.temp_out:.1f}°C, 湿度 {s.rh_out:.1f}%, 风速 {s.wind_speed:.1f} m/s
 - 累积光量(DLI): {dli_mol:.1f} mol/m² {dli_status} (目标 > 15)
+- 未来1h特征: 辐射均值 {s.forecast_rad_mean_1h:.0f} W/m², 2h峰值 {s.forecast_rad_peak_2h:.0f} W/m², 外湿均值 {s.forecast_rh_out_mean_1h:.0f}%, 风峰值 {s.forecast_wind_peak_1h:.1f} m/s
+- 前瞻湿害风险: {s.forecast_humidity_risk:.2f} (0-1), 距离日出约 {s.time_to_sunrise_steps} 步
 - 气象预报(1h): {forecast_text}"""

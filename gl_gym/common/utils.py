@@ -522,6 +522,20 @@ def calculate_vpd_kpa(temp, rh):
     return max(0.0, vpd_pa / 1000.0)
 
 
+def calculate_dew_point_c(temp, rh):
+    """
+    Estimate dew point temperature [degC] from air temperature and RH.
+
+    Uses a Magnus-style approximation that is stable for greenhouse control
+    ranges and cheap enough to evaluate every step.
+    """
+    rh_clipped = np.clip(rh, 1e-3, 100.0)
+    a = 17.27
+    b = 237.7
+    alpha = np.log(rh_clipped / 100.0) + (a * temp) / (b + temp)
+    return (b * alpha) / (a - alpha)
+
+
 
 def co2ppm2dens(temp, ppm):
     """

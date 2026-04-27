@@ -45,7 +45,7 @@ def load_env(env_id, model_name, env_base_params, env_specific_params, load_path
     return env
 
 
-def evaluate(model, env):
+def evaluate(model, env, obs_dim: int):
     """
     执行单次模拟评估并收集所有步骤的数据。
     """
@@ -54,7 +54,7 @@ def evaluate(model, env):
     epi, revenue, heat_cost, co2_cost, elec_cost = np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1), np.zeros(
         N + 1), np.zeros(N + 1)
     temp_violation, co2_violation, rh_violation = np.zeros(N + 1), np.zeros(N + 1), np.zeros(N + 1)
-    episodic_obs = np.zeros((N + 1, 23))  # 存储前 23 个观测变量
+    episodic_obs = np.zeros((N + 1, obs_dim))
     episode_rewards = np.zeros(N + 1)
 
     dones = np.zeros((1,), dtype=bool)
@@ -78,7 +78,7 @@ def evaluate(model, env):
 
         # 记录奖励和反标准化后的观测值
         episode_rewards[timestep] += rewards[0]
-        episodic_obs[timestep] += env.unnormalize_obs(observations)[0, :23]
+        episodic_obs[timestep] += env.unnormalize_obs(observations)[0, :obs_dim]
 
         # 从 info 字典中提取经济和违规指标
         epi[timestep] += infos[0]["EPI"]
@@ -136,7 +136,9 @@ if __name__ == "__main__":
     model = ALG[args.algorithm].load(join(load_path + f"models", f"{args.model_name}/best_model.zip"), device="cpu")
 
     # 构建结果文件的列名
-    result_columns = eval_env.env_method("get_obs_names")[0][:23]
+    obs_names = eval_env.env_method("get_obs_names")[0]
+    obs_dim = int(eval_env.observation_space.shape[-1])
+    result_columns = obs_names[:obs_dim]
     result_columns.extend(["Rewards", "EPI", "Revenue", "Heat costs", "CO2 costs", "Elec costs"])
     result_columns.extend(["temp_violation", "co2_violation", "rh_violation"])
     result_columns.extend(["episode"])
@@ -146,7 +148,7 @@ if __name__ == "__main__":
     for sim in tqdm(range(n_sims)):
         # 为环境设置不同的种子以获得不同的随机参数采样
         eval_env.env_method("set_seed", 666 + sim)
-        result_data = evaluate(model, eval_env)
+        result_data = evaluate(model, eval_env, obs_dim)
 
         # 添加一列标识当前的模拟序号 (episode)
         sim_column = np.full((result_data.shape[0], 1), sim)

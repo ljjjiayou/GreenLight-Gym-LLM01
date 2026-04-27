@@ -52,7 +52,7 @@ class GreenLightEnv(gym.Env):
             dt: float,  # [秒] 底层求解器的步长
             u_min: List[float],  # 控制输入的下限
             u_max: List[float],  # 控制输入的上限
-            delta_u_max: float,  # 控制输入的单步最大变化量
+            delta_u_max: Any,  # 控制输入的单步最大变化量
             pred_horizon: int,  # [天] 天气预测长度
             season_length: int = 60,  # 生长季总天数
             start_train_year: int = 2023,  # 训练起始年
@@ -73,7 +73,13 @@ class GreenLightEnv(gym.Env):
         self.nd = nd
         self.u_min = np.array(u_min, dtype=np.float32)
         self.u_max = np.array(u_max, dtype=np.float32)
-        self.delta_u_max = np.ones(self.nu, dtype=np.float32) * delta_u_max
+        if isinstance(delta_u_max, (list, tuple, np.ndarray)):
+            delta_u_array = np.array(delta_u_max, dtype=np.float32).reshape(-1)
+            if delta_u_array.shape[0] != self.nu:
+                raise ValueError(f"delta_u_max 长度应为 {self.nu}，实际为 {delta_u_array.shape[0]}")
+            self.delta_u_max = delta_u_array
+        else:
+            self.delta_u_max = np.ones(self.nu, dtype=np.float32) * float(delta_u_max)
         self.weather_data_dir = weather_data_dir
         self.location = location
         self.dt = dt

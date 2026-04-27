@@ -265,7 +265,6 @@ def init_default_params(nparams):
     params[207] = 1e-6  # eps:             数值稳定性极小值 (Epsilon)
     return params
 
-
 def init_state(d0, rhMax=90, time_in_days=0):
     """
     初始化温室的 28 个物理状态变量。

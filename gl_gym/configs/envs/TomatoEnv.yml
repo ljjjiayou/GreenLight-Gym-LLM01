@@ -10,13 +10,13 @@ GreenLightEnv:
   dt: 900                         # [s] time step for the underlying GreenLight solver
   u_min: [0, 0, 0, 0, 0, 0]
   u_max: [1, 1, 1, 1, 1, 1]
-  delta_u_max: 0.1                # max change rate in control inputs
+  delta_u_max: [0.16, 0.08, 0.08, 0.12, 0.20, 0.08]                # max change rate in control inputs
   pred_horizon: 0.5               # [days] number of future weather predictions
   season_length: 60               # number of days to simulate
   start_train_year: 2010          # start year for training
-  end_train_year: 2010            # end year for training
-  start_train_day: 59             # start day of the year for training
-  end_train_day: 59               # end day of the year for training  
+  end_train_year: 2020            # end year for training
+  start_train_day: 45             # start day of the year for training
+  end_train_day: 280              # end day of the year for training  
   training: True                  # whether we are training or testing
 
 TomatoEnv:
@@ -40,8 +40,8 @@ TomatoEnv:
     rh_max: 90.          # upper bound on relative humidity               [#]         70
 
   eval_options:
-    eval_days: [59]                    # days to evaluate the agent on
-    eval_years: [2010]                  # year to evaluate the agent on
+    eval_days: [59, 180, 240]                    # days to evaluate the agent on
+    eval_years: [2010, 2015, 2020]                  # year to evaluate the agent on
     location: Amsterdam                 # location of the greenhouse
 
   reward_params:
@@ -56,6 +56,7 @@ TomatoEnv:
     dmfm: 0.065                 # dry matter fresh matter ratio
     pen_weights: [1.5e-4, 1.5e-3, 2.5e-4]
     pen_lamp: 0.1
+    include_fixed_costs_in_reward: false
 
 # results_columns: [
 #   Time, co2_air, co2_top, temp_air, temp_top, can_temp, covin_temp, covex_temp,

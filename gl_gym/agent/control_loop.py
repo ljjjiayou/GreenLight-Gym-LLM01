@@ -20,8 +20,6 @@ from gl_gym.agent.tools import (
     create_langchain_tools
 )
 from gl_gym.agent.llm_agent import (
-    GreenhouseAgent,
-    AgentConfig,
     RuleBasedLLMDirector
 )
 
@@ -53,7 +51,7 @@ class StepResult:
     agent_output: Optional[str] = None
     success: bool = True
     error: Optional[str] = None
-    source: str = "unknown"  # 决策来源：rule, llm, none
+    source: str = "unknown"  # 决策来源：llm_replan, plan_rollout, unknown
 
 
 class GreenhouseControlLoop:
@@ -66,7 +64,7 @@ class GreenhouseControlLoop:
     
     def __init__(
         self,
-        agent: Any, # 支持 GreenhouseAgent 或 RuleBasedLLMDirector
+        agent: Any, # 需实现 step_with_rules 接口（当前主路径为 RuleBasedLLMDirector）
         agent_interface: GreenhouseAgentInterface,
         config: Optional[ControlLoopConfig] = None
     ):
@@ -114,33 +112,35 @@ class GreenhouseControlLoop:
         
         state_before = self.interface.get_state()
         
-        # 兼容不同的 Agent 接口
-        source = "unknown"
-        if hasattr(self.agent, "step_with_rules"):
-             # RuleBasedLLMDirector
-            result = self.agent.step_with_rules()
-            source = result.get("action", "unknown") # rule_control, llm_control, none
+        if not hasattr(self.agent, "step_with_rules"):
+            raise TypeError("GreenhouseControlLoop requires an agent implementing step_with_rules()")
+
+        # RuleBasedLLMDirector 主路径：由 agent 返回 action，未知值统一回退为 unknown。
+        result = self.agent.step_with_rules()
+        source = result.get("action", "unknown")
+        
+        # 记录动作时优先使用 agent 显式返回的最终执行动作；
+        # 若未返回，则退回到“读取环境最新状态”的兼容路径。
+        applied_control = result.get("applied_control") if isinstance(result, dict) else None
+        if isinstance(applied_control, (list, tuple)) and len(applied_control) >= 6:
+            action = ControlAction(
+                u_boil=float(applied_control[0]),
+                u_co2=float(applied_control[1]),
+                u_th_scr=float(applied_control[2]),
+                u_vent=float(applied_control[3]),
+                u_lamp=float(applied_control[4]),
+                u_bl_scr=float(applied_control[5])
+            )
         else:
-            # GreenhouseAgent
-            result = self.agent.step(context)
-            source = "llm_agent"
-        
-        # 获取当前控制状态（可能被 Agent 修改，也可能保持不变）
-        # 注意：Agent 的 step 方法通常已经通过工具调用了 env.step
-        # 这里我们需要获取最新的动作状态用于记录
-        
-        # 如果 Agent 没有返回显式的 action 对象，我们假设它通过副作用修改了环境
-        # 我们从环境或接口中获取最新的动作
-        state_after = self.interface.get_state()
-        
-        action = ControlAction(
-            u_boil=state_after.u_boil,
-            u_co2=state_after.u_co2,
-            u_th_scr=state_after.u_th_scr,
-            u_vent=state_after.u_vent,
-            u_lamp=state_after.u_lamp,
-            u_bl_scr=state_after.u_bl_scr
-        )
+            state_after = self.interface.get_state()
+            action = ControlAction(
+                u_boil=state_after.u_boil,
+                u_co2=state_after.u_co2,
+                u_th_scr=state_after.u_th_scr,
+                u_vent=state_after.u_vent,
+                u_lamp=state_after.u_lamp,
+                u_bl_scr=state_after.u_bl_scr
+            )
         
         # 检查环境是否结束
         # 如果 Agent 内部调用了 env.step，我们不需要再次调用
@@ -179,10 +179,16 @@ class GreenhouseControlLoop:
         
         if self.config.verbose:
             print(f"Step {self.current_step}: Source={source}, Reward={reward:.2f}, Done={done}")
-            if source == "llm_control":
-                print(f"  > LLM Output: {step_result.agent_output[:100]}...")
-            elif source == "rule_control":
-                print(f"  > Rule Action Executed")
+            if source == "llm_replan":
+                print(f"  > LLM 宏观规划完成! 新的目标策略已下达并由规则开始执行。")
+                if step_result.agent_output:
+                    # 打印出模型的部分回复确认
+                    out_text = step_result.agent_output.replace('\n', ' ')
+                    print(f"  > LLM 分析摘要: {out_text[:120]}...")
+            elif source == "plan_rollout":
+                print("  > 规划有效期内，规则控制器正在依据设定目标追踪执行...")
+            else:
+                print(f"  > 其它模式执行: {source}")
         
         return step_result
     
@@ -198,8 +204,7 @@ class GreenhouseControlLoop:
         Args:
             max_steps: 最大步数
             callback: 每步执行后的回调函数
-            early_stop: 提前停止条件
-            
+     
         Returns:
             Dict: 运行结果统计
         """

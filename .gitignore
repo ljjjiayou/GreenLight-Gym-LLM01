@@ -1,7 +1,10 @@
 .vscode/
+.env
+.codex_literature_pdfs/
 __pycache__/
 build/
 data/
+gl_gym/result/
 gl_gym.egg-info/
 figures/
 results/

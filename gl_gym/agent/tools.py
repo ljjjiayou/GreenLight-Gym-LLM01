@@ -1,5 +1,24 @@
+from typing import List, Optional
 from langchain_core.tools import StructuredTool
-from gl_gym.agent.interface import GreenhouseAgentInterface, ControlAction
+from gl_gym.agent.interface import GreenhouseAgentInterface
+import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class ControlAction:
+    u_boil: float = 0.0
+    u_co2: float = 0.0
+    u_th_scr: float = 0.0
+    u_vent: float = 0.0
+    u_lamp: float = 0.0
+    u_bl_scr: float = 0.0
+    action_set: bool = False
+
+    def to_array(self) -> np.ndarray:
+        return np.array([self.u_boil, self.u_co2, self.u_th_scr, self.u_vent, self.u_lamp, self.u_bl_scr], dtype=np.float32)
+
+    def is_empty(self) -> bool:
+        return not self.action_set
 
 class GreenhouseTools:
     """
@@ -17,31 +36,19 @@ class GreenhouseTools:
     
     def __init__(self, interface: GreenhouseAgentInterface):
         self.interface = interface
-        self.last_reward = 0.0
-        self.last_done = False
-        self.status_calls_this_round = 0
-        # 初始化动作缓冲区，默认所有设备关闭 (0.0)
         self.buffered_action = ControlAction()
+        self.buffered_setpoints = {}
+        self.status_calls_this_round = 0
         
     def reset_buffer(self):
-        """
-        重置动作缓冲区
-        
-        在每一轮决策开始前调用。
-        默认继承当前环境的执行器状态，而不是全零重置。
-        这意味着如果 LLM 不调整某个设备，该设备将保持上一时刻的状态（惯性保持）。
-        """
-        current_state = self.interface.get_state()
-        self.buffered_action = ControlAction(
-            u_boil=current_state.u_boil,
-            u_co2=current_state.u_co2,
-            u_th_scr=current_state.u_th_scr,
-            u_vent=current_state.u_vent,
-            u_lamp=current_state.u_lamp,
-            u_bl_scr=current_state.u_bl_scr
-        )
+        """重置动作缓冲区"""
+        self.buffered_action = ControlAction()
+        self.buffered_setpoints = {}
         self.status_calls_this_round = 0
-        print(f"[Tools] 缓冲区已重置: 加热={self.buffered_action.u_boil:.2f}, 通风={self.buffered_action.u_vent:.2f}")
+
+    def is_empty(self) -> bool:
+        """检查动作是否为空（全零）"""
+        return self.buffered_action.is_empty()
 
     def _update_buffer(self, **kwargs) -> str:
         """
@@ -57,6 +64,7 @@ class GreenhouseTools:
             if hasattr(self.buffered_action, k):
                 # 确保控制量在 [0, 1] 范围内
                 setattr(self.buffered_action, k, max(0, min(1, v)))
+        self.buffered_action.action_set = True
         
         return (f"已记录设置 -> 加热:{self.buffered_action.u_boil:.2f}, "
                 f"CO2:{self.buffered_action.u_co2:.2f}, "
@@ -151,18 +159,72 @@ class GreenhouseTools:
         print(f"[Tools] set_blindscreen({position}) 被调用")
         return self._update_buffer(u_bl_scr=position)
     
-    def set_all_controls(self, heating: float, co2: float, screen: float, 
-                        ventilation: float, lamps: float, blindscreen: float) -> str:
+    def set_all_controls(
+        self,
+        heating: float,
+        co2: float,
+        screen: float,
+        ventilation: float,
+        lighting: float,
+        shading: float,
+        target_temp: Optional[float] = None, # 新增目标温度参数
+        target_co2: Optional[float] = None,  # 新增目标CO2参数
+        target_rh: Optional[float] = None,   # 新增目标相对湿度参数
+        target_temp_profile: Optional[List[float]] = None,
+        target_co2_profile: Optional[List[float]] = None,
+        target_rh_profile: Optional[List[float]] = None
+    ):
         """
-        工具：一次性设置所有控制设备
+        设置所有环境控制执行器的值。
         
-        高效工具，允许 LLM 用一次调用完成所有配置。
+        Args:
+            heating: 加热阀门初始参考开度 (0.0 - 1.0)
+            co2: CO2 注入阀门初始参考开度 (0.0 - 1.0)
+            screen: 保温幕初始参考位置 (0.0=打开, 1.0=关闭)
+            ventilation: 通风窗初始参考开度 (0.0 - 1.0)
+            lighting: 补光灯强度 (0.0 - 1.0)
+            shading: 遮阳网参考位置 (0.0=打开, 1.0=关闭)
+            target_temp: [强烈建议填写] 未来几十分钟的高层目标空气温度，底层规则将极其依赖此目标。
+            target_co2: [强烈建议填写] 目标 CO2 设定点浓度 (ppm)，用于底层规则追踪。
+            target_rh: [强烈建议填写] 目标相对湿度百分比 (如 75.0, 80.0)，防止病害。
+            target_temp_profile: 可选，规划周期内逐步目标温度序列。
+            target_co2_profile: 可选，规划周期内逐步目标 CO2 序列。
+            target_rh_profile: 可选，规划周期内逐步目标湿度序列。
         """
-        print(f"[Tools] set_all_controls(heating={heating:.2f}, co2={co2:.2f}, ...) 被调用")
-        return self._update_buffer(
-            u_boil=heating, u_co2=co2, u_th_scr=screen,
-            u_vent=ventilation, u_lamp=lamps, u_bl_scr=blindscreen
+        self.buffered_action = ControlAction(
+            u_boil=max(0.0, min(1.0, heating)),
+            u_co2=max(0.0, min(1.0, co2)),
+            u_th_scr=max(0.0, min(1.0, screen)),
+            u_vent=max(0.0, min(1.0, ventilation)),
+            u_lamp=max(0.0, min(1.0, lighting)),
+            u_bl_scr=max(0.0, min(1.0, shading)),
+            action_set=True,
         )
+        # 存储 Setpoints 到实例变量，供 Agent 读取
+        self.buffered_setpoints = {
+            "target_temp": target_temp,
+            "target_co2": target_co2,
+            "target_rh": target_rh,
+            "target_temp_profile": target_temp_profile,
+            "target_co2_profile": target_co2_profile,
+            "target_rh_profile": target_rh_profile,
+        }
+
+        # print(f"[Tools] 缓冲区已重置: 加热={heating:.2f}, 通风={ventilation:.2f}, T_target={target_temp}")
+        required_setpoints = ("target_temp", "target_co2", "target_rh")
+        missing = [
+            name for name in required_setpoints
+            for value in [self.buffered_setpoints.get(name)]
+            if value is None
+        ]
+        if missing:
+            missing_text = ", ".join(missing)
+            return (
+                "Control actions set. "
+                f"Warning: missing setpoints -> {missing_text}. "
+                "系统会在执行前自动补齐，但建议你在当前轮明确填写这些目标。"
+            )
+        return "Control actions and setpoints set successfully."
 
 def create_langchain_tools(interface: GreenhouseAgentInterface) -> list:
     """

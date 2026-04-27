@@ -86,9 +86,11 @@ def main():
     
     # 3. 配置智能体
     agent_config = AgentConfig(
-        model_name="qwen-plus", 
+        model_name="qwen-max-latest", 
         verbose=True,           
-        max_iterations=10,      
+        max_iterations=2,
+        max_tokens=260,
+        control_interval=12,
         api_key=api_key
     )
     
@@ -106,8 +108,8 @@ def main():
     
     # 6. 配置控制循环
     loop_config = ControlLoopConfig(
-        max_steps=10,  # 快速验证设为10步
-        log_freq=1,
+        max_steps=5760,  # 60天 * 24小时 * 4步/小时 = 5760步 (覆盖幼苗期到结果期)
+        log_freq=200,    # 每200步(约2天)输出一次日志
         verbose=True
     )
     

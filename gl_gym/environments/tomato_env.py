@@ -145,7 +145,13 @@ class TomatoEnv(GreenLightEnv):
         """
         将智能体输出的动作转换为环境的实际控制输入。
         """
-        return np.clip(self.u + action * self.delta_u_max, self.u_min, self.u_max)
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape[0] != self.nu:
+            raise ValueError(f"action 维度应为 {self.nu}，实际为 {action.shape[0]}")
+        delta_u_max = np.asarray(self.delta_u_max, dtype=np.float32).reshape(-1)
+        if delta_u_max.shape[0] != self.nu:
+            raise ValueError(f"delta_u_max 维度应为 {self.nu}，实际为 {delta_u_max.shape[0]}")
+        return np.clip(self.u + action * delta_u_max, self.u_min, self.u_max)
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, SupportsFloat, bool, bool, Dict[str, Any]]:
         """
