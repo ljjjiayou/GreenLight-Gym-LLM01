@@ -139,6 +139,14 @@ class AgentConfig:
     rh_target_extreme_cap: float = 72.0           # 极高湿/结露风险最大 RH 目标
     
     # 调试
+    rh_pulse_temp_cap: float = 21.5               # Max temp for heat-vent dehumidification pulse
+    rh_pulse_heat_floor: float = 0.16             # Heat floor for high RH / low VPD pulse
+    rh_pulse_extreme_heat_floor: float = 0.24     # Heat floor for extreme RH / dew-risk pulse
+    rh_pulse_vent_floor: float = 0.62             # Vent floor for strong dehumidification pulse
+    rh_pulse_extreme_vent_floor: float = 0.70     # Vent floor for extreme dehumidification pulse
+    rh_pulse_screen_cap: float = 0.45             # Screen cap during heat-vent dehumidification
+    rh_pulse_extreme_screen_cap: float = 0.32     # Screen cap during extreme dehumidification
+    rh_emergency_replan_cooldown_steps: int = 8   # Avoid repeated LLM calls while RH pulse is active
     verbose: bool = True
 
 
@@ -356,6 +364,17 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
                  guarded[3] = max(guarded[3], 0.50)
                  guarded[2] = min(guarded[2], 0.60)
     
+        # Heat-vent pulse: extreme RH needs a small heat floor even when air temp is acceptable.
+        # This raises VPD while ventilation exports moisture, instead of relying on ventilation alone.
+        if (rh_air >= 92.0 or vpd < 0.22) and temp_air < 21.5 and not high_temp_override:
+            extreme_rh = rh_air >= 94.0 or vpd < 0.18
+            heat_floor = 0.24 if extreme_rh else 0.16
+            if temp_air < 15.0:
+                heat_floor = max(heat_floor, 0.28)
+            guarded[0] = max(guarded[0], heat_floor)
+            guarded[3] = max(guarded[3], 0.70 if extreme_rh else 0.62)
+            guarded[2] = min(guarded[2], 0.32 if extreme_rh else 0.45)
+
     # 3. 正常/干燥 VPD 处理（防萎蔫）
     # 如果 VPD > 1.2 (偏干)，减少通风，增加保湿
     elif vpd > 1.2 and not high_temp_override:
@@ -396,6 +415,8 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         guarded[2] = min(guarded[2], 0.38)
         guarded[4] = 0.0
         guarded[1] = 0.0
+        if temp_air < 21.5:
+            guarded[0] = max(guarded[0], 0.24 if rh_air >= 94.0 else 0.16)
     elif rh_air >= 88.0:
         guarded[3] = max(guarded[3], 0.42)
         guarded[2] = min(guarded[2], 0.60)
@@ -433,11 +454,24 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         guarded[3] = min(guarded[3], wind_cap)
 
     # 7. 夜间保温策略
+    # High RH / low VPD can tolerate a larger vent opening even under wind protection.
+    if (rh_air >= 92.0 or vpd < 0.20) and temp_air < 21.5:
+        if wind_speed > 8.0:
+            guarded[3] = max(guarded[3], 0.48)
+        elif wind_speed > 6.0 and temp_out < temp_air:
+            guarded[3] = max(guarded[3], 0.55)
+        else:
+            guarded[3] = max(guarded[3], 0.62)
+
     if is_night:
         guarded[5] = 0.0 # 夜间不用遮阳网
         guarded[4] = 0.0 # 夜间不用补光（假设非光周期补光）
         if temp_air < 15.0:
             guarded[2] = max(guarded[2], 0.80) # 夜间低温必拉保温幕
+
+    if is_night and temp_air < 15.0 and (rh_air >= 86.0 or vpd < 0.35):
+        guarded[0] = max(guarded[0], 0.25)
+        guarded[2] = min(max(guarded[2], 0.45), 0.75)
 
     return np.clip(guarded, 0.0, 1.0)
 
@@ -758,6 +792,7 @@ class RuleBasedLLMDirector:
         self._lamp_budget_integral: float = 0.0
         self.last_lamp_budget_remaining: float = float(self.config.lamp_daily_budget)
         self.rh_violation_debt: float = 0.0
+        self.rh_emergency_streak_steps: int = 0
         self.pending_control: Optional[np.ndarray] = None
         
         # v2.1.2: 决策可解释性增强
@@ -1060,7 +1095,11 @@ class RuleBasedLLMDirector:
             # 检查连续步数是否达到确认要求
             if self.rh_emergency_streak_steps >= confirm_steps:
                 # 检查是否满足最小冷却时间（比通用冷却时间更短）
-                rh_emergency_cooldown = max(1, self.emergency_replan_cooldown_steps // 2)
+                # Deterministic heat-vent pulses handle RH between LLM calls; avoid token-heavy replans.
+                rh_emergency_cooldown = max(
+                    int(getattr(self.config, "rh_emergency_replan_cooldown_steps", 8)),
+                    int(self.emergency_replan_cooldown_steps),
+                )
                 if current_step - self.last_llm_trigger_step >= rh_emergency_cooldown:
                     self.rh_emergency_streak_steps = 0  # 重置计数器
                     return True
@@ -1570,18 +1609,21 @@ class RuleBasedLLMDirector:
         if rh >= 86.0:
             dehum = np.clip(env_control.copy(), 0.0, 1.0)
             if rh >= 94.0:
-                dehum[3] = max(dehum[3], 0.62)
-                dehum[2] = min(dehum[2], 0.35)
+                dehum[3] = max(dehum[3], 0.70)
+                dehum[2] = min(dehum[2], 0.32)
             elif rh >= 90.0:
-                dehum[3] = max(dehum[3], 0.48)
-                dehum[2] = min(dehum[2], 0.55)
+                dehum[3] = max(dehum[3], 0.58)
+                dehum[2] = min(dehum[2], 0.45)
             else:
                 dehum[3] = max(dehum[3], 0.32)
                 dehum[2] = min(dehum[2], 0.70)
             dehum[1] = 0.0
             dehum[4] = 0.0
-            if temp < 15.0:
-                dehum[0] = max(dehum[0], 0.12 if temp >= 10.0 else 0.35)
+            if temp < 21.5:
+                heat_floor = 0.24 if rh >= 94.0 else 0.16
+                if temp < 15.0:
+                    heat_floor = max(heat_floor, 0.28 if temp >= 10.0 else 0.35)
+                dehum[0] = max(dehum[0], heat_floor)
             candidates.append(FallbackCandidate("emergency_dehumidify", dehum, rationale="高湿/结露风险优先排湿"))
 
         if temp < 12.5:
@@ -2140,6 +2182,29 @@ class RuleBasedLLMDirector:
             elif vpd_now < 0.35 and temp_air < 18.0:
                 control[0] = max(control[0], 0.08)
 
+            if (rh_air >= 92.0 or vpd_now < 0.22 or dew_margin < 0.6) and temp_air < float(self.config.rh_pulse_temp_cap):
+                extreme_rh = rh_air >= 94.0 or vpd_now < 0.18 or dew_margin < 0.4
+                heat_floor = (
+                    float(self.config.rh_pulse_extreme_heat_floor)
+                    if extreme_rh
+                    else float(self.config.rh_pulse_heat_floor)
+                )
+                if temp_air < 15.0:
+                    heat_floor = max(heat_floor, 0.28)
+                control[0] = max(control[0], heat_floor)
+                control[3] = max(
+                    control[3],
+                    float(self.config.rh_pulse_extreme_vent_floor)
+                    if extreme_rh
+                    else float(self.config.rh_pulse_vent_floor),
+                )
+                control[2] = min(
+                    control[2],
+                    float(self.config.rh_pulse_extreme_screen_cap)
+                    if extreme_rh
+                    else float(self.config.rh_pulse_screen_cap),
+                )
+
         # Profit-v2: 补光预算化与高湿禁补光
         if lamp_budget_remaining <= 0.0:
             control[4] = 0.0
@@ -2191,10 +2256,12 @@ class RuleBasedLLMDirector:
                 control[0] = max(control[0], 0.30)  # 极冷时保留加热底线
             elif temp_air < 15.5:
                 control[0] = max(control[0], 0.08)
+            elif temp_air < float(self.config.rh_pulse_temp_cap) and (rh_air >= 90.0 or vpd_now < 0.28):
+                control[0] = max(control[0], float(self.config.rh_pulse_heat_floor))
             # 温度回到安全区后不设置加热底线，允许自然调节
         elif dehumidify_mode == "strong":
-            control[3] = max(control[3], 0.58)
-            control[2] = min(control[2], 0.40)
+            control[3] = max(control[3], float(self.config.rh_pulse_vent_floor))
+            control[2] = min(control[2], float(self.config.rh_pulse_screen_cap))
             control[1] = 0.0
             control[4] = 0.0
             # v2.1.2: 高湿阶段加热底线做温度分段
@@ -2203,19 +2270,23 @@ class RuleBasedLLMDirector:
                 control[0] = max(control[0], 0.40)  # 极冷时更强的加热底线
             elif temp_air < 15.0:
                 control[0] = max(control[0], 0.12)
+            elif temp_air < float(self.config.rh_pulse_temp_cap):
+                control[0] = max(control[0], float(self.config.rh_pulse_heat_floor))
             # 温度回到安全区后不设置加热底线，避免加热+通风并发成本
 
         # Profit-v2.1: RH 极高时增加额外硬约束，抑制尾部持续超湿
         if float(state.rh_air) >= 94.0:
-            control[3] = max(control[3], 0.62)
-            control[2] = min(control[2], 0.35)
+            control[3] = max(control[3], float(self.config.rh_pulse_extreme_vent_floor))
+            control[2] = min(control[2], float(self.config.rh_pulse_extreme_screen_cap))
             control[1] = 0.0
             control[4] = 0.0
             temp_air = float(state.temp_air)
             if temp_air < 10.0:
                 control[0] = max(control[0], 0.35)  # 极冷时加热底线
             elif temp_air < 15.0:
-                control[0] = max(control[0], 0.10)
+                control[0] = max(control[0], 0.28)
+            elif temp_air < float(self.config.rh_pulse_temp_cap):
+                control[0] = max(control[0], float(self.config.rh_pulse_extreme_heat_floor))
 
         return (
             np.asarray(control, dtype=np.float32),

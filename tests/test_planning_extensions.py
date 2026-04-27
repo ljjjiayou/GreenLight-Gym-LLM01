@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 
 try:
-    from gl_gym.agent.llm_agent import AgentConfig, RuleBasedLLMDirector
+    from gl_gym.agent.llm_agent import AgentConfig, RuleBasedLLMDirector, apply_safety_guardrails
     from gl_gym.agent.tools import ControlAction
 
     IMPORT_ERROR = None
@@ -22,6 +22,7 @@ class DummyState:
     glob_rad: float = 0.0
     temp_out: float = 8.0
     rh_out: float = 88.0
+    wind_speed: float = 0.0
     fruit_weight: float = 0.1
     dew_margin_air: float = 0.4
     canopy_dew_margin: float = 0.3
@@ -49,6 +50,10 @@ class TestPlanningExtensions(unittest.TestCase):
         director.rule_controller = None
         director.last_control = None
         director.last_fallback_selection = {}
+        director.last_llm_trigger_step = -10**9
+        director.emergency_replan_cooldown_steps = max(6, director.config.control_interval // 2)
+        director.current_plan = None
+        director.rh_emergency_streak_steps = 0
         director.rh_violation_debt = 0.0
         return director
 
@@ -107,6 +112,40 @@ class TestPlanningExtensions(unittest.TestCase):
 
         self.assertGreater(debt, 0.0)
         self.assertEqual(director.rh_violation_debt, debt)
+
+    def test_guardrails_apply_heat_vent_pulse_for_extreme_rh(self):
+        control = apply_safety_guardrails(
+            DummyState(temp_air=18.4, rh_air=95.2, hour_of_day=14.0),
+            np.zeros(6, dtype=np.float32),
+        )
+
+        self.assertGreaterEqual(float(control[0]), 0.239)
+        self.assertGreaterEqual(float(control[3]), 0.699)
+        self.assertLessEqual(float(control[2]), 0.32)
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
+
+    def test_rh_emergency_replan_respects_extended_cooldown(self):
+        director = self._director()
+        director.last_llm_trigger_step = 10
+        director.rh_emergency_streak_steps = director.config.emergency_rh_confirm_steps - 1
+
+        self.assertFalse(director._should_rh_emergency_replan(DummyState(timestep=17, rh_air=95.0)))
+        self.assertTrue(director._should_rh_emergency_replan(DummyState(timestep=18, rh_air=95.0)))
+
+    def test_high_rh_low_vpd_relaxes_wind_vent_cap(self):
+        control = apply_safety_guardrails(
+            DummyState(
+                temp_air=19.0,
+                rh_air=92.5,
+                temp_out=10.0,
+                wind_speed=7.0,
+                hour_of_day=14.0,
+            ),
+            np.zeros(6, dtype=np.float32),
+        )
+
+        self.assertGreaterEqual(float(control[3]), 0.549)
 
 
 if __name__ == "__main__":
