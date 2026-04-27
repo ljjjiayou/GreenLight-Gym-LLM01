@@ -139,6 +139,37 @@ LLM Director 可作为上层经济/语义规划器，底层规则、fallback 和
 - 增加动态电价或日内能耗权重，强化 economic optimization。
 - 用不同年份、开始日期和不确定性水平做迁移测试。
 
+### 1.8 全自动温室决策系统：挑战、机会与竞赛经验
+
+`2503.21640v1.pdf` 对应论文 **Towards Fully Automated Decision-Making Systems for Greenhouse Control: Challenges and Opportunities**。该文不是单一控制器论文，而是从全自动农场/温室决策系统角度总结 AI 方法、领域挑战和 Autonomous Greenhouse Challenge 经验。它对本项目的价值在于：可以把 LLM-RSPC 从“LLM 做控制”提升为“面向温室管理的可解释、可回退、可约束的自动决策系统”。
+
+该文总结的关键挑战包括：
+
+- 农业系统状态空间大、作物和气候耦合强，仿真到真实环境存在泛化差距。
+- 温室控制同时受资源成本和安全约束影响，不能只最大化单一 reward。
+- 作物生长慢，控制动作的收益滞后，导致数据稀缺和 delayed reward。
+- 自动化系统仍需要面向种植者解释决策逻辑，并持续吸收专家知识和多模态信息。
+
+该文给出的机会包括：
+
+- 用 Bayesian Optimization 在有限仿真预算下搜索控制参数。
+- 用 constrained RL、动作投影或规则约束处理即时安全约束和累计资源约束。
+- 用 imitation learning、reward shaping 和专家知识缓解稀疏反馈问题。
+- 用 model-based RL、sim2real、domain randomization、meta/transfer learning 改善样本效率和泛化。
+- 用 explainable decision-making 和 multimodal ML 支持人机协作。
+
+该文竞赛案例中，作者在第 3 届 Autonomous Greenhouse Challenge 中排名第 2/46。他们尝试 MBRL，但发现长达约 1000 步的 episode 会让多步预测误差快速积累；最终更有效的是用 BO 搜索较低维的设定点和控制参数。这对本项目有两个直接启发：
+
+- 不应把论文创新押在“端到端学一个长周期控制器”上，而应强调低频高层规划、显式约束和高频安全执行。
+- PPO、规则控制器和 LLM-RSPC 的关键超参都应做有限预算调参，例如用 TPE/BO 搜索 RH-debt、通风底线、重规划阈值、rollout 权重和 PPO 超参。
+
+本项目对应改进：
+
+- 将 LLM-RSPC 明确表述为 autonomous greenhouse decision-making system，而不只是 LLM controller。
+- 增加 decision trace，记录状态风险、LLM 计划、合同修正、fallback 选择、护栏改动和最终动作。
+- 增加 BO/TPE 参数搜索层，在相同仿真预算下调优 PPO baseline 和 LLM-RSPC 的关键超参。
+- 实验中加入有限仿真预算、未知天气年份、传感噪声、API 失败和高湿长周期场景，证明方法具备系统级鲁棒性。
+
 ## 2. 文献启发下的方法定义
 
 ### 2.1 方法名称
@@ -201,6 +232,8 @@ P_t = {
   target_temp_profile,
   target_co2_profile,
   target_rh_profile,
+  risk_summary,
+  objective_tradeoff,
   reasoning
 }
 ```
@@ -210,6 +243,8 @@ P_t = {
 - `anchor_action` 是本周期第一个动作锚点；
 - `target_*` 是标量目标；
 - `target_*_profile` 是未来若干步目标轨迹；
+- `risk_summary` 汇总当前高湿、低温、CO2、能耗和天气扰动风险；
+- `objective_tradeoff` 说明本次规划在产量、能耗、除湿和安全之间的取舍；
 - `reasoning` 用于解释当前规划目的和约束。
 
 这对应 RL-MPC 和分层控制文献中的高层参考轨迹。
@@ -292,6 +327,33 @@ u_rollout = (1 - w) * u_anchor + w * u_rule + tracking_correction
 
 最终输出可执行动作。
 
+### 2.9 模块 7：Decision Trace 与离线参数搜索
+
+全自动温室决策系统不能只输出动作，还要能解释动作为何被选中、哪些安全层修改了动作、失败时如何恢复。因此每个控制步保存：
+
+```text
+trace_t = {
+  observed_state,
+  risk_flags,
+  llm_reference_plan,
+  contract_corrections,
+  fallback_candidates,
+  selected_anchor,
+  rollout_blend_weight,
+  guardrail_adjustments,
+  applied_action,
+  violations
+}
+```
+
+该记录用于三件事：
+
+- 论文中的可解释性分析，展示 LLM 计划如何被合同机制和护栏变成可执行动作。
+- 消融实验，统计 setpoint contract、fallback scoring、RH-debt 和 guardrail 分别减少了多少风险。
+- 离线参数搜索，用 BO/TPE 在有限仿真预算下调优 `rh_debt_decay`、高湿通风底线、屏幕上限、重规划冷却时间、rollout 权重和 PPO 超参。
+
+这对应 `2503.21640v1.pdf` 中对 explainable decision-making、有限样本 BO 和复杂农业系统泛化问题的建议。
+
 ## 3. 正式 Method 章节建议结构
 
 ### 3.1 System Architecture
@@ -306,6 +368,7 @@ State Observer
   -> Fallback Candidate Scoring
   -> Safe Rollout Controller
   -> Guardrail-filtered Action
+  -> Decision Trace Logger
   -> Greenhouse Environment
 ```
 
@@ -368,6 +431,7 @@ LLM 控制论文必须报告 runtime：
 必须包含：
 
 - Rule-based controller；
+- BO-tuned rule/setpoint controller；
 - PPO；
 - SAC 或 DDPG；
 - LLM anchor only；
@@ -385,7 +449,7 @@ LLM 控制论文必须报告 runtime：
 PPO 不能只用现有模型。论文级 PPO baseline 应满足：
 
 - 多 seed 训练；
-- 超参搜索；
+- 超参搜索，建议使用 TPE/BO 或网格加随机搜索；
 - validation set 选择 best checkpoint；
 - test set 只汇报最终模型；
 - 与 LLM 使用同一环境、同一 reward、同一 constraints。
@@ -418,6 +482,13 @@ PPO 不能只用现有模型。论文级 PPO baseline 应满足：
 - 多 seed；
 - uncertainty_scale = 0.0, 0.1, 0.2, 0.3。
 
+补充一个 decision-system benchmark：
+
+- limited simulation budget：限制每个方法只能使用相同次数的训练或调参运行。
+- unseen weather/year：验证从调参年份迁移到未知年份的泛化。
+- delayed reward setting：只允许用长周期 profit 选模型，检验方法是否过拟合短期 climate tracking。
+- API and planner failure：随机注入 LLM timeout、空动作、非法 JSON 和延迟响应。
+
 ### 4.4 Metrics
 
 主指标：
@@ -440,7 +511,10 @@ LLM 专属指标：
 - fallback rate；
 - setpoint contract correction count；
 - RH-debt peak；
-- target profile correction count。
+- target profile correction count；
+- decision trace completeness；
+- guardrail intervention count；
+- generalization gap between validation and test weather。
 
 ### 4.5 Ablation Study
 
@@ -468,6 +542,8 @@ LLM 专属指标：
 - LLM timeout；
 - LLM missing action；
 - LLM malformed output；
+- sensor noise；
+- weather forecast perturbation；
 - high humidity weather；
 - cold night；
 - high radiation day；
@@ -486,6 +562,7 @@ LLM 专属指标：
 - 增加统一实验 runner，支持 PPO、Rule、LLM、ablation。
 - 输出每步日志，包括 state、target、control、violation、contract correction。
 - 添加 960 步和 40 天实验配置。
+- 增加 decision trace 字段，支持可解释性、故障恢复和护栏贡献统计。
 
 ### P1：增强方法创新性
 
@@ -493,6 +570,8 @@ LLM 专属指标：
 - 增加天气趋势风险评分。
 - 增加 LLM call cache 或 direct JSON planner，降低 runtime。
 - 增加 `LLM failure injection` 测试。
+- 增加 BO/TPE 参数搜索，用相同仿真预算调优 PPO、规则基线和 LLM-RSPC。
+- 增加 domain randomization / sensor noise 配置，测试仿真到未知天气条件的泛化。
 
 ### P2：论文可视化
 
@@ -510,14 +589,15 @@ LLM 专属指标：
 1. 提出 LLM-RSPC，一种将 LLM 作为高层设定点规划器、底层安全控制器负责约束执行的温室气候混合控制框架。
 2. 提出 setpoint contract 和 target profile completion，使 LLM 输出变成完整、合法、可执行的短期参考轨迹。
 3. 提出 fallback candidate scoring 与 RH-debt constraint tightening，提高 LLM 失败和长周期高湿场景下的安全性。
-4. 在 GreenLight-Gym 风格的温室环境中，与 PPO、规则控制和消融变体进行对比，验证安全性、经济性和可解释性。
+4. 提出 decision trace 与有限预算参数搜索流程，使自动温室决策系统具备可解释、可诊断和可复现实验评估。
+5. 在 GreenLight-Gym 风格的温室环境中，与 PPO、BO-tuned 规则控制和消融变体进行对比，验证安全性、经济性和泛化能力。
 
 ## 7. 下一步执行顺序
 
 1. 锁定当前环境与 reward 版本。
-2. 设计 PPO 强基线训练脚本和 sweep。
-3. 将 LLM-RSPC 模块参数化，支持 ablation 开关。
-4. 跑 240、960、40 天实验。
-5. 根据实验结果反向优化 RH-debt、fallback score 和 setpoint contract。
-6. 写论文 Related Work、Method、Experiment。
-
+2. 设计 PPO 强基线训练脚本和 TPE/BO sweep。
+3. 将 LLM-RSPC 模块参数化，支持 ablation 开关和 decision trace。
+4. 对 PPO、规则基线和 LLM-RSPC 使用相同仿真预算调参。
+5. 跑 240、960、40 天实验。
+6. 根据实验结果反向优化 RH-debt、fallback score 和 setpoint contract。
+7. 写论文 Related Work、Method、Experiment。
