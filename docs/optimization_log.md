@@ -157,3 +157,98 @@
 相比直接克隆 PPO，这能形成更清晰的论文主张：
 
 > LLM-RSPC 从 PPO 轨迹中挖掘可解释、带置信度门控的策略倾向，然后只将经过安全过滤的经济行为注入到规则约束的 rollout 控制器中。
+
+## 2026-04-28：Plan-Conditioned Intent Residual Distillation
+
+### 动机
+
+上一阶段已经能把 PPO 连续动作翻译成可审计策略标签，但仍存在一个关键缺口：PPO 轨迹导出时没有显式包含 LLM-RSPC 的目标计划条件。因此，专家模型学到的是 `state -> action`，而不是 `state + target -> intent -> action`。这会削弱泛化能力，也不利于论文中解释“为什么此时采用这个动作”。
+
+本阶段将 PPO 蒸馏增强为目标条件化意图蒸馏。核心思路是：先用 setpoint 合同为每个 PPO 状态补一个伪目标计划，再根据当前状态与目标状态差距推断控制意图，最后只把与目标意图一致的 PPO 策略样本用于 residual 专家训练。
+
+### 代码改动
+
+- 新增 `gl_gym/agent/plan_intent.py`。
+  - 提供 `default_setpoint_contract`，为 PPO 轨迹生成状态驱动的伪目标计划。
+  - 提供 `infer_plan_intent`，根据当前状态、目标温度、目标 RH、目标 CO2、VPD 和结露风险推断控制意图。
+  - 当前意图包括 `economic_dehumidify`、`safe_dehumidify`、`heat_recovery`、`heat_preservation`、`cooling`、`co2_enrichment`、`lighting_assist`、`humidity_preservation` 和 `economy_hold`。
+  - 提供 `strategy_intent_alignment`，判断 PPO 动作策略标签是否服务于当前目标意图。
+  - 提供 `target_tracking_baseline_control`，作为 residual 蒸馏的可解释 baseline。
+
+- 更新 `gl_gym/experiments/export_ppo_trajectories.py`。
+  - 每条 PPO 轨迹现在同时记录 `target_plan`、`plan_contract`、`intent`、`strategy` 和 `intent_strategy_alignment`。
+  - 特征提取时将伪目标计划传入 `extract_expert_features`，使 `target_temp_delta`、`target_co2_delta`、`target_rh_delta` 不再为空壳特征。
+  - 同时保存 `base_action` 和 `residual_action = PPO action - base_action`。
+  - NPZ 数据集新增 intent/strategy 标签、置信度和目标一致性 mask，便于后续训练过滤。
+
+- 更新 `gl_gym/experiments/train_distilled_expert.py`。
+  - 新增 `--require-intent-aligned`，只使用目标意图与 PPO 策略一致的样本。
+  - 新增 `--target-mode action|residual`，支持直接动作蒸馏和 residual 蒸馏。
+  - residual 模式下，模型学习的是 PPO 相对目标跟踪 baseline 的修正量，而不是完整动作硬复制。
+
+- 更新 `gl_gym/agent/expert_distillation.py`。
+  - `DistilledExpertPolicy` 现在可以读取模型元数据中的 `target_mode`。
+  - 当 `target_mode=residual` 时，专家先预测 residual，再与 `target_tracking_baseline_control` 合成最终动作。
+
+- 更新 `gl_gym/agent/llm_agent.py`。
+  - rollout 调用专家时会推断当前 plan intent。
+  - 专家预测会记录 `plan_intent_label`、`expert_strategy_label` 和 `intent_strategy_alignment`。
+  - 默认启用轻量 intent gate：只有当目标意图和专家动作策略都很明确但互相冲突时，才拒绝专家候选。
+
+- 新增 `tests/test_plan_intent_distillation.py`。
+  - 覆盖伪 setpoint 合同、经济除湿意图、策略-意图一致性、以及 residual 专家动作合成。
+
+### Smoke 测试
+
+场景：2020/day240，seed 42，24 步 PPO 轨迹。
+
+导出命令：
+
+```powershell
+python gl_gym\experiments\export_ppo_trajectories.py --years 2020 --days 240 --max-steps 24 --base-seed 42 --output-jsonl gl_gym\result\expert_distillation\ppo_plan_intent_smoke_s24.jsonl --output-npz gl_gym\result\expert_distillation\ppo_plan_intent_smoke_s24.npz
+```
+
+标签统计：
+
+- 目标意图：
+  - `safe_dehumidify`: 18。
+  - `economic_dehumidify`: 6。
+- PPO 策略标签：
+  - `free_air_exchange`: 8。
+  - `ambiguous`: 1。
+  - `unknown`: 15。
+- 目标意图与 PPO 策略一致样本：
+  - aligned: 8。
+  - not aligned: 16。
+
+Residual 专家训练命令：
+
+```powershell
+python gl_gym\experiments\train_distilled_expert.py --input gl_gym\result\expert_distillation\ppo_plan_intent_smoke_s24.npz --output-model train_data\AgriControl\ppo\deterministic\distilled_expert\llm_rspc_intent_residual_smoke_s24.npz --output-report gl_gym\result\expert_distillation\llm_rspc_intent_residual_smoke_s24_metrics.json --target-mode residual --require-intent-aligned --min-intent-confidence 0.5 --min-strategy-confidence 0.55
+```
+
+训练结果：
+
+- 源样本：24。
+- 目标一致样本：8。
+- residual validation MSE：0.000328。
+- validation MAE：
+  - heating: 0.0173。
+  - ventilation: 0.0406。
+  - screen: 0.0000。
+  - CO2/lighting/shading: 0.0000。
+
+### 解释
+
+该结果说明新链路能把 PPO 中可解释、与目标一致的低成本换气行为筛选出来，而不是直接复制全部 PPO 动作。对于当前窗口，PPO 的可借鉴部分仍然集中在 `free_air_exchange`，并且这些样本与目标意图过滤后的数量一致。
+
+下一步应将该流程扩展到更多年份、日期和随机种子，并进行四组消融实验：
+
+- LLM-RSPC 原版。
+- LLM-RSPC + action-only PPO distillation。
+- LLM-RSPC + plan-conditioned action distillation。
+- LLM-RSPC + plan-conditioned intent residual distillation。
+
+该方向的论文表述可以是：
+
+> 通过目标条件化意图推断，将 PPO 行为从黑箱动作模仿转化为“目标差距 -> 控制意图 -> 安全 residual 候选”的可解释蒸馏过程。

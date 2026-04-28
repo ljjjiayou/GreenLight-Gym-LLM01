@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import numpy as np
 
 from gl_gym.common.utils import calculate_vpd_kpa
+from gl_gym.agent.plan_intent import infer_plan_intent, target_tracking_baseline_control
 
 
 ACTION_NAMES = (
@@ -207,7 +208,11 @@ class DistilledExpertPolicy:
             raise ValueError(f"Expected {len(self.feature_names)} features, got {len(feature)}")
         z = self._standardize(feature)
         raw = z @ self.coef + self.intercept
-        action = np.clip(raw, 0.0, 1.0).astype(np.float32)
+        target_mode = str((self.metadata or {}).get("target_mode", "action"))
+        if target_mode == "residual":
+            action = np.clip(raw, -1.0, 1.0).astype(np.float32)
+        else:
+            action = np.clip(raw, 0.0, 1.0).astype(np.float32)
         distance = float(np.mean(np.abs(z)))
         max_abs_z = float(np.max(np.abs(z))) if len(z) else 0.0
         threshold = None
@@ -222,6 +227,7 @@ class DistilledExpertPolicy:
             "distance_threshold_p99": threshold_p99,
             "model": (self.metadata or {}).get("model", "ridge"),
             "train_cases": (self.metadata or {}).get("train_cases"),
+            "target_mode": target_mode,
         }
 
     def predict(
@@ -239,7 +245,17 @@ class DistilledExpertPolicy:
             lamp_budget_remaining=lamp_budget_remaining,
             dehumidify_mode=dehumidify_mode,
         )
-        action, info = self.predict_from_features(feature)
+        prediction, info = self.predict_from_features(feature)
+        if info.get("target_mode") == "residual":
+            intent = infer_plan_intent(state, plan)
+            base_action = target_tracking_baseline_control(state, plan, intent)
+            action = np.clip(base_action + prediction, 0.0, 1.0).astype(np.float32)
+            info["base_action"] = [float(x) for x in base_action]
+            info["residual_prediction"] = [float(x) for x in prediction]
+            info["intent_label"] = intent.label
+            info["intent_confidence"] = float(intent.confidence)
+        else:
+            action = prediction
         info["features"] = feature_dict
         return action, info
 

@@ -25,6 +25,13 @@ from langchain_core.prompts import ChatPromptTemplate
 from gl_gym.environments.baseline import RuleBasedController
 from gl_gym.common.utils import load_model_hyperparams, calculate_vpd_kpa
 from gl_gym.agent.expert_distillation import DistilledExpertPolicy
+from gl_gym.agent.plan_intent import (
+    action_record_for_labeling,
+    infer_plan_intent,
+    intent_to_dehumidify_mode,
+    strategy_intent_alignment,
+)
+from gl_gym.agent.ppo_strategy_labeler import label_strategy
 from gl_gym.agent.tools import create_langchain_tools, GreenhouseTools # 导入 Tools 类
 
 
@@ -110,6 +117,7 @@ class AgentConfig:
     expert_policy_path: str = "train_data/AgriControl/ppo/deterministic/distilled_expert/llm_rspc_expert_ridge.npz"
     expert_candidate_max_distance: float = 0.0
     expert_candidate_blend: float = 0.55
+    expert_intent_gate_enabled: bool = True
 
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
@@ -901,13 +909,20 @@ class RuleBasedLLMDirector:
             self.last_expert_prediction["available"] = False
             return None
         try:
+            intent = infer_plan_intent(state, plan)
+            effective_dehumidify_mode = str(dehumidify_mode or "normal")
+            if effective_dehumidify_mode == "normal":
+                effective_dehumidify_mode = intent_to_dehumidify_mode(intent.label)
             control, info = expert_policy.predict(
                 state,
                 plan=plan,
                 rh_violation_debt=rh_debt,
                 lamp_budget_remaining=lamp_budget_remaining,
-                dehumidify_mode=dehumidify_mode,
+                dehumidify_mode=effective_dehumidify_mode,
             )
+            control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+            strategy = label_strategy(action_record_for_labeling(state, control), action_prefix="u")
+            alignment = strategy_intent_alignment(strategy, intent)
             distance = float(info.get("feature_distance", 0.0))
             max_distance = float(getattr(self.config, "expert_candidate_max_distance", 4.0))
             if max_distance <= 0.0:
@@ -916,10 +931,25 @@ class RuleBasedLLMDirector:
                     max_distance = float(metadata_threshold) * 1.20
                 except Exception:
                     max_distance = 4.0
+            accepted = distance <= max_distance
+            reject_reason = "accepted"
+            if not accepted:
+                reject_reason = "feature_distance"
+            intent_gate_enabled = bool(getattr(self.config, "expert_intent_gate_enabled", True))
+            if (
+                accepted
+                and intent_gate_enabled
+                and intent.is_confident
+                and strategy.is_confident
+                and not bool(alignment.get("aligned", False))
+            ):
+                accepted = False
+                reject_reason = "intent_mismatch"
             self.last_expert_prediction = {
                 "enabled": True,
                 "available": True,
-                "accepted": distance <= max_distance,
+                "accepted": accepted,
+                "reject_reason": reject_reason,
                 "feature_distance": distance,
                 "max_abs_z": float(info.get("max_abs_z", 0.0)),
                 "max_distance": max_distance,
@@ -927,10 +957,17 @@ class RuleBasedLLMDirector:
                 "distance_threshold_p99": info.get("distance_threshold_p99"),
                 "model": info.get("model", "distilled_expert"),
                 "train_cases": info.get("train_cases"),
+                "target_mode": info.get("target_mode", "action"),
+                "plan_intent_label": intent.label,
+                "plan_intent_confidence": float(intent.confidence),
+                "effective_dehumidify_mode": effective_dehumidify_mode,
+                "expert_strategy_label": strategy.label,
+                "expert_strategy_confidence": float(strategy.confidence),
+                "intent_strategy_alignment": alignment,
             }
-            if distance > max_distance:
+            if not accepted:
                 return None
-            return np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+            return control
         except Exception as exc:
             self.last_expert_prediction = {
                 "enabled": True,
