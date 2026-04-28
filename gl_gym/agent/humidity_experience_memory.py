@@ -136,6 +136,7 @@ class HumidityExperience:
     trust: float
     support_count: int = 1
     supporting_cases: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_record(self) -> Dict[str, Any]:
         return asdict(self)
@@ -162,6 +163,7 @@ class HumidityExperience:
             trust=float(record.get("trust", 0.0)),
             support_count=int(record.get("support_count", 1)),
             supporting_cases=[str(x) for x in record.get("supporting_cases", [])],
+            metadata=dict(record.get("metadata", {})),
         )
 
 
@@ -579,13 +581,20 @@ def make_case_id(source: str, scenario: Dict[str, Any], residual: Sequence[float
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def config_fingerprint(config: HumidityExperienceConfig) -> str:
+    payload = json.dumps(config.__dict__, sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def build_experience_from_pair(
     ppo_row: Dict[str, Any],
     llm_row: Dict[str, Any],
     source: str = "ppo_vs_llm",
     config: Optional[HumidityExperienceConfig] = None,
+    source_metadata: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[HumidityExperience], ExperienceAssessment]:
-    assessment = assess_free_air_exchange_pair(ppo_row, llm_row, config=config)
+    cfg = config or HumidityExperienceConfig()
+    assessment = assess_free_air_exchange_pair(ppo_row, llm_row, config=cfg)
     if not assessment.accepted:
         return None, assessment
     state = row_to_state(llm_row)
@@ -605,6 +614,11 @@ def build_experience_from_pair(
     context = build_context(llm_row, llm_row)
     target = target_from_rows(llm_row, llm_row)
     case_id = make_case_id(source, scenario, residual)
+    metadata = dict(source_metadata or {})
+    metadata.setdefault("memory_schema_version", "hem_rspc_v1")
+    metadata.setdefault("teacher_policy_id", "ppo_unspecified")
+    metadata.setdefault("baseline_controller_id", "llm_rspc_unspecified")
+    metadata.setdefault("mining_config_hash", config_fingerprint(cfg))
     experience = HumidityExperience(
         case_id=case_id,
         status="pending",
@@ -625,6 +639,7 @@ def build_experience_from_pair(
         trust=trust_score(assessment),
         support_count=1,
         supporting_cases=[case_id],
+        metadata=metadata,
     )
     return experience, assessment
 
@@ -693,6 +708,7 @@ class HumidityExperienceMemory:
         top_k: int = 3,
         max_distance: Optional[float] = None,
         min_trust: Optional[float] = None,
+        required_metadata: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         cfg = self.config
         max_distance = cfg.retrieval_max_distance if max_distance is None else float(max_distance)
@@ -722,6 +738,14 @@ class HumidityExperienceMemory:
         query_vec = context_vector(build_context(row, target_row or row))
         matches: List[Dict[str, Any]] = []
         for experience in self.experiences:
+            if required_metadata:
+                mismatch = False
+                for key, value in required_metadata.items():
+                    if value is not None and str(experience.metadata.get(key, "")) != str(value):
+                        mismatch = True
+                        break
+                if mismatch:
+                    continue
             if experience.status not in {"pending", "validated"}:
                 continue
             if experience.intent_label != "economic_dehumidify" or experience.strategy_label != "free_air_exchange":

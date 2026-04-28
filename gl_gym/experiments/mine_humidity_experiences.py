@@ -20,6 +20,7 @@ from gl_gym.agent.humidity_experience_memory import (
     _float,
     assess_free_air_exchange_pair,
     build_experience_from_pair,
+    config_fingerprint,
 )
 
 
@@ -156,6 +157,11 @@ def main() -> None:
     parser.add_argument("--no-merge", action="store_true")
     parser.add_argument("--min-strategy-confidence", type=float, default=0.55)
     parser.add_argument("--min-intent-confidence", type=float, default=0.60)
+    parser.add_argument("--memory-version", type=str, default="hem_rspc_v1")
+    parser.add_argument("--teacher-policy-id", type=str, default="ppo_current")
+    parser.add_argument("--baseline-controller-id", type=str, default="llm_rspc_current")
+    parser.add_argument("--data-split", type=str, default="unspecified")
+    parser.add_argument("--source-trace-id", type=str, default="")
     args = parser.parse_args()
 
     config = HumidityExperienceConfig(
@@ -167,6 +173,14 @@ def main() -> None:
     memory = HumidityExperienceMemory(config=config)
     rejected: List[Dict[str, Any]] = []
     accepted_metrics: List[Dict[str, float]] = []
+    source_metadata = {
+        "memory_schema_version": str(args.memory_version),
+        "teacher_policy_id": str(args.teacher_policy_id),
+        "baseline_controller_id": str(args.baseline_controller_id),
+        "data_split": str(args.data_split),
+        "source_trace_id": str(args.source_trace_id or Path(args.trace).name),
+        "mining_config_hash": config_fingerprint(config),
+    }
 
     for key in sorted(paired):
         item = paired[key]
@@ -174,7 +188,12 @@ def main() -> None:
         llm = item.get("llm_director")
         if ppo is None or llm is None:
             continue
-        experience, assessment = build_experience_from_pair(ppo, llm, config=config)
+        experience, assessment = build_experience_from_pair(
+            ppo,
+            llm,
+            config=config,
+            source_metadata=source_metadata,
+        )
         future = future_window_metrics(paired, key, int(args.future_window))
         future_reasons: List[str] = []
         if experience is not None and future:
@@ -228,6 +247,7 @@ def main() -> None:
         "reject_reason_counts": reason_counts,
         "accepted_metric_means": metric_means,
         "config": config.__dict__,
+        "source_metadata": source_metadata,
     }
     out_summary = Path(args.output_summary)
     out_summary.parent.mkdir(parents=True, exist_ok=True)

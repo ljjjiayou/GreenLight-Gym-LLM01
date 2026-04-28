@@ -72,6 +72,9 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--max-distance", type=float, default=1.15)
     parser.add_argument("--min-trust", type=float, default=0.50)
+    parser.add_argument("--required-teacher-policy-id", type=str, default="")
+    parser.add_argument("--required-baseline-controller-id", type=str, default="")
+    parser.add_argument("--required-memory-version", type=str, default="")
     args = parser.parse_args()
 
     config = HumidityExperienceConfig(retrieval_max_distance=float(args.max_distance), min_trust=float(args.min_trust))
@@ -81,6 +84,15 @@ def main() -> None:
     context_reasons: Dict[str, int] = {}
     cost_deltas: List[float] = []
     conflict_deltas: List[float] = []
+    required_metadata = {
+        key: value
+        for key, value in {
+            "teacher_policy_id": args.required_teacher_policy_id,
+            "baseline_controller_id": args.required_baseline_controller_id,
+            "memory_schema_version": args.required_memory_version,
+        }.items()
+        if value
+    }
 
     for row in rows:
         reasons, context_metrics = screen_free_air_exchange_context(row, target_row=row, config=config)
@@ -93,7 +105,12 @@ def main() -> None:
         if reasons:
             for reason in reasons:
                 context_reasons[reason] = context_reasons.get(reason, 0) + 1
-        matches = memory.retrieve(row, target_row=row, top_k=int(args.top_k))
+        matches = memory.retrieve(
+            row,
+            target_row=row,
+            top_k=int(args.top_k),
+            required_metadata=required_metadata or None,
+        )
         base_action = action_from_row(row)
         record: Dict[str, Any] = {
             "year": int(_float(row, "year", 0.0)),
@@ -141,6 +158,7 @@ def main() -> None:
         "mean_proxy_cost_delta": float(sum(cost_deltas) / len(cost_deltas)) if cost_deltas else 0.0,
         "mean_heat_vent_delta": float(sum(conflict_deltas) / len(conflict_deltas)) if conflict_deltas else 0.0,
         "context_reject_reason_counts": context_reasons,
+        "required_metadata": required_metadata,
     }
     out_json = Path(args.output_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)

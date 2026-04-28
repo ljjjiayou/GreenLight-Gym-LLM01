@@ -68,6 +68,40 @@ PPO 给出高置信 free_air_exchange，
 
 这个修正不能绕过安全条件；它只能放松“目标 RH 过激导致的意图误判”。在经验证据中会记录 `plan_intent_overridden=1`，方便后续论文消融时单独验证。
 
+## 经验库版本管理
+
+经验库不是一次性训练产物。由于 PPO 权重、LLM-RSPC 规则、setpoint 合同和安全门控后续都可能更新，每条经验都必须记录来源版本：
+
+```text
+memory_schema_version
+teacher_policy_id
+baseline_controller_id
+data_split
+source_trace_id
+mining_config_hash
+```
+
+后续如果 PPO 或 LLM-RSPC 改进，不应直接混用旧经验，而应按下面流程处理：
+
+```text
+1. 保留旧经验库，作为可复现实验快照。
+2. 用新 PPO / 新 RSPC 重新生成配对轨迹。
+3. 对旧经验做 revalidation：
+   - 如果相对新 RSPC 不再省成本，降权或淘汰。
+   - 如果安全风险变差，标记 deprecated。
+   - 如果仍然有效，可以迁移到新版本经验库。
+4. 从新轨迹中继续挖掘新经验。
+5. 实验时只加载同一 teacher_policy_id / baseline_controller_id / data_split 的经验。
+```
+
+因此，HEM-RSPC 的经验学习不是“死记 PPO 当前动作”，而是一个可持续的离线经验生命周期：
+
+```text
+mine -> pending -> shadow validate -> validated -> revalidate -> migrate/deprecate
+```
+
+论文实验中应冻结某一版 PPO 和 RSPC，保证对照公平；工程优化中则可以随着控制器升级持续重挖和复验。
+
 ## 典型命令
 
 先生成配对诊断轨迹：

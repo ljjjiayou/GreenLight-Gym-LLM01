@@ -126,6 +126,32 @@ class TestHumidityExperienceMemory(unittest.TestCase):
         self.assertGreater(float(candidate[3]), float(action_from_row(_llm_row())[3]))
         self.assertLess(float(candidate[0]), float(action_from_row(_llm_row())[0]))
 
+    def test_metadata_filter_prevents_cross_version_reuse(self):
+        experience, _ = build_experience_from_pair(
+            _ppo_row(),
+            _llm_row(),
+            source_metadata={
+                "teacher_policy_id": "ppo_a",
+                "baseline_controller_id": "rspc_a",
+                "memory_schema_version": "hem_rspc_v1",
+            },
+        )
+        memory = HumidityExperienceMemory([experience])
+
+        matching = memory.retrieve(
+            _llm_row(),
+            target_row=_llm_row(),
+            required_metadata={"teacher_policy_id": "ppo_a"},
+        )
+        mismatching = memory.retrieve(
+            _llm_row(),
+            target_row=_llm_row(),
+            required_metadata={"teacher_policy_id": "ppo_b"},
+        )
+
+        self.assertTrue(matching)
+        self.assertFalse(mismatching)
+
 
 if __name__ == "__main__":
     unittest.main()
