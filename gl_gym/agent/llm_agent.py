@@ -24,6 +24,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from gl_gym.environments.baseline import RuleBasedController
 from gl_gym.common.utils import load_model_hyperparams, calculate_vpd_kpa
+from gl_gym.agent.expert_distillation import DistilledExpertPolicy
 from gl_gym.agent.tools import create_langchain_tools, GreenhouseTools # 导入 Tools 类
 
 
@@ -105,6 +106,10 @@ class AgentConfig:
     rollout_candidate_sharing: bool = True
     rollout_rule_weight_start: float = 0.25
     rollout_rule_weight_end: float = 0.55
+    expert_rollout_enabled: bool = False
+    expert_policy_path: str = "train_data/AgriControl/ppo/deterministic/distilled_expert/llm_rspc_expert_ridge.npz"
+    expert_candidate_max_distance: float = 0.0
+    expert_candidate_blend: float = 0.55
 
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
@@ -796,6 +801,7 @@ class RuleBasedLLMDirector:
         self.env_id = env_id or getattr(self.interface.env, "env_id", self.interface.env.__class__.__name__)
         # 加载规则控制器 (PID 或其他算法)
         self.rule_controller = self._init_rule_controller(rule_params)
+        self.expert_policy = self._init_expert_policy()
         
         # 状态追踪
         self.steps_since_last_llm = 0
@@ -806,6 +812,7 @@ class RuleBasedLLMDirector:
         self.last_plan_message: str = ""
         self.last_fallback_selection: Dict[str, Any] = {}
         self.last_rollout_selection: Dict[str, Any] = {}
+        self.last_expert_prediction: Dict[str, Any] = {}
         self.last_llm_trigger_step: int = -10**9
         self.emergency_replan_cooldown_steps: int = max(6, int(self.config.control_interval // 2))
         self.emergency_replan_confirm_steps: int = 2
@@ -863,6 +870,76 @@ class RuleBasedLLMDirector:
         if not rule_params:
             return None
         return RuleBasedController(**rule_params)
+
+    def _init_expert_policy(self) -> Optional[DistilledExpertPolicy]:
+        if not bool(getattr(self.config, "expert_rollout_enabled", False)):
+            return None
+        policy_path = str(getattr(self.config, "expert_policy_path", "") or "")
+        if not policy_path:
+            return None
+        try:
+            policy = DistilledExpertPolicy.load(policy_path)
+            print(f"[Director] Loaded distilled expert rollout policy: {policy_path}")
+            return policy
+        except FileNotFoundError:
+            print(f"[Director] Distilled expert policy not found, disabling expert rollout: {policy_path}")
+        except Exception as exc:
+            print(f"[Director] Failed to load distilled expert policy, disabling expert rollout: {exc}")
+        return None
+
+    def _predict_expert_control(
+        self,
+        state,
+        plan: Optional[Dict[str, Any]],
+        rh_debt: float,
+        lamp_budget_remaining: float,
+        dehumidify_mode: str,
+    ) -> Optional[np.ndarray]:
+        self.last_expert_prediction = {"enabled": bool(getattr(self.config, "expert_rollout_enabled", False))}
+        expert_policy = getattr(self, "expert_policy", None)
+        if expert_policy is None:
+            self.last_expert_prediction["available"] = False
+            return None
+        try:
+            control, info = expert_policy.predict(
+                state,
+                plan=plan,
+                rh_violation_debt=rh_debt,
+                lamp_budget_remaining=lamp_budget_remaining,
+                dehumidify_mode=dehumidify_mode,
+            )
+            distance = float(info.get("feature_distance", 0.0))
+            max_distance = float(getattr(self.config, "expert_candidate_max_distance", 4.0))
+            if max_distance <= 0.0:
+                metadata_threshold = info.get("distance_threshold_p99", info.get("distance_threshold"))
+                try:
+                    max_distance = float(metadata_threshold) * 1.20
+                except Exception:
+                    max_distance = 4.0
+            self.last_expert_prediction = {
+                "enabled": True,
+                "available": True,
+                "accepted": distance <= max_distance,
+                "feature_distance": distance,
+                "max_abs_z": float(info.get("max_abs_z", 0.0)),
+                "max_distance": max_distance,
+                "distance_threshold": info.get("distance_threshold"),
+                "distance_threshold_p99": info.get("distance_threshold_p99"),
+                "model": info.get("model", "distilled_expert"),
+                "train_cases": info.get("train_cases"),
+            }
+            if distance > max_distance:
+                return None
+            return np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        except Exception as exc:
+            self.last_expert_prediction = {
+                "enabled": True,
+                "available": True,
+                "accepted": False,
+                "error": str(exc),
+            }
+            print(f"[Director] Distilled expert rollout failed: {exc}")
+            return None
     
     def _get_weather_vector(self) -> np.ndarray:
         env = self.interface.env
@@ -2148,6 +2225,14 @@ class RuleBasedLLMDirector:
             except Exception as e:
                 print(f"[Director] Rule rollout failed, fallback to anchor control: {e}")
 
+        expert_control = self._predict_expert_control(
+            state=state,
+            plan=plan,
+            rh_debt=rh_debt,
+            lamp_budget_remaining=lamp_budget_remaining,
+            dehumidify_mode=dehumidify_mode,
+        )
+
         plan_start = int(plan.get("created_timestep", int(state.timestep)))
         plan_end = int(plan.get("expires_timestep", plan_start + 1))
         plan_len = max(1, plan_end - plan_start)
@@ -2169,6 +2254,23 @@ class RuleBasedLLMDirector:
                 ("rule_lean_blend", 0.25 * anchor_control + 0.75 * rule_control, 0.75),
                 ("rule", rule_control, 1.0),
             ]
+            if expert_control is not None:
+                expert_blend = float(np.clip(getattr(self.config, "expert_candidate_blend", 0.55), 0.0, 1.0))
+                candidate_controls.extend(
+                    [
+                        ("distilled_expert", expert_control, 0.0),
+                        (
+                            "expert_anchor_blend",
+                            expert_blend * expert_control + (1.0 - expert_blend) * anchor_control,
+                            0.0,
+                        ),
+                        (
+                            "expert_rule_blend",
+                            expert_blend * expert_control + (1.0 - expert_blend) * rule_control,
+                            1.0 - expert_blend,
+                        ),
+                    ]
+                )
             scored_candidates = []
             for name, candidate_control, candidate_rule_weight in candidate_controls:
                 clipped = np.clip(np.asarray(candidate_control, dtype=np.float32), 0.0, 1.0)
@@ -2191,6 +2293,7 @@ class RuleBasedLLMDirector:
                     }
                     for score, name, _, candidate_rule_weight, _ in scored_candidates
                 ],
+                "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
             }
         else:
             self.last_rollout_selection = {
@@ -2198,6 +2301,7 @@ class RuleBasedLLMDirector:
                 "score": None,
                 "rule_weight": float(rule_weight),
                 "candidates": [],
+                "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
             }
 
         target_temp = self._get_plan_target(plan, "target_temp", state)

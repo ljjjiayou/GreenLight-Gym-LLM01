@@ -52,8 +52,10 @@ class TestPlanningExtensions(unittest.TestCase):
         director.rules = RuleBasedLLMDirector._init_rules(director)
         director.interface = DummyInterface()
         director.rule_controller = None
+        director.expert_policy = None
         director.last_control = None
         director.last_fallback_selection = {}
+        director.last_expert_prediction = {}
         director.last_llm_trigger_step = -10**9
         director.emergency_replan_cooldown_steps = max(6, director.config.control_interval // 2)
         director.current_plan = None
@@ -204,6 +206,53 @@ class TestPlanningExtensions(unittest.TestCase):
 
         self.assertEqual(director.last_rollout_selection["source"], "anchor")
         self.assertEqual(rule_weight, 0.0)
+        self.assertLess(float(control[0]), 0.05)
+        self.assertLess(float(control[3]), 0.15)
+        self.assertEqual(float(control[4]), 0.0)
+
+    def test_distilled_expert_can_be_selected_as_rollout_candidate(self):
+        class WastefulRule:
+            def predict(self, *_args):
+                return np.array([0.70, 0.50, 1.00, 0.70, 0.80, 0.0], dtype=np.float32)
+
+        class CalmExpert:
+            def predict(self, *_args, **_kwargs):
+                return np.zeros(6, dtype=np.float32), {
+                    "feature_distance": 0.5,
+                    "max_abs_z": 1.0,
+                    "model": "test_expert",
+                    "train_cases": 24,
+                }
+
+        director = self._director()
+        director.config.expert_rollout_enabled = True
+        director.config.expert_candidate_max_distance = 4.0
+        director.rule_controller = WastefulRule()
+        director.expert_policy = CalmExpert()
+        director.current_plan = {
+            "anchor_control": np.ones(6, dtype=np.float32) * 0.75,
+            "created_timestep": 0,
+            "expires_timestep": 12,
+            "target_temp": 18.0,
+            "target_co2": 430.0,
+            "target_rh": 70.0,
+            "target_profile": {},
+        }
+
+        control, _rule, _anchor, _rule_weight = director._plan_control_step(
+            DummyState(
+                temp_air=18.0,
+                rh_air=70.0,
+                co2_air=430.0,
+                glob_rad=300.0,
+                hour_of_day=12.0,
+                dew_margin_air=2.0,
+                canopy_dew_margin=2.0,
+            )
+        )
+
+        self.assertEqual(director.last_rollout_selection["source"], "distilled_expert")
+        self.assertTrue(director.last_rollout_selection["expert_prediction"]["accepted"])
         self.assertLess(float(control[0]), 0.05)
         self.assertLess(float(control[3]), 0.15)
         self.assertEqual(float(control[4]), 0.0)

@@ -235,6 +235,9 @@ def run_llm_case(
     llm_max_tokens: int,
     llm_fallback_max_steps: int,
     rule_params: dict,
+    expert_rollout_enabled: bool = False,
+    expert_policy_path: str = "",
+    expert_candidate_max_distance: float = 0.0,
 ) -> dict:
     base_env_params = dict(env_cfg["GreenLightEnv"])
     base_env_params["training"] = False
@@ -264,6 +267,9 @@ def run_llm_case(
         control_interval=llm_interval,
         max_iterations=llm_max_iterations,
         max_tokens=llm_max_tokens,
+        expert_rollout_enabled=bool(expert_rollout_enabled),
+        expert_policy_path=expert_policy_path or AgentConfig.expert_policy_path,
+        expert_candidate_max_distance=float(expert_candidate_max_distance),
     )
     agent = RuleBasedLLMDirector(
         agent_interface=interface,
@@ -278,6 +284,11 @@ def run_llm_case(
     done = False
     runtime_error = ""
     fallback_steps = 0
+    rollout_source_counts: dict[str, int] = {}
+    expert_available_steps = 0
+    expert_accepted_steps = 0
+    expert_selected_steps = 0
+    expert_distances: list[float] = []
     while (not done) and steps < max_steps:
         try:
             result = agent.step_with_rules()
@@ -313,6 +324,23 @@ def run_llm_case(
         total_reward += reward
         info = env._get_info()
         add_info_metrics(totals, info)
+        plan_info = result.get("plan", {}) if isinstance(result, dict) else {}
+        rollout_info = plan_info.get("rollout_selection", {}) if isinstance(plan_info, dict) else {}
+        rollout_source = str(rollout_info.get("source", "unknown"))
+        rollout_source_counts[rollout_source] = rollout_source_counts.get(rollout_source, 0) + 1
+        if rollout_source.startswith("expert") or rollout_source == "distilled_expert":
+            expert_selected_steps += 1
+        expert_info = rollout_info.get("expert_prediction", {}) if isinstance(rollout_info, dict) else {}
+        if isinstance(expert_info, dict):
+            if expert_info.get("available"):
+                expert_available_steps += 1
+            if expert_info.get("accepted"):
+                expert_accepted_steps += 1
+            if expert_info.get("feature_distance") is not None:
+                try:
+                    expert_distances.append(float(expert_info.get("feature_distance")))
+                except Exception:
+                    pass
         done = bool(result.get("done", False))
         steps += 1
     return {
@@ -321,6 +349,12 @@ def run_llm_case(
         "mean_reward": total_reward / max(steps, 1),
         "runtime_error": runtime_error,
         "fallback_steps": fallback_steps,
+        "rollout_source_counts": rollout_source_counts,
+        "expert_available_steps": expert_available_steps,
+        "expert_accepted_steps": expert_accepted_steps,
+        "expert_selected_steps": expert_selected_steps,
+        "expert_mean_feature_distance": float(mean(expert_distances)) if expert_distances else 0.0,
+        "expert_max_feature_distance": float(max(expert_distances)) if expert_distances else 0.0,
         **totals,
     }
 
@@ -468,6 +502,19 @@ def main():
     parser.add_argument("--llm-max-iterations", type=int, default=1, help="Max reasoning steps")
     parser.add_argument("--llm-max-tokens", type=int, default=260, help="Max output tokens")
     parser.add_argument("--llm-fallback-max-steps", type=int, default=2, help="Max fallback control steps after LLM runtime exceptions")
+    parser.add_argument("--llm-expert-rollout", action="store_true", help="Enable PPO-distilled expert rollout candidate")
+    parser.add_argument(
+        "--llm-expert-policy-path",
+        type=str,
+        default=AgentConfig.expert_policy_path,
+        help="Path to distilled expert NPZ model",
+    )
+    parser.add_argument(
+        "--llm-expert-max-distance",
+        type=float,
+        default=AgentConfig.expert_candidate_max_distance,
+        help="OOD cutoff for expert feature distance; <=0 uses model metadata p99 * 1.2",
+    )
     parser.add_argument("--safety-temp-threshold", type=float, default=100.0, help="Hard threshold for temperature violation")
     parser.add_argument("--safety-co2-threshold", type=float, default=10000.0, help="Hard threshold for CO2 violation")
     parser.add_argument("--safety-rh-threshold", type=float, default=30.0, help="Hard threshold for RH violation")
@@ -616,7 +663,10 @@ def main():
                         env_cfg, api_key, year, day, seed, args.max_steps,
                         args.llm_model, args.llm_interval, args.llm_max_iterations, args.llm_max_tokens,
                         args.llm_fallback_max_steps,
-                        rule_params
+                        rule_params,
+                        expert_rollout_enabled=args.llm_expert_rollout,
+                        expert_policy_path=args.llm_expert_policy_path,
+                        expert_candidate_max_distance=args.llm_expert_max_distance,
                     )
                     llm_elapsed = time.perf_counter() - t2
                     llm_row = {
@@ -647,6 +697,9 @@ def main():
         "llm_interval": args.llm_interval,
         "llm_max_iterations": args.llm_max_iterations,
         "llm_max_tokens": args.llm_max_tokens,
+        "llm_expert_rollout": bool(args.llm_expert_rollout),
+        "llm_expert_policy_path": args.llm_expert_policy_path,
+        "llm_expert_max_distance": float(args.llm_expert_max_distance),
         "safety_thresholds": SAFETY_THRESHOLDS,
         "summaries": [
             summarize(rows, "ppo"),
