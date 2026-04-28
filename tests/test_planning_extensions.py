@@ -30,9 +30,13 @@ class DummyState:
 
 class DummyEnv:
     nu = 6
+    nd = 10
 
     def __init__(self):
         self.u = np.zeros(6, dtype=np.float32)
+        self.x = np.zeros(4, dtype=np.float32)
+        self.timestep = 0
+        self.weather_data = [np.zeros(self.nd, dtype=np.float32)]
 
 
 class DummyInterface:
@@ -53,8 +57,15 @@ class TestPlanningExtensions(unittest.TestCase):
         director.last_llm_trigger_step = -10**9
         director.emergency_replan_cooldown_steps = max(6, director.config.control_interval // 2)
         director.current_plan = None
+        director.last_rollout_selection = {}
         director.rh_emergency_streak_steps = 0
         director.rh_violation_debt = 0.0
+        director.dehumidify_mode = "normal"
+        director.dehumidify_mode_hold_steps = 0
+        director.dehumidify_exit_confirm_counter = 0
+        director._lamp_budget_day_marker = None
+        director._lamp_budget_integral = 0.0
+        director.last_lamp_budget_remaining = director.config.lamp_daily_budget
         return director
 
     def test_explicit_action_set_allows_zero_anchor(self):
@@ -125,6 +136,21 @@ class TestPlanningExtensions(unittest.TestCase):
         self.assertEqual(float(control[1]), 0.0)
         self.assertEqual(float(control[4]), 0.0)
 
+    def test_moderate_rh_low_temp_vpd_does_not_trigger_dehumid_pulse(self):
+        control = apply_safety_guardrails(
+            DummyState(
+                temp_air=14.0,
+                rh_air=80.0,
+                hour_of_day=14.0,
+                dew_margin_air=2.0,
+                canopy_dew_margin=2.0,
+            ),
+            np.zeros(6, dtype=np.float32),
+        )
+
+        self.assertLess(float(control[0]), 0.05)
+        self.assertLess(float(control[3]), 0.15)
+
     def test_rh_emergency_replan_respects_extended_cooldown(self):
         director = self._director()
         director.last_llm_trigger_step = 10
@@ -146,6 +172,41 @@ class TestPlanningExtensions(unittest.TestCase):
         )
 
         self.assertGreaterEqual(float(control[3]), 0.549)
+
+    def test_rollout_candidate_sharing_avoids_bad_rule_action(self):
+        class WastefulRule:
+            def predict(self, *_args):
+                return np.array([0.70, 0.50, 1.00, 0.70, 0.80, 0.0], dtype=np.float32)
+
+        director = self._director()
+        director.rule_controller = WastefulRule()
+        director.current_plan = {
+            "anchor_control": np.zeros(6, dtype=np.float32),
+            "created_timestep": 0,
+            "expires_timestep": 12,
+            "target_temp": 18.0,
+            "target_co2": 430.0,
+            "target_rh": 70.0,
+            "target_profile": {},
+        }
+
+        control, _rule, _anchor, rule_weight = director._plan_control_step(
+            DummyState(
+                temp_air=18.0,
+                rh_air=70.0,
+                co2_air=430.0,
+                glob_rad=300.0,
+                hour_of_day=12.0,
+                dew_margin_air=2.0,
+                canopy_dew_margin=2.0,
+            )
+        )
+
+        self.assertEqual(director.last_rollout_selection["source"], "anchor")
+        self.assertEqual(rule_weight, 0.0)
+        self.assertLess(float(control[0]), 0.05)
+        self.assertLess(float(control[3]), 0.15)
+        self.assertEqual(float(control[4]), 0.0)
 
 
 if __name__ == "__main__":

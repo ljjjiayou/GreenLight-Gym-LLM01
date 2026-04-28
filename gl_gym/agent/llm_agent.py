@@ -101,6 +101,11 @@ class AgentConfig:
     fallback_smooth_penalty_weight: float = 0.20
     fallback_conflict_penalty_weight: float = 0.75
 
+    # Rollout control sharing: avoid blindly following a weak rule controller.
+    rollout_candidate_sharing: bool = True
+    rollout_rule_weight_start: float = 0.25
+    rollout_rule_weight_end: float = 0.55
+
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
     lamp_budget_soft_cap: float = 0.40            # 预算接近上限时的补光软上限
@@ -243,6 +248,15 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
     is_night = hour_of_day < 6.0 or hour_of_day > 18.0
     
     vpd = calculate_vpd_kpa(temp_air, rh_air)
+    dew_margin = min(
+        float(getattr(state, "dew_margin_air", 3.0)),
+        float(getattr(state, "canopy_dew_margin", 3.0)),
+    )
+    low_vpd_humidity_risk = (
+        (rh_air >= 82.0 and vpd < 0.35)
+        or (rh_air >= 78.0 and vpd < 0.22)
+    )
+    humidity_risk = rh_air > 85.0 or low_vpd_humidity_risk or dew_margin < 0.6
     print(f"[Guard] T={temp_air:.1f}, RH={rh_air:.1f}, VPD={vpd:.2f} kPa, Fruit={fruit_weight:.2f}")
 
     # --- 幼苗期铁律（硬约束） ---
@@ -328,8 +342,8 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         guarded[3] = min(guarded[3], vent_cap)
     
     # 2. 高湿/低VPD 处理（防病害）
-    # 如果 VPD < 0.4 (过湿) 或 RH > 85% (新增)，需要除湿
-    if vpd < 0.4 or rh_air > 85.0:
+    # 低温下 VPD 会天然偏低；只有叠加较高 RH 或露点风险时才启动除湿。
+    if humidity_risk:
         # RH 尾部紧急处理：防止在长间隔低 token 决策下湿度被“锁死”
         if rh_air > 95.0:
             guarded[2] = min(guarded[2], 0.35)  # 降低保温幕闭合度以释放湿气
@@ -343,7 +357,13 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         # 允许一定程度的加热+通风 (除湿模式)
         if temp_air < 18.0:
             if temp_air < 15.0:
-                guarded[0] = max(guarded[0], 0.22) # 极冷，适度加热除湿
+                if rh_air >= 92.0 or dew_margin < 0.6:
+                    heat_floor = 0.22
+                elif rh_air >= 90.0:
+                    heat_floor = 0.14
+                else:
+                    heat_floor = 0.08
+                guarded[0] = max(guarded[0], heat_floor) # 轻度高湿避免过度烧暖气
             else:
                 guarded[0] = max(guarded[0], 0.08) # 微冷，低加热除湿 (省钱)
             
@@ -366,8 +386,12 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
     
         # Heat-vent pulse: extreme RH needs a small heat floor even when air temp is acceptable.
         # This raises VPD while ventilation exports moisture, instead of relying on ventilation alone.
-        if (rh_air >= 92.0 or vpd < 0.22) and temp_air < 21.5 and not high_temp_override:
-            extreme_rh = rh_air >= 94.0 or vpd < 0.18
+        if (
+            rh_air >= 92.0
+            or (rh_air >= 78.0 and vpd < 0.22)
+            or dew_margin < 0.6
+        ) and temp_air < 21.5 and not high_temp_override:
+            extreme_rh = rh_air >= 94.0 or (rh_air >= 78.0 and vpd < 0.18) or dew_margin < 0.4
             heat_floor = 0.24 if extreme_rh else 0.16
             if temp_air < 15.0:
                 heat_floor = max(heat_floor, 0.28)
@@ -455,7 +479,11 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
 
     # 7. 夜间保温策略
     # High RH / low VPD can tolerate a larger vent opening even under wind protection.
-    if (rh_air >= 92.0 or vpd < 0.20) and temp_air < 21.5:
+    if (
+        rh_air >= 92.0
+        or (rh_air >= 78.0 and vpd < 0.20)
+        or dew_margin < 0.6
+    ) and temp_air < 21.5:
         if wind_speed > 8.0:
             guarded[3] = max(guarded[3], 0.48)
         elif wind_speed > 6.0 and temp_out < temp_air:
@@ -469,8 +497,9 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         if temp_air < 15.0:
             guarded[2] = max(guarded[2], 0.80) # 夜间低温必拉保温幕
 
-    if is_night and temp_air < 15.0 and (rh_air >= 86.0 or vpd < 0.35):
-        guarded[0] = max(guarded[0], 0.25)
+    if is_night and temp_air < 15.0 and (rh_air >= 86.0 or (rh_air >= 82.0 and vpd < 0.35) or dew_margin < 0.6):
+        night_heat_floor = 0.25 if (rh_air >= 90.0 or dew_margin < 0.6) else 0.12
+        guarded[0] = max(guarded[0], night_heat_floor)
         guarded[2] = min(max(guarded[2], 0.45), 0.75)
 
     return np.clip(guarded, 0.0, 1.0)
@@ -776,6 +805,7 @@ class RuleBasedLLMDirector:
         self.current_plan: Optional[Dict[str, Any]] = None
         self.last_plan_message: str = ""
         self.last_fallback_selection: Dict[str, Any] = {}
+        self.last_rollout_selection: Dict[str, Any] = {}
         self.last_llm_trigger_step: int = -10**9
         self.emergency_replan_cooldown_steps: int = max(6, int(self.config.control_interval // 2))
         self.emergency_replan_confirm_steps: int = 2
@@ -1039,7 +1069,13 @@ class RuleBasedLLMDirector:
 
         preemptive_risk = max(rh - float(self.config.rh_preemptive_threshold), 0.0)
         violation_risk = max(rh - float(self.config.rh_control_limit), 0.0)
-        vpd_risk = max(0.42 - vpd, 0.0) * 8.0
+        if rh >= 82.0:
+            vpd_risk_threshold = 0.42
+        elif rh >= 78.0:
+            vpd_risk_threshold = 0.25
+        else:
+            vpd_risk_threshold = 0.0
+        vpd_risk = max(vpd_risk_threshold - vpd, 0.0) * 8.0
         dew_risk = max(1.0 - dew_margin, 0.0) * 2.0
 
         debt = float(self.rh_violation_debt) * float(self.config.rh_debt_decay)
@@ -1792,13 +1828,14 @@ class RuleBasedLLMDirector:
         risk_cap = 88.0
         if (
             rh_now >= float(self.config.rh_control_limit)
-            or vpd_now < 0.30
+            or (rh_now >= 82.0 and vpd_now < 0.30)
+            or (rh_now >= 78.0 and vpd_now < 0.20)
             or dew_margin < 0.8
         ):
             risk_cap = float(self.config.rh_target_extreme_cap)
         elif (
             rh_now >= float(self.config.dehumidify_mild_rh_on)
-            or vpd_now < 0.40
+            or (rh_now >= 82.0 and vpd_now < 0.40)
             or dew_margin < 1.2
         ):
             risk_cap = float(self.config.rh_target_high_cap)
@@ -2116,9 +2153,52 @@ class RuleBasedLLMDirector:
         plan_len = max(1, plan_end - plan_start)
         progress = float(np.clip((int(state.timestep) - plan_start) / plan_len, 0.0, 1.0))
 
-        # 以规则执行为主，锚点提供方向；随计划推进提高规则权重。
-        rule_weight = 0.55 + 0.25 * progress
-        control = (1.0 - rule_weight) * anchor_control + rule_weight * rule_control
+        # Risk-weighted control sharing. The previous fixed 55%-80% rule blend was too
+        # trusting when the rule controller itself performed poorly in this benchmark.
+        rule_weight_start = float(np.clip(self.config.rollout_rule_weight_start, 0.0, 1.0))
+        rule_weight_end = float(np.clip(self.config.rollout_rule_weight_end, 0.0, 1.0))
+        rule_weight = float(np.clip(rule_weight_start + (rule_weight_end - rule_weight_start) * progress, 0.0, 1.0))
+        nominal_blend = (1.0 - rule_weight) * anchor_control + rule_weight * rule_control
+        control = np.asarray(nominal_blend, dtype=np.float32)
+
+        if bool(getattr(self.config, "rollout_candidate_sharing", True)):
+            candidate_controls = [
+                ("anchor", anchor_control, 0.0),
+                ("anchor_lean_blend", 0.75 * anchor_control + 0.25 * rule_control, 0.25),
+                ("nominal_blend", nominal_blend, rule_weight),
+                ("rule_lean_blend", 0.25 * anchor_control + 0.75 * rule_control, 0.75),
+                ("rule", rule_control, 1.0),
+            ]
+            scored_candidates = []
+            for name, candidate_control, candidate_rule_weight in candidate_controls:
+                clipped = np.clip(np.asarray(candidate_control, dtype=np.float32), 0.0, 1.0)
+                score, details = self._score_fallback_candidate(state, clipped)
+                scored_candidates.append((score, name, clipped, candidate_rule_weight, details))
+            scored_candidates.sort(key=lambda item: item[0])
+            _, selected_name, selected_control, selected_rule_weight, selected_details = scored_candidates[0]
+            control = np.asarray(selected_control, dtype=np.float32)
+            rule_weight = float(selected_rule_weight)
+            self.last_rollout_selection = {
+                "source": selected_name,
+                "score": float(scored_candidates[0][0]),
+                "rule_weight": float(rule_weight),
+                "details": selected_details,
+                "candidates": [
+                    {
+                        "name": name,
+                        "score": float(score),
+                        "rule_weight": float(candidate_rule_weight),
+                    }
+                    for score, name, _, candidate_rule_weight, _ in scored_candidates
+                ],
+            }
+        else:
+            self.last_rollout_selection = {
+                "source": "fixed_blend",
+                "score": None,
+                "rule_weight": float(rule_weight),
+                "candidates": [],
+            }
 
         target_temp = self._get_plan_target(plan, "target_temp", state)
         if target_temp is not None:
@@ -2157,15 +2237,20 @@ class RuleBasedLLMDirector:
             float(getattr(state, "dew_margin_air", 3.0)),
             float(getattr(state, "canopy_dew_margin", 3.0)),
         )
+        low_vpd_humidity_risk = (
+            (rh_air >= 82.0 and vpd_now < 0.42)
+            or (rh_air >= 78.0 and vpd_now < 0.25)
+        )
         rh_risk_active = (
             rh_air >= float(self.config.rh_preemptive_threshold)
-            or vpd_now < 0.42
+            or low_vpd_humidity_risk
             or dew_margin < 1.1
             or rh_debt > 2.0
         )
         if rh_risk_active:
             severity = max(rh_air - float(self.config.rh_preemptive_threshold), 0.0)
-            severity = max(severity, max(0.42 - vpd_now, 0.0) * 6.0)
+            if low_vpd_humidity_risk:
+                severity = max(severity, max(0.42 - vpd_now, 0.0) * 6.0)
             severity = max(severity, max(1.1 - dew_margin, 0.0) * 2.0)
             debt_vent = min(0.22, float(self.config.rh_debt_vent_gain) * rh_debt)
             debt_screen = min(0.28, float(self.config.rh_debt_screen_gain) * rh_debt)
@@ -2182,8 +2267,12 @@ class RuleBasedLLMDirector:
             elif vpd_now < 0.35 and temp_air < 18.0:
                 control[0] = max(control[0], 0.08)
 
-            if (rh_air >= 92.0 or vpd_now < 0.22 or dew_margin < 0.6) and temp_air < float(self.config.rh_pulse_temp_cap):
-                extreme_rh = rh_air >= 94.0 or vpd_now < 0.18 or dew_margin < 0.4
+            if (
+                rh_air >= 92.0
+                or (rh_air >= 78.0 and vpd_now < 0.22)
+                or dew_margin < 0.6
+            ) and temp_air < float(self.config.rh_pulse_temp_cap):
+                extreme_rh = rh_air >= 94.0 or (rh_air >= 78.0 and vpd_now < 0.18) or dew_margin < 0.4
                 heat_floor = (
                     float(self.config.rh_pulse_extreme_heat_floor)
                     if extreme_rh
@@ -2486,6 +2575,7 @@ class RuleBasedLLMDirector:
                 "reason": self.current_plan.get("reason"),
                 "anchor_source": self.current_plan.get("anchor_source", "unknown"),
                 "fallback_selection": self.current_plan.get("fallback_selection", {}),
+                "rollout_selection": dict(getattr(self, "last_rollout_selection", {})),
                 "dehumidify_mode": self.dehumidify_mode,
                 "rh_violation_debt": self.rh_violation_debt,
                 "lamp_budget_remaining": self.last_lamp_budget_remaining,
