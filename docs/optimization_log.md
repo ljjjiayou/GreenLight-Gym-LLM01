@@ -97,3 +97,44 @@ This change supports the method claim:
 > execution. PPO knowledge is distilled into a lightweight rollout candidate,
 > while rule contracts, candidate scoring, and guardrails preserve safety and
 > interpretability.
+
+## 2026-04-28: PPO vs LLM-RSPC diagnostic tooling
+
+### Motivation
+
+Manual threshold tuning is no longer the best next step. The controller needs a
+repeatable way to answer why PPO has better profit while LLM-RSPC often has
+better humidity safety. The diagnostic tool therefore records matched PPO and
+LLM-RSPC trajectories and groups action/cost/safety differences by greenhouse
+regime.
+
+### Code changes
+
+- Added `gl_gym/experiments/diagnose_ppo_vs_llm.py`.
+  - Runs PPO and LLM-RSPC on the same year/day/seed window.
+  - Saves per-step JSON and CSV trajectories.
+  - Summarizes aggregate reward/profit/cost/violation metrics.
+  - Computes per-action PPO-vs-LLM differences.
+  - Groups results by phase, RH band, temperature band, and radiation band.
+  - Counts safety/cost patterns such as heat+vent conflict, CO2 leakage during
+    ventilation, risky lamp usage, and RH>=90 states.
+
+### First smoke result
+
+Scenario: 2020/day240, seed 42, 24 steps.
+
+- PPO reward: 15.063; profit: -0.00453; RH violation: 1.467.
+- LLM-RSPC reward: 15.032; profit: -0.00712; RH violation: 0.000.
+- LLM-RSPC is safer on RH in this short window, but it spends more heat.
+- Mean absolute action gaps are largest for screen and ventilation.
+- Heat+vent conflict steps:
+  - PPO: 1.
+  - LLM-RSPC: 8.
+
+### Next hypothesis
+
+The next controller improvement should focus on dehumidification cost gating:
+LLM-RSPC already controls RH aggressively, but it needs a duty-cycle or marginal
+benefit gate for heat+vent pulses. A publishable framing is:
+
+> humidity-risk-aware economic pulse gating for safe rollout control.
