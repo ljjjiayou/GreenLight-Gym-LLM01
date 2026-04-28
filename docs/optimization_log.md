@@ -138,3 +138,84 @@ LLM-RSPC already controls RH aggressively, but it needs a duty-cycle or marginal
 benefit gate for heat+vent pulses. A publishable framing is:
 
 > humidity-risk-aware economic pulse gating for safe rollout control.
+
+## 2026-04-28: PPO strategy-label audit for safe distillation
+
+### Motivation
+
+Using PPO as an expert source is only useful if its continuous actions can be
+translated into stable, auditable strategy tendencies. The previous trajectory
+export and ridge distillation can copy actions numerically, but that is not
+enough for a paper-grade greenhouse controller because a mixed action such as
+heating plus ventilation may mean dehumidification, wasteful conflict, or a
+transition artifact depending on RH risk and crop-climate context.
+
+This step therefore adds a conservative strategy-label layer before any further
+PPO-to-LLM-RSPC distillation. PPO is treated as a behavior reference and
+diagnostic mirror, not as a ground-truth controller.
+
+### Code changes
+
+- Added `gl_gym/agent/ppo_strategy_labeler.py`.
+  - Scores each continuous action against interpretable strategy candidates:
+    economy hold, vent-only dehumidification, heat+vent dehumidification,
+    screen-release dehumidification, heat preservation, free air exchange,
+    cooling ventilation, CO2 enrichment, lighting assist, and shade cooling.
+  - Uses action values together with climate features such as RH, temperature,
+    VPD, dew-margin risk, radiation, and time of day.
+  - Marks a sample as `unknown` when the best score is too weak and
+    `ambiguous` when the top two strategies are too close.
+  - Exports the full soft score vector and reason string for later auditing.
+
+- Updated `gl_gym/experiments/diagnose_ppo_vs_llm.py`.
+  - Adds strategy labels to both PPO and LLM-RSPC trace rows.
+  - Adds a label audit block with confident/ambiguous/unknown counts.
+  - Adds a useful-PPO-tendency filter: high-confidence PPO labels are counted
+    as useful only when PPO has same-step profit advantage without increasing
+    same-step RH or temperature violation beyond a small tolerance.
+
+- Added `tests/test_ppo_strategy_labeler.py`.
+  - Covers humidity-risk-aware dehumidification labels, heat preservation,
+    free-air exchange, and conservative rejection of weak mixed actions.
+
+### First audit result
+
+Scenario: 2020/day240, seed 42, 24 steps.
+
+- PPO reward: 15.063; profit: -0.00453; RH violation: 1.467.
+- LLM-RSPC reward: 15.032; profit: -0.00712; RH violation: 0.000.
+- Heat+vent conflict steps:
+  - PPO: 1.
+  - LLM-RSPC: 8.
+- Strategy label audit:
+  - PPO: 8 confident `free_air_exchange` samples, 1 ambiguous sample, 15
+    unknown samples.
+  - LLM-RSPC: 14 confident `economy_hold` samples, 1 confident
+    `free_air_exchange` sample, 9 unknown samples.
+- Useful PPO tendency candidates:
+  - 8 high-confidence useful PPO samples.
+  - All 8 are `free_air_exchange`.
+  - No high-confidence PPO samples were rejected by the same-step safety filter
+    in this short window.
+
+### Interpretation
+
+The first label audit supports the current optimization direction. In this
+window, LLM-RSPC is safer on RH but pays extra heat cost and triggers more
+heat+vent conflict. PPO's useful tendency is not "stronger dehumidification";
+it is low-cost air exchange under moderate humidity risk: high ventilation,
+open screen, low heating, and no CO2 or lamp use.
+
+The next controller change should therefore be a dehumidification economic gate:
+
+- when RH/dew risk is severe, keep the existing safe dehumidification behavior;
+- when RH risk is moderate and temperature is not too low, prefer a bounded
+  free-air-exchange candidate before heat+vent pulses;
+- when the action is ambiguous or out of the audited region, fall back to the
+  existing rule and guardrail stack.
+
+This gives a clearer paper claim than direct PPO cloning:
+
+> LLM-RSPC mines PPO trajectories for interpretable, confidence-gated strategy
+> tendencies, then injects only safety-filtered economic behaviors into a
+> rule-constrained rollout controller.

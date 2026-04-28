@@ -32,6 +32,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from gl_gym.agent.expert_distillation import ACTION_NAMES
 from gl_gym.agent.interface import GreenhouseAgentInterface
 from gl_gym.agent.llm_agent import AgentConfig, RuleBasedLLMDirector, create_langchain_tools
+from gl_gym.agent.ppo_strategy_labeler import label_strategy
 from gl_gym.environments.baseline import RuleBasedController as GreenhouseRuleController
 from gl_gym.environments.tomato_env import TomatoEnv
 
@@ -197,6 +198,18 @@ def append_regime_labels(row: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
+def append_strategy_label(row: Dict[str, Any]) -> Dict[str, Any]:
+    strategy = label_strategy(row, action_prefix="u")
+    row.update(strategy.to_record(prefix="strategy"))
+    return row
+
+
+def finalize_trace_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    append_regime_labels(row)
+    append_strategy_label(row)
+    return row
+
+
 def run_ppo_trace(
     model: PPO,
     vecnorm_path: Path,
@@ -236,7 +249,7 @@ def run_ppo_trace(
             **control_to_record(action_cmd_1d, prefix="action_cmd"),
             **info_to_metrics(dict(infos[0])),
         }
-        rows.append(append_regime_labels(row))
+        rows.append(finalize_trace_row(row))
         done = bool(dones[0])
         step += 1
     vec_env.close()
@@ -332,7 +345,7 @@ def run_llm_trace(
             **control_to_record(result.get("rule_control", np.zeros(6)), prefix="rule"),
             **info_to_metrics(info),
         }
-        rows.append(append_regime_labels(row))
+        rows.append(finalize_trace_row(row))
         done = bool(result.get("done", False))
         step += 1
     return rows
@@ -382,6 +395,12 @@ def pairwise_step_diffs(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "ppo_profit": float(p.get("profit", 0.0)),
             "llm_profit": float(l.get("profit", 0.0)),
             "profit_diff_llm_minus_ppo": float(l.get("profit", 0.0)) - float(p.get("profit", 0.0)),
+            "ppo_strategy_label": p.get("strategy_label", "unknown"),
+            "ppo_strategy_confidence": float(p.get("strategy_confidence", 0.0)),
+            "ppo_strategy_reason": p.get("strategy_reason", ""),
+            "llm_strategy_label": l.get("strategy_label", "unknown"),
+            "llm_strategy_confidence": float(l.get("strategy_confidence", 0.0)),
+            "llm_strategy_reason": l.get("strategy_reason", ""),
         }
         for action in ACTION_NAMES:
             p_val = float(p.get(f"u_{action}", 0.0))
@@ -453,6 +472,95 @@ def safety_patterns(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def strategy_label_audit(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    audit: Dict[str, Any] = {}
+    for algo in sorted({str(r["algo"]) for r in rows}):
+        selected = [r for r in rows if r["algo"] == algo and "strategy_label" in r]
+        label_counts: Dict[str, int] = {}
+        best_counts: Dict[str, int] = {}
+        by_rh: Dict[str, Dict[str, int]] = {}
+        by_phase: Dict[str, Dict[str, int]] = {}
+        confidence_values: List[float] = []
+        for row in selected:
+            label = str(row.get("strategy_label", "unknown"))
+            best_label = str(row.get("strategy_best_label", "unknown"))
+            label_counts[label] = label_counts.get(label, 0) + 1
+            best_counts[best_label] = best_counts.get(best_label, 0) + 1
+            confidence_values.append(float(row.get("strategy_confidence", 0.0)))
+            rh_band = str(row.get("rh_band", "unknown"))
+            phase = str(row.get("phase", "unknown"))
+            by_rh.setdefault(rh_band, {})
+            by_rh[rh_band][label] = by_rh[rh_band].get(label, 0) + 1
+            by_phase.setdefault(phase, {})
+            by_phase[phase][label] = by_phase[phase].get(label, 0) + 1
+        audit[algo] = {
+            "rows": len(selected),
+            "confident_rows": sum(1 for r in selected if str(r.get("strategy_label")) not in {"unknown", "ambiguous"}),
+            "ambiguous_rows": label_counts.get("ambiguous", 0),
+            "unknown_rows": label_counts.get("unknown", 0),
+            "mean_confidence": float(mean(confidence_values)) if confidence_values else 0.0,
+            "label_counts": dict(sorted(label_counts.items())),
+            "best_label_counts": dict(sorted(best_counts.items())),
+            "by_rh_band": by_rh,
+            "by_phase": by_phase,
+        }
+    return audit
+
+
+def valuable_ppo_tendency_candidates(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Find high-confidence PPO tendencies that look economically useful.
+
+    This is only an audit aid. A sample is considered useful when PPO has better
+    immediate profit and does not increase same-step temperature/RH violation
+    beyond a small tolerance. Later work can replace this with horizon-aware
+    attribution.
+    """
+    by_algo: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for row in rows:
+        by_algo.setdefault(str(row["algo"]), {})[int(row["step"])] = row
+    ppo = by_algo.get("ppo", {})
+    llm = by_algo.get("llm_director", {})
+    useful: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    for step in sorted(set(ppo) & set(llm)):
+        p = ppo[step]
+        l = llm[step]
+        label = str(p.get("strategy_label", "unknown"))
+        confidence = float(p.get("strategy_confidence", 0.0))
+        if label in {"unknown", "ambiguous"} or confidence < 0.55:
+            continue
+        profit_adv = float(p.get("profit", 0.0)) - float(l.get("profit", 0.0))
+        rh_extra = float(p.get("rh_violation", 0.0)) - float(l.get("rh_violation", 0.0))
+        temp_extra = float(p.get("temp_violation", 0.0)) - float(l.get("temp_violation", 0.0))
+        record = {
+            "step": int(step),
+            "label": label,
+            "confidence": confidence,
+            "phase": p.get("phase"),
+            "rh_band": p.get("rh_band"),
+            "profit_advantage_ppo_minus_llm": profit_adv,
+            "rh_violation_extra_ppo_minus_llm": rh_extra,
+            "temp_violation_extra_ppo_minus_llm": temp_extra,
+            "reason": p.get("strategy_reason", ""),
+        }
+        if profit_adv > 0.0 and rh_extra <= 0.05 and temp_extra <= 0.05:
+            useful.append(record)
+        else:
+            rejected.append(record)
+    label_counts: Dict[str, int] = {}
+    for row in useful:
+        label = str(row["label"])
+        label_counts[label] = label_counts.get(label, 0) + 1
+    return {
+        "useful_count": len(useful),
+        "rejected_count": len(rejected),
+        "useful_by_label": dict(sorted(label_counts.items())),
+        "examples": useful[:20],
+        "rejected_examples": rejected[:20],
+        "note": "Immediate same-step filter; use as an audit hint, not final causal attribution.",
+    }
+
+
 def write_rows_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     keys = sorted({key for row in rows for key in row.keys()})
@@ -501,6 +609,24 @@ def build_report(summary: Dict[str, Any]) -> str:
             f"CO2 leak={item['co2_leak_steps']}, lamp risk={item['lamp_risk_steps']}, "
             f"RH>=90 state steps={item['state_rh_ge_90_steps']}"
         )
+    lines.extend(["", "## Strategy Label Audit"])
+    for algo, item in summary.get("strategy_label_audit", {}).items():
+        lines.append(
+            f"- {algo}: confident={item['confident_rows']}/{item['rows']}, "
+            f"ambiguous={item['ambiguous_rows']}, unknown={item['unknown_rows']}, "
+            f"mean confidence={item['mean_confidence']:.3f}"
+        )
+        lines.append(f"  - labels: {item['label_counts']}")
+    useful = summary.get("valuable_ppo_tendencies", {})
+    lines.extend(
+        [
+            "",
+            "## Useful PPO Tendency Candidates",
+            f"- Useful high-confidence samples: {useful.get('useful_count', 0)}",
+            f"- Rejected high-confidence samples: {useful.get('rejected_count', 0)}",
+            f"- Useful by label: {useful.get('useful_by_label', {})}",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -585,6 +711,8 @@ def main() -> None:
         "by_temp_band": {algo: summarize_by([r for r in rows if r["algo"] == algo], "temp_band") for algo in aggregate},
         "pairwise": pairwise_step_diffs(rows),
         "safety_patterns": safety_patterns(rows),
+        "strategy_label_audit": strategy_label_audit(rows),
+        "valuable_ppo_tendencies": valuable_ppo_tendency_candidates(rows),
     }
 
     json_path = Path(args.output_json)
