@@ -58,6 +58,7 @@ class TestPlanningExtensions(unittest.TestCase):
         director.last_fallback_selection = {}
         director.last_expert_prediction = {}
         director.last_humidity_memory_prediction = {}
+        director.last_humidity_memory_selected_step = -10**9
         director.last_llm_trigger_step = -10**9
         director.emergency_replan_cooldown_steps = max(6, director.config.control_interval // 2)
         director.current_plan = None
@@ -268,6 +269,136 @@ class TestPlanningExtensions(unittest.TestCase):
         self.assertLess(float(control[0]), 0.05)
         self.assertGreater(float(control[3]), 0.95)
 
+    def test_humidity_memory_is_rejected_in_high_risk_night_window(self):
+        class WastefulRule:
+            def predict(self, *_args):
+                return np.array([0.30, 0.0, 0.80, 0.55, 0.0, 0.0], dtype=np.float32)
+
+        class Memory:
+            def retrieve(self, *_args, **_kwargs):
+                return [
+                    {
+                        "candidate_action": [0.0, 0.0, 0.05, 1.0, 0.0, 0.0],
+                        "case_id": "night-risk",
+                        "distance": 0.2,
+                        "trust": 0.8,
+                        "support_count": 12,
+                        "status": "pending",
+                        "score": 0.76,
+                    }
+                ]
+
+        director = self._director()
+        director.config.humidity_memory_enabled = True
+        director.rule_controller = WastefulRule()
+        director.humidity_memory = Memory()
+        director.current_plan = {
+            "anchor_control": np.array([0.30, 0.0, 0.80, 0.55, 0.0, 0.0], dtype=np.float32),
+            "created_timestep": 0,
+            "expires_timestep": 12,
+            "target_temp": 18.0,
+            "target_co2": 430.0,
+            "target_rh": 75.0,
+            "target_profile": {},
+        }
+
+        director._plan_control_step(
+            DummyState(
+                timestep=20,
+                temp_air=17.0,
+                rh_air=82.0,
+                co2_air=430.0,
+                glob_rad=0.0,
+                temp_out=11.0,
+                rh_out=65.0,
+                hour_of_day=23.0,
+                dew_margin_air=3.0,
+                canopy_dew_margin=3.0,
+            )
+        )
+
+        self.assertFalse(director.last_rollout_selection["source"].startswith("humidity_memory"))
+        hem_info = director.last_rollout_selection["humidity_memory_prediction"]
+        self.assertEqual(hem_info["reject_reason"], "night_temp_buffer")
+        self.assertTrue(hem_info["horizon_filter_rejected"])
+
+    def test_humidity_memory_night_gap_blocks_repeated_pulses(self):
+        class WastefulRule:
+            def predict(self, *_args):
+                return np.array([0.30, 0.0, 0.80, 0.55, 0.0, 0.0], dtype=np.float32)
+
+        class Memory:
+            def retrieve(self, *_args, **_kwargs):
+                return [
+                    {
+                        "candidate_action": [0.0, 0.0, 0.05, 1.0, 0.0, 0.0],
+                        "case_id": "night-gap",
+                        "distance": 0.2,
+                        "trust": 0.8,
+                        "support_count": 12,
+                        "status": "pending",
+                        "score": 0.76,
+                    }
+                ]
+
+        director = self._director()
+        director.config.humidity_memory_enabled = True
+        director.rule_controller = WastefulRule()
+        director.humidity_memory = Memory()
+        director.last_humidity_memory_selected_step = 10
+        director.current_plan = {
+            "anchor_control": np.array([0.30, 0.0, 0.80, 0.55, 0.0, 0.0], dtype=np.float32),
+            "created_timestep": 0,
+            "expires_timestep": 12,
+            "target_temp": 18.0,
+            "target_co2": 430.0,
+            "target_rh": 75.0,
+            "target_profile": {},
+        }
+
+        director._plan_control_step(
+            DummyState(
+                timestep=14,
+                temp_air=18.1,
+                rh_air=82.0,
+                co2_air=430.0,
+                glob_rad=0.0,
+                temp_out=12.0,
+                rh_out=65.0,
+                hour_of_day=23.0,
+                dew_margin_air=3.0,
+                canopy_dew_margin=3.0,
+            )
+        )
+
+        self.assertFalse(director.last_rollout_selection["source"].startswith("humidity_memory"))
+        self.assertEqual(director.last_rollout_selection["humidity_memory_prediction"]["reject_reason"], "night_gap")
+
+    def test_humidity_memory_disabled_does_not_query_memory(self):
+        class FailingMemory:
+            def retrieve(self, *_args, **_kwargs):
+                raise AssertionError("disabled HEM should not be queried")
+
+        director = self._director()
+        director.config.humidity_memory_enabled = False
+        director.humidity_memory = FailingMemory()
+        director.current_plan = {
+            "anchor_control": np.zeros(6, dtype=np.float32),
+            "created_timestep": 0,
+            "expires_timestep": 12,
+            "target_temp": 18.0,
+            "target_co2": 430.0,
+            "target_rh": 75.0,
+            "target_profile": {},
+        }
+
+        director._plan_control_step(
+            DummyState(temp_air=18.5, rh_air=82.0, glob_rad=120.0, hour_of_day=10.0)
+        )
+
+        self.assertFalse(director.last_rollout_selection["humidity_memory_prediction"]["enabled"])
+        self.assertFalse(director.last_rollout_selection["humidity_memory_prediction"]["available"])
+
     def test_humidity_memory_shape_survives_night_guardrail_when_safe(self):
         director = self._director()
         director.config.humidity_memory_enabled = True
@@ -277,7 +408,7 @@ class TestPlanningExtensions(unittest.TestCase):
 
         final = director._flush_buffered_control(
             DummyState(
-                temp_air=17.2,
+                temp_air=17.8,
                 rh_air=82.0,
                 co2_air=430.0,
                 glob_rad=0.0,
@@ -290,10 +421,11 @@ class TestPlanningExtensions(unittest.TestCase):
         )
 
         self.assertTrue(director.last_rollout_selection["humidity_memory_post_guardrail_shape"]["applied"])
-        self.assertLessEqual(float(final[2]), 0.35)
+        self.assertGreaterEqual(float(final[2]), 0.449)
         self.assertGreaterEqual(float(final[3]), 0.55)
-        self.assertLessEqual(float(final[3]), 0.65)
+        self.assertLessEqual(float(final[3]), 0.58)
         self.assertLessEqual(float(final[0]), 0.10)
+        self.assertGreaterEqual(float(final[0]), 0.059)
 
     def test_distilled_expert_can_be_selected_as_rollout_candidate(self):
         class WastefulRule:

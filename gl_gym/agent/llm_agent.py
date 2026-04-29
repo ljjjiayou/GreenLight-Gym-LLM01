@@ -129,6 +129,19 @@ class AgentConfig:
     humidity_memory_baseline_controller_id: str = ""
     humidity_memory_version: str = "hem_rspc_v1"
     humidity_memory_post_guardrail_shape: bool = True
+    humidity_memory_horizon_filter: bool = True
+    humidity_memory_score_margin: float = 0.015
+    humidity_memory_horizon_penalty_weight: float = 1.0
+    humidity_memory_direct_saving_weight: float = 0.20
+    humidity_memory_max_recovery_heat_cost: float = 0.055
+    humidity_memory_max_rh_debt_penalty: float = 0.060
+    humidity_memory_night_min_temp: float = 17.5
+    humidity_memory_night_vent_cap: float = 0.58
+    humidity_memory_night_heat_floor: float = 0.06
+    humidity_memory_night_screen_floor: float = 0.45
+    humidity_memory_min_dew_margin: float = 1.35
+    humidity_memory_max_forecast_risk: float = 0.72
+    humidity_memory_night_gap_steps: int = 6
 
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
@@ -834,6 +847,7 @@ class RuleBasedLLMDirector:
         self.last_rollout_selection: Dict[str, Any] = {}
         self.last_expert_prediction: Dict[str, Any] = {}
         self.last_humidity_memory_prediction: Dict[str, Any] = {}
+        self.last_humidity_memory_selected_step: int = -10**9
         self.last_llm_trigger_step: int = -10**9
         self.emergency_replan_cooldown_steps: int = max(6, int(self.config.control_interval // 2))
         self.emergency_replan_confirm_steps: int = 2
@@ -954,7 +968,11 @@ class RuleBasedLLMDirector:
         state,
         plan: Optional[Dict[str, Any]],
     ) -> Optional[np.ndarray]:
-        self.last_humidity_memory_prediction = {"enabled": bool(getattr(self.config, "humidity_memory_enabled", False))}
+        enabled = bool(getattr(self.config, "humidity_memory_enabled", False))
+        self.last_humidity_memory_prediction = {"enabled": enabled}
+        if not enabled:
+            self.last_humidity_memory_prediction["available"] = False
+            return None
         memory = getattr(self, "humidity_memory", None)
         if memory is None:
             self.last_humidity_memory_prediction["available"] = False
@@ -1824,6 +1842,131 @@ class RuleBasedLLMDirector:
         }
         return float(score), details
 
+    @staticmethod
+    def _candidate_energy_proxy(control: np.ndarray) -> float:
+        control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        return float(0.70 * control[0] + 0.22 * control[1] + 1.05 * control[4] + 0.05 * control[3])
+
+    def _is_humidity_memory_night_window(self, state) -> bool:
+        hour = float(getattr(state, "hour_of_day", 12.0))
+        rad = float(getattr(state, "glob_rad", 0.0))
+        return bool(hour >= 18.0 or hour < 6.0 or rad < 10.0)
+
+    def _evaluate_humidity_memory_horizon(
+        self,
+        state,
+        control: np.ndarray,
+        raw_score: float,
+        details: Dict[str, float],
+        best_non_hem: Optional[Tuple[float, np.ndarray, Dict[str, float]]],
+        plan: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Apply a HEM-only short-horizon safety score without changing baseline scoring."""
+        cfg = self.config
+        control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        is_night = self._is_humidity_memory_night_window(state)
+        timestep = int(float(getattr(state, "timestep", 0.0)))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        temp_out = float(getattr(state, "temp_out", temp_air))
+        forecast_risk = float(getattr(state, "forecast_humidity_risk", 0.0))
+        dew_margin = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        target_temp = self._get_plan_target(plan, "target_temp", state) if plan is not None else None
+        if target_temp is None:
+            target_temp = 18.0 if not is_night else 16.5
+
+        best_score = float("inf")
+        best_control = None
+        best_details: Dict[str, float] = {}
+        if best_non_hem is not None:
+            best_score, best_control, best_details = best_non_hem
+            best_control = np.clip(np.asarray(best_control, dtype=np.float32), 0.0, 1.0)
+
+        direct_saving = 0.0
+        if best_control is not None:
+            direct_saving = max(self._candidate_energy_proxy(best_control) - self._candidate_energy_proxy(control), 0.0)
+
+        hem_temp_next = float(details.get("temp_next", temp_air))
+        hem_rh_next = float(details.get("rh_next", rh_air))
+        non_hem_temp_next = float(best_details.get("temp_next", hem_temp_next))
+        non_hem_rh_next = float(best_details.get("rh_next", hem_rh_next))
+
+        temp_drop_vs_non_hem = max(non_hem_temp_next - hem_temp_next, 0.0)
+        target_temp_gap = max(float(target_temp) - hem_temp_next, 0.0)
+        temp_buffer_deficit = max(float(getattr(cfg, "humidity_memory_night_min_temp", 17.5)) - min(temp_air, hem_temp_next), 0.0)
+        outdoor_heat_loss = 0.0
+        screen_heat_loss = 0.0
+        if best_control is not None:
+            outdoor_heat_loss = max(float(control[3] - best_control[3]), 0.0) * max(temp_air - temp_out, 0.0) / 10.0
+            screen_heat_loss = max(float(best_control[2] - control[2]), 0.0)
+
+        night_multiplier = 1.65 if is_night else 1.0
+        recovery_heat_cost = night_multiplier * (
+            0.018 * target_temp_gap
+            + 0.018 * temp_drop_vs_non_hem
+            + 0.020 * temp_buffer_deficit
+            + 0.030 * outdoor_heat_loss
+            + 0.018 * screen_heat_loss
+        )
+        rh_debt_penalty = (
+            0.010 * max(hem_rh_next - 84.0, 0.0)
+            + 0.018 * max(hem_rh_next - 90.0, 0.0)
+            + 0.008 * max(hem_rh_next - non_hem_rh_next, 0.0)
+            + 0.020 * max(float(getattr(cfg, "humidity_memory_min_dew_margin", 1.35)) - dew_margin, 0.0)
+            + 0.020 * max(forecast_risk - 0.55, 0.0)
+        )
+        horizon_penalty = recovery_heat_cost + rh_debt_penalty
+        adjusted_score = (
+            float(raw_score)
+            + float(getattr(cfg, "humidity_memory_horizon_penalty_weight", 1.0)) * horizon_penalty
+            - float(getattr(cfg, "humidity_memory_direct_saving_weight", 0.20)) * direct_saving
+        )
+
+        reject_reason = ""
+        last_step = int(getattr(self, "last_humidity_memory_selected_step", -10**9))
+        gap_steps = int(getattr(cfg, "humidity_memory_night_gap_steps", 6))
+        if is_night and timestep - last_step < gap_steps:
+            reject_reason = "night_gap"
+        elif is_night and rh_air >= 78.0 and temp_air < float(getattr(cfg, "humidity_memory_night_min_temp", 17.5)):
+            reject_reason = "night_temp_buffer"
+        elif rh_air >= 78.0 and dew_margin < float(getattr(cfg, "humidity_memory_min_dew_margin", 1.35)):
+            reject_reason = "low_dew_margin"
+        elif rh_air >= 78.0 and forecast_risk > float(getattr(cfg, "humidity_memory_max_forecast_risk", 0.72)):
+            reject_reason = "forecast_humidity_risk"
+        elif recovery_heat_cost > float(getattr(cfg, "humidity_memory_max_recovery_heat_cost", 0.055)) and recovery_heat_cost > direct_saving:
+            reject_reason = "recovery_cost_exceeds_saving"
+        elif rh_debt_penalty > float(getattr(cfg, "humidity_memory_max_rh_debt_penalty", 0.060)):
+            reject_reason = "rh_debt_penalty"
+        elif np.isfinite(best_score) and adjusted_score > best_score - float(getattr(cfg, "humidity_memory_score_margin", 0.015)):
+            reject_reason = "insufficient_score_margin"
+
+        info: Dict[str, Any] = {
+            "enabled": True,
+            "rejected": bool(reject_reason),
+            "reject_reason": reject_reason,
+            "raw_score": float(raw_score),
+            "adjusted_score": float(adjusted_score),
+            "horizon_penalty": float(horizon_penalty),
+            "direct_saving": float(direct_saving),
+            "recovery_heat_cost": float(recovery_heat_cost),
+            "rh_debt_penalty": float(rh_debt_penalty),
+            "best_non_hem_score": float(best_score) if np.isfinite(best_score) else None,
+            "temp_next": float(hem_temp_next),
+            "rh_next": float(hem_rh_next),
+            "non_hem_temp_next": float(non_hem_temp_next),
+            "non_hem_rh_next": float(non_hem_rh_next),
+            "is_night": bool(is_night),
+            "dew_margin": float(dew_margin),
+            "forecast_humidity_risk": float(forecast_risk),
+            "last_selected_step": int(last_step),
+        }
+        if reject_reason:
+            return float("inf"), info
+        return float(adjusted_score), info
+
     def _build_fallback_candidates(
         self,
         state,
@@ -2029,17 +2172,35 @@ class RuleBasedLLMDirector:
             shape_info["reason"] = "outside_safe_economic_band"
             selection["humidity_memory_post_guardrail_shape"] = shape_info
             return final
+        if is_dark and temp_air < float(getattr(self.config, "humidity_memory_night_min_temp", 17.5)):
+            shape_info["reason"] = "night_temp_buffer"
+            selection["humidity_memory_post_guardrail_shape"] = shape_info
+            return final
+        if dew_margin < float(getattr(self.config, "humidity_memory_min_dew_margin", 1.35)):
+            shape_info["reason"] = "low_dew_margin"
+            selection["humidity_memory_post_guardrail_shape"] = shape_info
+            return final
+        if float(getattr(state, "forecast_humidity_risk", 0.0)) > float(
+            getattr(self.config, "humidity_memory_max_forecast_risk", 0.72)
+        ):
+            shape_info["reason"] = "forecast_humidity_risk"
+            selection["humidity_memory_post_guardrail_shape"] = shape_info
+            return final
 
         memory_cfg = getattr(getattr(self, "humidity_memory", None), "config", HumidityExperienceConfig())
         before = final.copy()
         final[0] = min(float(final[0]), float(memory_cfg.free_air_exchange_heat_cap))
         final[1] = min(float(final[1]), float(memory_cfg.free_air_exchange_co2_cap))
-        final[2] = min(float(final[2]), float(memory_cfg.free_air_exchange_screen_cap))
+        screen_cap = float(memory_cfg.free_air_exchange_screen_cap)
+        if is_dark and temp_air < 18.0:
+            screen_cap = max(screen_cap, float(getattr(self.config, "humidity_memory_night_screen_floor", 0.45)))
+        final[2] = min(float(final[2]), screen_cap)
         final[3] = max(float(final[3]), float(memory_cfg.free_air_exchange_min_ventilation))
         final[4] = min(float(final[4]), float(memory_cfg.free_air_exchange_lighting_cap))
         if is_dark and temp_air < 18.0:
-            final[0] = max(float(final[0]), 0.04)
-            final[3] = min(float(final[3]), 0.65)
+            final[0] = max(float(final[0]), float(getattr(self.config, "humidity_memory_night_heat_floor", 0.06)))
+            final[2] = max(float(final[2]), float(getattr(self.config, "humidity_memory_night_screen_floor", 0.45)))
+            final[3] = min(float(final[3]), float(getattr(self.config, "humidity_memory_night_vent_cap", 0.58)))
         shape_info.update(
             {
                 "applied": True,
@@ -2509,13 +2670,65 @@ class RuleBasedLLMDirector:
                         ),
                     ]
                 )
-            scored_candidates = []
+            raw_scored_candidates = []
             for name, candidate_control, candidate_rule_weight in candidate_controls:
                 clipped = np.clip(np.asarray(candidate_control, dtype=np.float32), 0.0, 1.0)
                 score, details = self._score_fallback_candidate(state, clipped)
-                scored_candidates.append((score, name, clipped, candidate_rule_weight, details))
+                raw_scored_candidates.append((score, name, clipped, candidate_rule_weight, details))
+            non_hem_candidates = [
+                (score, control_item, details)
+                for score, name, control_item, _candidate_rule_weight, details in raw_scored_candidates
+                if not str(name).startswith("humidity_memory")
+            ]
+            best_non_hem = None
+            if non_hem_candidates:
+                best_non_hem = min(non_hem_candidates, key=lambda item: item[0])
+
+            scored_candidates = []
+            best_memory_eval: Optional[Dict[str, Any]] = None
+            horizon_filter_enabled = bool(getattr(self.config, "humidity_memory_horizon_filter", True))
+            for raw_score, name, clipped, candidate_rule_weight, details in raw_scored_candidates:
+                score = float(raw_score)
+                candidate_details: Dict[str, Any] = dict(details)
+                if horizon_filter_enabled and str(name).startswith("humidity_memory"):
+                    score, hem_eval = self._evaluate_humidity_memory_horizon(
+                        state,
+                        clipped,
+                        raw_score=float(raw_score),
+                        details=details,
+                        best_non_hem=best_non_hem,
+                        plan=plan,
+                    )
+                    candidate_details["humidity_memory_horizon_filter"] = hem_eval
+                    if best_memory_eval is None or float(hem_eval["adjusted_score"]) < float(
+                        best_memory_eval["adjusted_score"]
+                    ):
+                        best_memory_eval = dict(hem_eval)
+                        best_memory_eval["candidate_name"] = name
+                scored_candidates.append((score, name, clipped, candidate_rule_weight, candidate_details))
             scored_candidates.sort(key=lambda item: item[0])
             _, selected_name, selected_control, selected_rule_weight, selected_details = scored_candidates[0]
+            if str(selected_name).startswith("humidity_memory"):
+                self.last_humidity_memory_selected_step = int(float(getattr(state, "timestep", 0.0)))
+                if best_memory_eval is not None:
+                    best_memory_eval["rejected"] = False
+                    best_memory_eval["reject_reason"] = ""
+            humidity_memory_prediction = dict(getattr(self, "last_humidity_memory_prediction", {}))
+            if best_memory_eval is not None:
+                humidity_memory_prediction.update(
+                    {
+                        "reject_reason": best_memory_eval.get("reject_reason", ""),
+                        "horizon_penalty": float(best_memory_eval.get("horizon_penalty", 0.0)),
+                        "direct_saving": float(best_memory_eval.get("direct_saving", 0.0)),
+                        "recovery_heat_cost": float(best_memory_eval.get("recovery_heat_cost", 0.0)),
+                        "rh_debt_penalty": float(best_memory_eval.get("rh_debt_penalty", 0.0)),
+                        "best_non_hem_score": best_memory_eval.get("best_non_hem_score"),
+                        "horizon_adjusted_score": float(best_memory_eval.get("adjusted_score", 0.0)),
+                        "horizon_filter_rejected": bool(best_memory_eval.get("rejected", False)),
+                        "horizon_filter_candidate": best_memory_eval.get("candidate_name"),
+                    }
+                )
+                self.last_humidity_memory_prediction = humidity_memory_prediction
             control = np.asarray(selected_control, dtype=np.float32)
             rule_weight = float(selected_rule_weight)
             self.last_rollout_selection = {
@@ -2526,13 +2739,23 @@ class RuleBasedLLMDirector:
                 "candidates": [
                     {
                         "name": name,
-                        "score": float(score),
+                        "score": float(score) if np.isfinite(score) else None,
                         "rule_weight": float(candidate_rule_weight),
+                        "humidity_memory_rejected": bool(
+                            isinstance(details.get("humidity_memory_horizon_filter"), dict)
+                            and details["humidity_memory_horizon_filter"].get("rejected", False)
+                        ),
+                        "humidity_memory_reject_reason": (
+                            details.get("humidity_memory_horizon_filter", {}).get("reject_reason", "")
+                            if isinstance(details.get("humidity_memory_horizon_filter"), dict)
+                            else ""
+                        ),
                     }
-                    for score, name, _, candidate_rule_weight, _ in scored_candidates
+                    for score, name, _, candidate_rule_weight, details in scored_candidates
                 ],
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
-                "humidity_memory_prediction": dict(getattr(self, "last_humidity_memory_prediction", {})),
+                "humidity_memory_prediction": humidity_memory_prediction,
+                "humidity_memory_horizon_filter": dict(best_memory_eval or {}),
             }
         else:
             self.last_rollout_selection = {

@@ -365,6 +365,14 @@ def run_llm_trace(
             "humidity_memory_support_count": int(humidity_memory_info.get("support_count", 0)) if isinstance(humidity_memory_info, dict) else 0,
             "humidity_memory_strategy_label": humidity_memory_info.get("strategy_label") if isinstance(humidity_memory_info, dict) else None,
             "humidity_memory_strategy_confidence": float(humidity_memory_info.get("strategy_confidence", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_reject_reason": humidity_memory_info.get("reject_reason") if isinstance(humidity_memory_info, dict) else None,
+            "humidity_memory_horizon_penalty": float(humidity_memory_info.get("horizon_penalty", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_direct_saving": float(humidity_memory_info.get("direct_saving", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_recovery_heat_cost": float(humidity_memory_info.get("recovery_heat_cost", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_rh_debt_penalty": float(humidity_memory_info.get("rh_debt_penalty", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_best_non_hem_score": float(humidity_memory_info.get("best_non_hem_score", 0.0) or 0.0) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_horizon_adjusted_score": float(humidity_memory_info.get("horizon_adjusted_score", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_horizon_filter_rejected": bool(humidity_memory_info.get("horizon_filter_rejected", False)) if isinstance(humidity_memory_info, dict) else False,
             "humidity_memory_post_shape_applied": bool(humidity_memory_shape.get("applied", False)) if isinstance(humidity_memory_shape, dict) else False,
             "humidity_memory_post_shape_reason": humidity_memory_shape.get("reason") if isinstance(humidity_memory_shape, dict) else None,
             **state_to_record(state),
@@ -391,6 +399,16 @@ def sum_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             summary[f"mean_u_{action}"] = float(mean(float(r.get(f"u_{action}", 0.0)) for r in rows))
         summary["mean_rh"] = float(mean(float(r.get("rh_air", 0.0)) for r in rows))
         summary["mean_temp"] = float(mean(float(r.get("temp_air", 0.0)) for r in rows))
+        if any("humidity_memory_available" in r for r in rows):
+            summary["humidity_memory_available_steps"] = int(sum(bool(r.get("humidity_memory_available", False)) for r in rows))
+            summary["humidity_memory_accepted_steps"] = int(sum(bool(r.get("humidity_memory_accepted", False)) for r in rows))
+            summary["humidity_memory_selected_steps"] = int(sum(bool(r.get("humidity_memory_selected", False)) for r in rows))
+            summary["humidity_memory_rejected_steps"] = int(
+                sum(bool(r.get("humidity_memory_accepted", False)) and bool(r.get("humidity_memory_reject_reason")) for r in rows)
+            )
+            summary["mean_humidity_memory_horizon_penalty"] = float(
+                mean(float(r.get("humidity_memory_horizon_penalty", 0.0)) for r in rows)
+            )
     return summary
 
 
@@ -636,6 +654,19 @@ def build_report(summary: Dict[str, Any]) -> str:
             f"- {algo}: heat+vent conflict={item['heat_vent_conflict_steps']}, "
             f"CO2 leak={item['co2_leak_steps']}, lamp risk={item['lamp_risk_steps']}, "
             f"RH>=90 state steps={item['state_rh_ge_90_steps']}"
+        )
+    llm_item = summary.get("aggregate", {}).get("llm_director", {})
+    if "humidity_memory_available_steps" in llm_item:
+        lines.extend(
+            [
+                "",
+                "## Humidity Memory",
+                f"- available={llm_item.get('humidity_memory_available_steps', 0)}, "
+                f"accepted={llm_item.get('humidity_memory_accepted_steps', 0)}, "
+                f"selected={llm_item.get('humidity_memory_selected_steps', 0)}, "
+                f"rejected={llm_item.get('humidity_memory_rejected_steps', 0)}",
+                f"- mean horizon penalty={llm_item.get('mean_humidity_memory_horizon_penalty', 0.0):.5f}",
+            ]
         )
     lines.extend(["", "## Strategy Label Audit"])
     for algo, item in summary.get("strategy_label_audit", {}).items():
