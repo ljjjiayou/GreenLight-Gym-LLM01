@@ -89,6 +89,7 @@ def config_fingerprint(config: Any) -> Dict[str, Any]:
         "max_iterations": int(getattr(config, "max_iterations", 0) or 0),
         "control_interval": int(getattr(config, "control_interval", 0) or 0),
         "fallback_strategy": str(getattr(config, "fallback_strategy", "")),
+        "plan_cache_key_policy": str(getattr(config, "plan_cache_key_policy", "prompt")),
     }
 
 

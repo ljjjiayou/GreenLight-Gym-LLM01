@@ -104,6 +104,7 @@ def run_job(
     plan_cache_mode: str,
     plan_cache_path: str,
     plan_cache_strict: bool,
+    plan_cache_key_policy: str,
     humidity_memory_path: str,
     humidity_memory_teacher_policy_id: str,
     humidity_memory_baseline_controller_id: str,
@@ -140,6 +141,7 @@ def run_job(
             plan_cache_mode=plan_cache_mode,
             plan_cache_path=plan_cache_path,
             plan_cache_strict=plan_cache_strict,
+            plan_cache_key_policy=plan_cache_key_policy,
             uncertainty_scale=uncertainty_scale,
         )
     return summarize_trace(job, rows, time.perf_counter() - start)
@@ -163,6 +165,7 @@ def main() -> None:
     parser.add_argument("--plan-cache-mode", type=str, choices=["off", "record", "replay", "refresh"], default="replay")
     parser.add_argument("--plan-cache-path", type=str, default=AgentConfig.plan_cache_path)
     parser.add_argument("--plan-cache-strict", action="store_true")
+    parser.add_argument("--plan-cache-key-policy", type=str, choices=["prompt", "scenario_timestep"], default="scenario_timestep")
     parser.add_argument("--humidity-memory-path", type=str, default=AgentConfig.humidity_memory_path)
     parser.add_argument("--humidity-memory-teacher-policy-id", type=str, default="")
     parser.add_argument("--humidity-memory-baseline-controller-id", type=str, default="")
@@ -208,6 +211,7 @@ def main() -> None:
                 plan_cache_mode=args.plan_cache_mode,
                 plan_cache_path=args.plan_cache_path,
                 plan_cache_strict=args.plan_cache_strict,
+                plan_cache_key_policy=args.plan_cache_key_policy,
                 humidity_memory_path=args.humidity_memory_path,
                 humidity_memory_teacher_policy_id=args.humidity_memory_teacher_policy_id,
                 humidity_memory_baseline_controller_id=args.humidity_memory_baseline_controller_id,
@@ -224,6 +228,7 @@ def main() -> None:
             "max_steps": int(args.max_steps),
             "plan_cache_mode": str(args.plan_cache_mode),
             "plan_cache_path": str(args.plan_cache_path),
+            "plan_cache_key_policy": str(args.plan_cache_key_policy),
         },
         "summaries": summaries,
     }
@@ -235,4 +240,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

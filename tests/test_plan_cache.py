@@ -87,9 +87,14 @@ class RaisingGraph:
         raise AssertionError("replay should not call the LLM graph")
 
 
-def make_director(tmp_path, mode, tools, graph):
+def make_director(tmp_path, mode, tools, graph, key_policy="prompt"):
     director = object.__new__(RuleBasedLLMDirector)
-    director.config = AgentConfig(plan_cache_mode=mode, plan_cache_path=str(tmp_path), max_iterations=1)
+    director.config = AgentConfig(
+        plan_cache_mode=mode,
+        plan_cache_path=str(tmp_path),
+        plan_cache_key_policy=key_policy,
+        max_iterations=1,
+    )
     director.env_id = "TomatoEnv"
     director.active_control_interval = 12
     director.plan_cache = PlanCache(tmp_path, mode=mode, strict=True)
@@ -196,6 +201,36 @@ class TestPlanCache(unittest.TestCase):
             self.assertTrue(replay["plan"]["plan_cache_event"]["hit"])
             self.assertAlmostEqual(float(replay_tools.buffered_action.u_boil), 0.1, places=5)
             self.assertAlmostEqual(float(replay_tools.buffered_action.u_vent), 0.3, places=5)
+
+    def test_scenario_timestep_policy_replays_after_state_divergence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plans.json"
+            tools = FakeTools()
+            director = make_director(path, "record", tools, RecordingGraph(tools), key_policy="scenario_timestep")
+            state = DummyState(timestep=36, rh_air=82.0)
+
+            result = RuleBasedLLMDirector._replan_with_llm(director, state, {"state": state}, "plan_expired")
+            self.assertTrue(result["success"])
+
+            replay_tools = FakeTools()
+            replay_director = make_director(
+                path,
+                "replay",
+                replay_tools,
+                RaisingGraph(),
+                key_policy="scenario_timestep",
+            )
+            diverged_state = DummyState(timestep=36, rh_air=88.0, temp_air=16.0)
+            replay = RuleBasedLLMDirector._replan_with_llm(
+                replay_director,
+                diverged_state,
+                {"state": diverged_state},
+                "emergency_replan",
+            )
+
+            self.assertTrue(replay["success"])
+            self.assertTrue(replay["plan"]["plan_cache_event"]["hit"])
+            self.assertEqual(replay["plan"]["plan_cache_event"]["key_policy"], "scenario_timestep")
 
 
 if __name__ == "__main__":

@@ -101,6 +101,7 @@ class AgentConfig:
     plan_cache_mode: str = "off"                   # off | record | replay | refresh
     plan_cache_path: str = "gl_gym/result/plan_cache/llm_plan_cache.json"
     plan_cache_strict: bool = False
+    plan_cache_key_policy: str = "prompt"          # prompt | scenario_timestep
     
     # 控制频率配置 (新增)
     control_interval: int = 12                     # LLM 控制间隔步数
@@ -2522,6 +2523,7 @@ class RuleBasedLLMDirector:
             "mode": cache_mode,
             "hit": False,
             "status": "disabled" if plan_cache is None else "pending",
+            "key_policy": str(getattr(self.config, "plan_cache_key_policy", "prompt")),
         }
 
         try:
@@ -2562,13 +2564,24 @@ class RuleBasedLLMDirector:
                 cache_entry = None
                 cache_prompt_hash = text_hash(prompt_text)
                 if plan_cache is not None:
+                    key_policy = str(getattr(self.config, "plan_cache_key_policy", "prompt") or "prompt")
+                    if key_policy == "scenario_timestep":
+                        cache_state_summary = {"timestep": int(getattr(state, "timestep", 0))}
+                        cache_reason = "frozen_replan"
+                        cache_horizon = 0
+                        cache_prompt_key = "scenario_timestep"
+                    else:
+                        cache_state_summary = state_summary_from_state(state)
+                        cache_reason = reason
+                        cache_horizon = planning_horizon
+                        cache_prompt_key = cache_prompt_hash
                     cache_key = plan_cache.make_key(
                         env_id=str(getattr(self, "env_id", "")),
-                        state_summary=state_summary_from_state(state),
-                        reason=reason,
-                        planning_horizon=planning_horizon,
+                        state_summary=cache_state_summary,
+                        reason=cache_reason,
+                        planning_horizon=cache_horizon,
                         config_hash=cache_config_hash,
-                        prompt_hash=cache_prompt_hash,
+                        prompt_hash=cache_prompt_key,
                         attempt=llm_attempts,
                     )
                     cache_entry = plan_cache.get(cache_key)
@@ -2582,6 +2595,7 @@ class RuleBasedLLMDirector:
                         "attempt": int(llm_attempts),
                         "prompt_hash": cache_prompt_hash,
                         "config_hash": cache_config_hash,
+                        "key_policy": key_policy,
                     }
                     if cache_entry is not None and cache_mode in {"record", "replay"}:
                         llm_output = str(cache_entry.get("raw_response", ""))

@@ -280,6 +280,7 @@ def run_llm_trace(
     plan_cache_mode: str,
     plan_cache_path: str,
     plan_cache_strict: bool,
+    plan_cache_key_policy: str,
     uncertainty_scale: float,
 ) -> List[Dict[str, Any]]:
     raw_env = build_env(config, year, day, seed, uncertainty_scale)
@@ -307,11 +308,13 @@ def run_llm_trace(
         plan_cache_mode=str(plan_cache_mode or "off"),
         plan_cache_path=str(plan_cache_path or AgentConfig.plan_cache_path),
         plan_cache_strict=bool(plan_cache_strict),
+        plan_cache_key_policy=str(plan_cache_key_policy or AgentConfig.plan_cache_key_policy),
     )
     agent = RuleBasedLLMDirector(
         agent_interface=interface,
         tools=tools,
         config=agent_cfg,
+        env_id=f"TomatoEnv_y{int(year)}_d{int(day)}_s{int(seed)}",
         rule_params=dict(DEFAULT_RULE_PARAMS),
     )
     raw_env.reset(seed=seed)
@@ -365,6 +368,7 @@ def run_llm_trace(
             "plan_cache_status": plan_cache_event.get("status") if isinstance(plan_cache_event, dict) else None,
             "plan_cache_key": plan_cache_event.get("key") if isinstance(plan_cache_event, dict) else None,
             "plan_cache_attempt": int(plan_cache_event.get("attempt", 0) or 0) if isinstance(plan_cache_event, dict) else 0,
+            "plan_cache_key_policy": plan_cache_event.get("key_policy") if isinstance(plan_cache_event, dict) else None,
             "rh_violation_debt": plan.get("rh_violation_debt", 0.0) if isinstance(plan, dict) else 0.0,
             "expert_available": bool(expert_info.get("available", False)) if isinstance(expert_info, dict) else False,
             "expert_accepted": bool(expert_info.get("accepted", False)) if isinstance(expert_info, dict) else False,
@@ -733,6 +737,7 @@ def main() -> None:
     parser.add_argument("--llm-plan-cache-mode", type=str, choices=["off", "record", "replay", "refresh"], default="off")
     parser.add_argument("--llm-plan-cache-path", type=str, default=AgentConfig.plan_cache_path)
     parser.add_argument("--llm-plan-cache-strict", action="store_true")
+    parser.add_argument("--llm-plan-cache-key-policy", type=str, choices=["prompt", "scenario_timestep"], default=AgentConfig.plan_cache_key_policy)
     parser.add_argument("--llm-expert-rollout", action="store_true")
     parser.add_argument("--llm-expert-policy-path", type=str, default=AgentConfig.expert_policy_path)
     parser.add_argument("--llm-expert-max-distance", type=float, default=AgentConfig.expert_candidate_max_distance)
@@ -791,6 +796,7 @@ def main() -> None:
                 plan_cache_mode=args.llm_plan_cache_mode,
                 plan_cache_path=args.llm_plan_cache_path,
                 plan_cache_strict=args.llm_plan_cache_strict,
+                plan_cache_key_policy=args.llm_plan_cache_key_policy,
                 uncertainty_scale=args.uncertainty_scale,
             )
         )
@@ -815,6 +821,7 @@ def main() -> None:
             "plan_cache_mode": str(args.llm_plan_cache_mode),
             "plan_cache_path": str(args.llm_plan_cache_path),
             "plan_cache_strict": bool(args.llm_plan_cache_strict),
+            "plan_cache_key_policy": str(args.llm_plan_cache_key_policy),
         },
         "timing": {"ppo_seconds": float(ppo_elapsed), "llm_seconds": float(llm_elapsed)},
         "aggregate": aggregate,
