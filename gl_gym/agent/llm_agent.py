@@ -158,6 +158,22 @@ class AgentConfig:
     humidity_memory_max_forecast_risk: float = 0.72
     humidity_memory_night_gap_steps: int = 6
 
+    # Dry-side recovery: prevent low RH / high VPD violations caused by over-venting
+    # or heat-vent pulses after the crop is already too dry.
+    dry_rh_on: float = 55.0
+    dry_rh_off: float = 62.0
+    dry_vpd_on: float = 1.20
+    dry_vpd_off: float = 0.95
+    dry_vent_cap: float = 0.12
+    dry_warm_vent_cap: float = 0.18
+    dry_hot_vent_cap: float = 0.35
+    dry_target_rh_floor: float = 70.0
+    dry_temp_target_cap: float = 20.0
+    cold_dehumidify_temp_threshold: float = 12.0
+    cold_dehumidify_buffer_temp: float = 15.5
+    cold_dehumidify_vent_cap: float = 0.12
+    cold_dehumidify_extreme_vent_cap: float = 0.25
+
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
     lamp_budget_soft_cap: float = 0.40            # 预算接近上限时的补光软上限
@@ -553,6 +569,46 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         night_heat_floor = 0.25 if (rh_air >= 90.0 or dew_margin < 0.6) else 0.12
         guarded[0] = max(guarded[0], night_heat_floor)
         guarded[2] = min(max(guarded[2], 0.45), 0.75)
+
+    # Final dry-side and cold-buffer guard. This intentionally runs after the
+    # high-humidity pulse logic so a cold or already dry house cannot be
+    # over-vented by an earlier dehumidification branch.
+    dry_side_risk = (rh_air < 55.0 or vpd > 1.20) and not high_temp_override
+    if dry_side_risk:
+        if temp_air >= 28.0:
+            vent_cap = 0.35
+        elif temp_air >= 24.0:
+            vent_cap = 0.18
+        else:
+            vent_cap = 0.12
+        guarded[3] = min(guarded[3], vent_cap)
+        if temp_air >= 12.0:
+            guarded[0] = 0.0
+        guarded[1] = 0.0
+        guarded[4] = 0.0
+        if temp_air < 18.0:
+            guarded[2] = max(guarded[2], 0.70)
+        if glob_rad > 250.0 or temp_air > 24.0:
+            guarded[5] = max(guarded[5], 0.50)
+
+    extreme_dew_risk = rh_air >= 94.0 or dew_margin < 0.4
+    if temp_air < 12.0 and not extreme_dew_risk:
+        guarded[0] = max(guarded[0], 0.90)
+        guarded[2] = max(guarded[2], 0.90)
+        guarded[3] = min(guarded[3], 0.12)
+        guarded[1] = 0.0
+        guarded[4] = 0.0
+    elif (
+        12.0 <= temp_air < 15.5
+        and rh_air < 90.0
+        and dew_margin >= 0.8
+        and (guarded[3] > 0.25 or rh_air >= 86.0)
+    ):
+        guarded[0] = max(guarded[0], 0.18 if temp_air < 13.0 else 0.08)
+        guarded[2] = max(guarded[2], 0.65)
+        guarded[3] = min(guarded[3], 0.25)
+        guarded[1] = 0.0
+        guarded[4] = 0.0
 
     return np.clip(guarded, 0.0, 1.0)
 
@@ -1859,6 +1915,7 @@ class RuleBasedLLMDirector:
         lamp_rh_delta = -0.4 * lamp
         screen_rh_delta = 0.45 * screen if not is_day else 0.10 * screen
         rh_next = np.clip(rh + vent_rh_delta + heat_rh_delta + lamp_rh_delta + screen_rh_delta, 35.0, 100.0)
+        vpd_next = calculate_vpd_kpa(float(temp_next), float(rh_next))
 
         co2_assimilation = 20.0 if is_day and total_rad > 120.0 else 4.0
         co2_leak = 190.0 * vent * max((co2 - 410.0) / 500.0, 0.0)
@@ -1867,6 +1924,7 @@ class RuleBasedLLMDirector:
         return {
             "temp_next": float(temp_next),
             "rh_next": float(rh_next),
+            "vpd_next": float(vpd_next),
             "co2_next": float(co2_next),
             "total_rad": float(total_rad),
         }
@@ -1882,6 +1940,7 @@ class RuleBasedLLMDirector:
         response = self._estimate_candidate_response(state, control)
         temp_next = response["temp_next"]
         rh_next = response["rh_next"]
+        vpd_next = response.get("vpd_next", calculate_vpd_kpa(float(temp_next), float(rh_next)))
         co2_next = response["co2_next"]
         total_rad = response["total_rad"]
 
@@ -1892,6 +1951,15 @@ class RuleBasedLLMDirector:
             0.08 * max(rh_next - 84.0, 0.0) ** 2
             + 0.18 * max(rh_next - 90.0, 0.0) ** 2
             + 0.55 * max(rh_next - 95.0, 0.0) ** 2
+        )
+        dry_penalty = (
+            0.10 * max(55.0 - rh_next, 0.0) ** 2
+            + 0.35 * max(50.0 - rh_next, 0.0) ** 2
+            + 1.25 * max(45.0 - rh_next, 0.0) ** 2
+        )
+        vpd_penalty = (
+            0.85 * max(vpd_next - 1.20, 0.0) ** 2
+            + 1.50 * max(vpd_next - 1.60, 0.0) ** 2
         )
         dew_margin = min(
             float(getattr(state, "dew_margin_air", 3.0)),
@@ -1920,10 +1988,21 @@ class RuleBasedLLMDirector:
             mitigation_bonus += 0.55 * control[0] + 0.20 * control[2]
         if float(state.temp_air) > 28.0:
             mitigation_bonus += 0.55 * control[3] + 0.25 * control[5]
+        if float(state.rh_air) < float(getattr(self.config, "dry_rh_on", 55.0)) or calculate_vpd_kpa(
+            float(state.temp_air), float(state.rh_air)
+        ) > float(getattr(self.config, "dry_vpd_on", 1.20)):
+            if control[3] <= float(getattr(self.config, "dry_warm_vent_cap", 0.18)):
+                mitigation_bonus += 0.45
+            if control[1] <= 0.01 and control[4] <= 0.01:
+                mitigation_bonus += 0.30
+            if float(state.temp_air) < 18.0 and control[2] >= 0.65:
+                mitigation_bonus += 0.18
 
         score = (
             self.config.fallback_temp_penalty_weight * temp_penalty
             + self.config.fallback_rh_penalty_weight * rh_penalty
+            + 1.20 * dry_penalty
+            + 1.00 * vpd_penalty
             + self.config.fallback_cost_penalty_weight * energy_penalty
             + self.config.fallback_smooth_penalty_weight * smooth_penalty
             + self.config.fallback_conflict_penalty_weight * conflict_penalty
@@ -1934,6 +2013,8 @@ class RuleBasedLLMDirector:
             "score": float(score),
             "temp_penalty": float(temp_penalty),
             "rh_penalty": float(rh_penalty),
+            "dry_penalty": float(dry_penalty),
+            "vpd_penalty": float(vpd_penalty),
             "dew_penalty": float(dew_penalty),
             "energy_penalty": float(energy_penalty),
             "conflict_penalty": float(conflict_penalty),
@@ -2117,6 +2198,7 @@ class RuleBasedLLMDirector:
         temp = float(state.temp_air)
         rad = float(state.glob_rad)
         hour = float(state.hour_of_day)
+        vpd = calculate_vpd_kpa(temp, rh)
         is_day = 6 <= hour <= 18
 
         if rh >= 86.0:
@@ -2157,6 +2239,29 @@ class RuleBasedLLMDirector:
                 cooling[5] = max(cooling[5], 0.75)
             cooling[4] = 0.0
             candidates.append(FallbackCandidate("heat_relief", cooling, rationale="高温降温保护"))
+
+        if rh <= float(self.config.dry_rh_on) or vpd >= float(self.config.dry_vpd_on):
+            dry = np.clip(env_control.copy(), 0.0, 1.0)
+            dry[1] = 0.0
+            dry[4] = 0.0
+            if temp >= 28.0:
+                vent_cap = float(self.config.dry_hot_vent_cap)
+            elif temp >= 24.0:
+                vent_cap = float(self.config.dry_warm_vent_cap)
+            else:
+                vent_cap = float(self.config.dry_vent_cap)
+            dry[3] = min(dry[3], vent_cap)
+            if temp < 12.0:
+                dry[0] = max(dry[0], 0.85)
+                dry[2] = max(dry[2], 0.90)
+                dry[3] = min(dry[3], float(self.config.cold_dehumidify_vent_cap))
+            else:
+                dry[0] = 0.0
+                if temp < 18.0:
+                    dry[2] = max(dry[2], 0.70)
+            if temp > 24.0 or rad > 250.0:
+                dry[5] = max(dry[5], 0.50)
+            candidates.append(FallbackCandidate("dry_recovery", dry, rationale="dry-side recovery"))
 
         economy = np.clip(env_control.copy(), 0.0, 1.0)
         economy[1] = 0.0 if (not is_day or rad < self.config.fallback_co2_min_rad or economy[3] > 0.16) else economy[1]
@@ -2404,6 +2509,19 @@ class RuleBasedLLMDirector:
         if target_rh > risk_cap:
             target_rh = max(62.0, risk_cap)
             corrected_fields.append("target_rh:risk_cap")
+
+        dry_side = rh_now < float(self.config.dry_rh_on) or vpd_now > float(self.config.dry_vpd_on)
+        if dry_side:
+            dry_floor = float(self.config.dry_target_rh_floor)
+            if target_rh < dry_floor:
+                target_rh = min(88.0, dry_floor)
+                corrected_fields.append("target_rh:dry_recovery_floor")
+            if target_temp > float(self.config.dry_temp_target_cap):
+                target_temp = float(self.config.dry_temp_target_cap)
+                corrected_fields.append("target_temp:dry_recovery_cap")
+            if target_co2 > 430.0 and (vent_level > 0.12 or total_rad < float(self.config.fallback_co2_min_rad)):
+                target_co2 = 430.0
+                corrected_fields.append("target_co2:dry_recovery_cap")
 
         return target_temp, target_co2, target_rh, missing_fields, corrected_fields
 
@@ -3165,6 +3283,44 @@ class RuleBasedLLMDirector:
                 control[0] = max(control[0], 0.28)
             elif temp_air < float(self.config.rh_pulse_temp_cap):
                 control[0] = max(control[0], float(self.config.rh_pulse_extreme_heat_floor))
+
+        dry_side_risk = (
+            float(state.rh_air) <= float(self.config.dry_rh_on)
+            or vpd_now >= float(self.config.dry_vpd_on)
+        )
+        if dry_side_risk:
+            before = np.asarray(control, dtype=np.float32).copy()
+            if temp_air >= 28.0:
+                vent_cap = float(self.config.dry_hot_vent_cap)
+            elif temp_air >= 24.0:
+                vent_cap = float(self.config.dry_warm_vent_cap)
+            else:
+                vent_cap = float(self.config.dry_vent_cap)
+            control[3] = min(control[3], vent_cap)
+            control[1] = 0.0
+            control[4] = 0.0
+            if temp_air < 12.5:
+                control[0] = max(control[0], 0.75)
+                control[2] = max(control[2], 0.90)
+                control[3] = min(control[3], float(self.config.cold_dehumidify_vent_cap))
+            elif temp_air < 15.0:
+                control[0] = min(max(control[0], 0.10), 0.25)
+                control[2] = max(control[2], 0.75)
+            else:
+                control[0] = min(control[0], 0.05)
+                if temp_air < 18.0:
+                    control[2] = max(control[2], 0.70)
+            if float(state.glob_rad) > 250.0 or temp_air > 24.0:
+                control[5] = max(control[5], 0.50)
+            self.last_rollout_selection["dry_recovery_override"] = {
+                "applied": True,
+                "rh_air": float(state.rh_air),
+                "vpd": float(vpd_now),
+                "before": before.tolist(),
+                "after": np.asarray(control, dtype=np.float32).tolist(),
+            }
+        else:
+            self.last_rollout_selection.setdefault("dry_recovery_override", {"applied": False})
 
         return (
             np.asarray(control, dtype=np.float32),

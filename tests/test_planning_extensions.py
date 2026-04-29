@@ -123,6 +123,23 @@ class TestPlanningExtensions(unittest.TestCase):
         self.assertLessEqual(target_rh, director.config.rh_target_extreme_cap)
         self.assertIn("target_rh:risk_cap", corrected)
 
+    def test_setpoint_contract_raises_dry_rh_target(self):
+        director = self._director()
+        target_temp, target_co2, target_rh, _, corrected = director._enforce_setpoint_contract(
+            DummyState(temp_air=24.0, rh_air=45.0, glob_rad=260.0),
+            np.array([0.2, 0.5, 0.0, 0.25, 0.3, 0.0], dtype=np.float32),
+            target_temp=23.0,
+            target_co2=700.0,
+            target_rh=62.0,
+        )
+
+        self.assertGreaterEqual(target_rh, director.config.dry_target_rh_floor)
+        self.assertLessEqual(target_temp, director.config.dry_temp_target_cap)
+        self.assertEqual(target_co2, 430.0)
+        self.assertIn("target_rh:dry_recovery_floor", corrected)
+        self.assertIn("target_temp:dry_recovery_cap", corrected)
+        self.assertIn("target_co2:dry_recovery_cap", corrected)
+
     def test_rh_violation_debt_accumulates_high_humidity_risk(self):
         director = self._director()
         debt = director._update_rh_violation_debt(DummyState(rh_air=96.0))
@@ -156,6 +173,44 @@ class TestPlanningExtensions(unittest.TestCase):
 
         self.assertLess(float(control[0]), 0.05)
         self.assertLess(float(control[3]), 0.15)
+
+    def test_guardrails_limit_dry_high_vpd_actions(self):
+        control = apply_safety_guardrails(
+            DummyState(
+                temp_air=25.0,
+                rh_air=42.0,
+                glob_rad=320.0,
+                hour_of_day=13.0,
+                dew_margin_air=3.0,
+                canopy_dew_margin=3.0,
+            ),
+            np.array([0.3, 0.5, 0.0, 0.8, 0.6, 0.0], dtype=np.float32),
+        )
+
+        self.assertEqual(float(control[0]), 0.0)
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
+        self.assertLessEqual(float(control[3]), 0.180001)
+        self.assertGreaterEqual(float(control[5]), 0.5)
+
+    def test_cold_non_extreme_humidity_caps_ventilation(self):
+        control = apply_safety_guardrails(
+            DummyState(
+                temp_air=11.5,
+                rh_air=88.0,
+                glob_rad=0.0,
+                hour_of_day=3.0,
+                dew_margin_air=1.2,
+                canopy_dew_margin=1.1,
+            ),
+            np.array([0.0, 0.5, 0.2, 0.8, 0.6, 0.0], dtype=np.float32),
+        )
+
+        self.assertGreaterEqual(float(control[0]), 0.90)
+        self.assertGreaterEqual(float(control[2]), 0.899)
+        self.assertLessEqual(float(control[3]), 0.120001)
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
 
     def test_rh_emergency_replan_respects_extended_cooldown(self):
         director = self._director()
@@ -213,6 +268,31 @@ class TestPlanningExtensions(unittest.TestCase):
         self.assertLess(float(control[0]), 0.05)
         self.assertLess(float(control[3]), 0.15)
         self.assertEqual(float(control[4]), 0.0)
+
+    def test_dry_fallback_prefers_recovery_candidate(self):
+        director = self._director()
+        director.interface.env.u = np.array([0.4, 0.5, 0.0, 0.8, 0.6, 0.0], dtype=np.float32)
+
+        control = director._select_fallback_control(
+            state=DummyState(
+                temp_air=25.0,
+                rh_air=43.0,
+                co2_air=400.0,
+                glob_rad=320.0,
+                temp_out=18.0,
+                rh_out=35.0,
+                hour_of_day=12.0,
+                dew_margin_air=3.0,
+                canopy_dew_margin=3.0,
+            )
+        )
+
+        self.assertEqual(director.last_fallback_selection["source"], "dry_recovery")
+        self.assertEqual(float(control[0]), 0.0)
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
+        self.assertLessEqual(float(control[3]), director.config.dry_warm_vent_cap + 1e-6)
+        self.assertGreaterEqual(float(control[5]), 0.5)
 
     def test_humidity_memory_can_be_selected_as_rollout_candidate(self):
         class WastefulRule:
