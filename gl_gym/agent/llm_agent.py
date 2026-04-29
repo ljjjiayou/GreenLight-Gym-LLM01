@@ -32,7 +32,16 @@ from gl_gym.agent.plan_intent import (
     intent_to_dehumidify_mode,
     strategy_intent_alignment,
 )
+from gl_gym.agent.plan_cache import (
+    PlanCache,
+    config_fingerprint,
+    stable_hash,
+    state_summary_from_state,
+    text_hash,
+    to_jsonable,
+)
 from gl_gym.agent.ppo_strategy_labeler import label_strategy
+from gl_gym.agent.tools import ControlAction
 from gl_gym.agent.tools import create_langchain_tools, GreenhouseTools # 导入 Tools 类
 
 
@@ -87,6 +96,11 @@ class AgentConfig:
     max_iterations: int = 2                        # LangChain Agent 的最大思考轮数
     max_execution_time: Optional[float] = None     # 超时时间
     early_stopping_method: str = "force"           # 早停策略
+
+    # Frozen benchmark support. "off" keeps the ordinary LLM-RSPC baseline unchanged.
+    plan_cache_mode: str = "off"                   # off | record | replay | refresh
+    plan_cache_path: str = "gl_gym/result/plan_cache/llm_plan_cache.json"
+    plan_cache_strict: bool = False
     
     # 控制频率配置 (新增)
     control_interval: int = 12                     # LLM 控制间隔步数
@@ -835,6 +849,7 @@ class RuleBasedLLMDirector:
         self.rule_controller = self._init_rule_controller(rule_params)
         self.expert_policy = self._init_expert_policy()
         self.humidity_memory = self._init_humidity_memory()
+        self.plan_cache = self._init_plan_cache()
         
         # 状态追踪
         self.steps_since_last_llm = 0
@@ -847,6 +862,7 @@ class RuleBasedLLMDirector:
         self.last_rollout_selection: Dict[str, Any] = {}
         self.last_expert_prediction: Dict[str, Any] = {}
         self.last_humidity_memory_prediction: Dict[str, Any] = {}
+        self.last_plan_cache_event: Dict[str, Any] = {"mode": str(getattr(self.config, "plan_cache_mode", "off"))}
         self.last_humidity_memory_selected_step: int = -10**9
         self.last_llm_trigger_step: int = -10**9
         self.emergency_replan_cooldown_steps: int = max(6, int(self.config.control_interval // 2))
@@ -937,6 +953,90 @@ class RuleBasedLLMDirector:
         except Exception as exc:
             print(f"[Director] Failed to load humidity memory, disabling HEM rollout: {exc}")
         return None
+
+    def _init_plan_cache(self) -> Optional[PlanCache]:
+        mode = str(getattr(self.config, "plan_cache_mode", "off") or "off").lower()
+        if mode == "off":
+            return None
+        try:
+            cache = PlanCache(
+                getattr(self.config, "plan_cache_path", "gl_gym/result/plan_cache/llm_plan_cache.json"),
+                mode=mode,
+                strict=bool(getattr(self.config, "plan_cache_strict", False)),
+            )
+            print(f"[Director] LLM plan cache enabled: mode={mode}, path={cache.path}")
+            return cache
+        except Exception as exc:
+            if bool(getattr(self.config, "plan_cache_strict", False)):
+                raise
+            print(f"[Director] Failed to initialize plan cache, disabling cache: {exc}")
+            return None
+
+    def _control_action_record(self, action: ControlAction) -> Dict[str, Any]:
+        return {
+            "u_boil": float(action.u_boil),
+            "u_co2": float(action.u_co2),
+            "u_th_scr": float(action.u_th_scr),
+            "u_vent": float(action.u_vent),
+            "u_lamp": float(action.u_lamp),
+            "u_bl_scr": float(action.u_bl_scr),
+            "action_set": bool(action.action_set),
+        }
+
+    def _restore_cached_action(self, tools_instance: GreenhouseTools, entry: Dict[str, Any]) -> bool:
+        action_record = entry.get("buffered_action", {})
+        if not isinstance(action_record, dict) or not bool(action_record.get("action_set", False)):
+            return False
+        tools_instance.buffered_action = ControlAction(
+            u_boil=float(action_record.get("u_boil", 0.0)),
+            u_co2=float(action_record.get("u_co2", 0.0)),
+            u_th_scr=float(action_record.get("u_th_scr", 0.0)),
+            u_vent=float(action_record.get("u_vent", 0.0)),
+            u_lamp=float(action_record.get("u_lamp", 0.0)),
+            u_bl_scr=float(action_record.get("u_bl_scr", 0.0)),
+            action_set=True,
+        )
+        setpoints = entry.get("buffered_setpoints", {})
+        tools_instance.buffered_setpoints = dict(setpoints) if isinstance(setpoints, dict) else {}
+        return True
+
+    def _make_plan_cache_entry(
+        self,
+        *,
+        key: str,
+        state,
+        reason: str,
+        planning_horizon: int,
+        attempt: int,
+        prompt_text: str,
+        status_brief: str,
+        llm_output: str,
+        llm_duration: float,
+        llm_action_found: bool,
+        tools_instance: GreenhouseTools,
+    ) -> Dict[str, Any]:
+        config_fp = config_fingerprint(self.config)
+        return {
+            "schema_version": "llm_plan_cache_v1",
+            "key": key,
+            "mode_written": str(getattr(self.config, "plan_cache_mode", "off")),
+            "model_name": str(getattr(self.config, "model_name", "")),
+            "env_id": str(getattr(self, "env_id", "")),
+            "reason": str(reason),
+            "planning_horizon": int(planning_horizon),
+            "attempt": int(attempt),
+            "timestep": int(getattr(state, "timestep", 0)),
+            "state_summary": state_summary_from_state(state),
+            "prompt_hash": text_hash(prompt_text),
+            "config_hash": stable_hash(config_fp),
+            "config_fingerprint": config_fp,
+            "status_brief": status_brief,
+            "raw_response": str(llm_output or ""),
+            "llm_duration_seconds": float(llm_duration),
+            "llm_action_found": bool(llm_action_found),
+            "buffered_action": self._control_action_record(tools_instance.buffered_action),
+            "buffered_setpoints": to_jsonable(getattr(tools_instance, "buffered_setpoints", {})),
+        }
 
     def _state_plan_memory_row(self, state, plan: Optional[Dict[str, Any]]) -> Dict[str, float]:
         plan = plan or {}
@@ -2412,6 +2512,17 @@ class RuleBasedLLMDirector:
         llm_duration = 0.0
         llm_attempts = 0
         planning_horizon = max(1, int(planning_interval if planning_interval is not None else self.active_control_interval))
+        plan_cache = getattr(self, "plan_cache", None)
+        cache_mode = str(getattr(plan_cache, "mode", "off")) if plan_cache is not None else "off"
+        cache_key = None
+        cache_prompt_hash = ""
+        cache_config_hash = stable_hash(config_fingerprint(self.config))
+        self.last_plan_cache_event = {
+            "enabled": bool(plan_cache is not None),
+            "mode": cache_mode,
+            "hit": False,
+            "status": "disabled" if plan_cache is None else "pending",
+        }
 
         try:
             tools_instance = None
@@ -2448,6 +2559,42 @@ class RuleBasedLLMDirector:
                     prompt_text = f"{prompt_text}{retry_hint}"
                     print(f"[Director] LLM iteration {llm_attempts} 使用纠错重试提示")
 
+                cache_entry = None
+                cache_prompt_hash = text_hash(prompt_text)
+                if plan_cache is not None:
+                    cache_key = plan_cache.make_key(
+                        env_id=str(getattr(self, "env_id", "")),
+                        state_summary=state_summary_from_state(state),
+                        reason=reason,
+                        planning_horizon=planning_horizon,
+                        config_hash=cache_config_hash,
+                        prompt_hash=cache_prompt_hash,
+                        attempt=llm_attempts,
+                    )
+                    cache_entry = plan_cache.get(cache_key)
+                    self.last_plan_cache_event = {
+                        "enabled": True,
+                        "mode": cache_mode,
+                        "key": cache_key,
+                        "path": str(getattr(plan_cache, "path", "")),
+                        "hit": cache_entry is not None,
+                        "status": "hit" if cache_entry is not None else "miss",
+                        "attempt": int(llm_attempts),
+                        "prompt_hash": cache_prompt_hash,
+                        "config_hash": cache_config_hash,
+                    }
+                    if cache_entry is not None and cache_mode in {"record", "replay"}:
+                        llm_output = str(cache_entry.get("raw_response", ""))
+                        llm_action_found = self._restore_cached_action(tools_instance, cache_entry)
+                        llm_duration = 0.0
+                        print(f"[Director] LLM plan cache hit: mode={cache_mode}, key={cache_key}")
+                        if llm_action_found:
+                            break
+                        print(f"[Director] Cached iteration {llm_attempts} has no planning anchor, retrying...")
+                        continue
+                    if cache_entry is None and cache_mode == "replay" and bool(getattr(plan_cache, "strict", False)):
+                        raise RuntimeError(f"LLM plan cache miss in strict replay mode: key={cache_key}")
+
                 start_time = time.time()
                 config = {"max_execution_time": self.config.max_execution_time or 60.0}
                 result_state = self.agent_graph.invoke(
@@ -2459,11 +2606,52 @@ class RuleBasedLLMDirector:
                 messages = result_state.get("messages", [])
                 if messages and isinstance(messages[-1], AIMessage):
                     llm_output = messages[-1].content
+                if plan_cache is not None and cache_key is not None and cache_mode == "replay" and cache_entry is None:
+                    self.last_plan_cache_event.update({"hit": False, "status": "miss_fallback"})
 
                 if not tools_instance.buffered_action.is_empty():
                     llm_action_found = True
                     print(f"[Director] LLM iteration {llm_attempts} found planning anchor")
+                    if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                        plan_cache.put(
+                            cache_key,
+                            self._make_plan_cache_entry(
+                                key=cache_key,
+                                state=state,
+                                reason=reason,
+                                planning_horizon=planning_horizon,
+                                attempt=llm_attempts,
+                                prompt_text=prompt_text,
+                                status_brief=status_brief,
+                                llm_output=llm_output,
+                                llm_duration=llm_duration,
+                                llm_action_found=llm_action_found,
+                                tools_instance=tools_instance,
+                            ),
+                        )
+                        self.last_plan_cache_event.update({"hit": False, "status": "written"})
                     break
+
+                if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                    plan_cache.put(
+                        cache_key,
+                        self._make_plan_cache_entry(
+                            key=cache_key,
+                            state=state,
+                            reason=reason,
+                            planning_horizon=planning_horizon,
+                            attempt=llm_attempts,
+                            prompt_text=prompt_text,
+                            status_brief=status_brief,
+                            llm_output=llm_output,
+                            llm_duration=llm_duration,
+                            llm_action_found=llm_action_found,
+                            tools_instance=tools_instance,
+                        ),
+                    )
+                    self.last_plan_cache_event.update({"hit": False, "status": "written_empty"})
+                elif plan_cache is not None and cache_key is not None and cache_mode == "replay":
+                    self.last_plan_cache_event.update({"hit": False, "status": "miss_fallback"})
 
                 print(f"[Director] LLM iteration {llm_attempts} planning anchor empty, retrying...")
 
@@ -2545,7 +2733,27 @@ class RuleBasedLLMDirector:
                 "reason": reason,
                 "llm_action_found": llm_action_found,
                 "plan_interval": planning_horizon,
+                "plan_cache_event": dict(getattr(self, "last_plan_cache_event", {})),
             }
+
+            if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                plan_cache.update(
+                    cache_key,
+                    {
+                        "parsed_plan": to_jsonable(plan),
+                        "setpoint_contract_plan": {
+                            "anchor_control": to_jsonable(np.asarray(target_control, dtype=np.float32)),
+                            "target_temp": target_temp,
+                            "target_co2": target_co2,
+                            "target_rh": target_rh,
+                            "target_profile": target_profile,
+                            "profile_contract": profile_contract,
+                            "setpoint_contract": plan.get("setpoint_contract", {}),
+                        },
+                        "fallback_info": plan.get("fallback_selection", {}),
+                        "anchor_source": anchor_source,
+                    },
+                )
 
             # v2.1.2: 记录决策理由
             reasoning = self._record_decision_reasoning(plan, state, analysis)
@@ -3142,6 +3350,7 @@ class RuleBasedLLMDirector:
                 "reason": self.current_plan.get("reason"),
                 "anchor_source": self.current_plan.get("anchor_source", "unknown"),
                 "fallback_selection": self.current_plan.get("fallback_selection", {}),
+                "plan_cache_event": self.current_plan.get("plan_cache_event", dict(getattr(self, "last_plan_cache_event", {}))),
                 "rollout_selection": dict(getattr(self, "last_rollout_selection", {})),
                 "dehumidify_mode": self.dehumidify_mode,
                 "rh_violation_debt": self.rh_violation_debt,

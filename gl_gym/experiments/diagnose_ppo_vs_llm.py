@@ -277,6 +277,9 @@ def run_llm_trace(
     humidity_memory_teacher_policy_id: str,
     humidity_memory_baseline_controller_id: str,
     humidity_memory_version: str,
+    plan_cache_mode: str,
+    plan_cache_path: str,
+    plan_cache_strict: bool,
     uncertainty_scale: float,
 ) -> List[Dict[str, Any]]:
     raw_env = build_env(config, year, day, seed, uncertainty_scale)
@@ -301,6 +304,9 @@ def run_llm_trace(
         humidity_memory_teacher_policy_id=str(humidity_memory_teacher_policy_id or ""),
         humidity_memory_baseline_controller_id=str(humidity_memory_baseline_controller_id or ""),
         humidity_memory_version=str(humidity_memory_version or AgentConfig.humidity_memory_version),
+        plan_cache_mode=str(plan_cache_mode or "off"),
+        plan_cache_path=str(plan_cache_path or AgentConfig.plan_cache_path),
+        plan_cache_strict=bool(plan_cache_strict),
     )
     agent = RuleBasedLLMDirector(
         agent_interface=interface,
@@ -332,6 +338,7 @@ def run_llm_trace(
             break
         info = raw_env._get_info()
         plan = result.get("plan", {}) if isinstance(result, dict) else {}
+        plan_cache_event = plan.get("plan_cache_event", {}) if isinstance(plan, dict) else {}
         rollout = plan.get("rollout_selection", {}) if isinstance(plan, dict) else {}
         expert_info = rollout.get("expert_prediction", {}) if isinstance(rollout, dict) else {}
         humidity_memory_info = rollout.get("humidity_memory_prediction", {}) if isinstance(rollout, dict) else {}
@@ -352,6 +359,12 @@ def run_llm_trace(
             "target_temp": plan.get("current_target_temp") if isinstance(plan, dict) else None,
             "target_co2": plan.get("current_target_co2") if isinstance(plan, dict) else None,
             "target_rh": plan.get("current_target_rh") if isinstance(plan, dict) else None,
+            "plan_cache_mode": plan_cache_event.get("mode") if isinstance(plan_cache_event, dict) else None,
+            "plan_cache_enabled": bool(plan_cache_event.get("enabled", False)) if isinstance(plan_cache_event, dict) else False,
+            "plan_cache_hit": bool(plan_cache_event.get("hit", False)) if isinstance(plan_cache_event, dict) else False,
+            "plan_cache_status": plan_cache_event.get("status") if isinstance(plan_cache_event, dict) else None,
+            "plan_cache_key": plan_cache_event.get("key") if isinstance(plan_cache_event, dict) else None,
+            "plan_cache_attempt": int(plan_cache_event.get("attempt", 0) or 0) if isinstance(plan_cache_event, dict) else 0,
             "rh_violation_debt": plan.get("rh_violation_debt", 0.0) if isinstance(plan, dict) else 0.0,
             "expert_available": bool(expert_info.get("available", False)) if isinstance(expert_info, dict) else False,
             "expert_accepted": bool(expert_info.get("accepted", False)) if isinstance(expert_info, dict) else False,
@@ -399,6 +412,9 @@ def sum_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             summary[f"mean_u_{action}"] = float(mean(float(r.get(f"u_{action}", 0.0)) for r in rows))
         summary["mean_rh"] = float(mean(float(r.get("rh_air", 0.0)) for r in rows))
         summary["mean_temp"] = float(mean(float(r.get("temp_air", 0.0)) for r in rows))
+        if any("plan_cache_enabled" in r for r in rows):
+            summary["plan_cache_enabled_steps"] = int(sum(bool(r.get("plan_cache_enabled", False)) for r in rows))
+            summary["plan_cache_hit_steps"] = int(sum(bool(r.get("plan_cache_hit", False)) for r in rows))
         if any("humidity_memory_available" in r for r in rows):
             summary["humidity_memory_available_steps"] = int(sum(bool(r.get("humidity_memory_available", False)) for r in rows))
             summary["humidity_memory_accepted_steps"] = int(sum(bool(r.get("humidity_memory_accepted", False)) for r in rows))
@@ -623,6 +639,7 @@ def build_report(summary: Dict[str, Any]) -> str:
         f"- Scenario: year={summary['scenario']['year']}, day={summary['scenario']['day']}, seed={summary['scenario']['seed']}",
         f"- Steps: {summary['scenario']['max_steps']}",
         f"- Expert rollout: {summary['scenario']['expert_rollout']}",
+        f"- Plan cache: {summary['scenario'].get('plan_cache_mode', 'off')}",
         "",
         "## Aggregate",
         "| Algorithm | Reward | Profit | Revenue | Heat | CO2 | Elec | Temp V | RH V |",
@@ -656,6 +673,15 @@ def build_report(summary: Dict[str, Any]) -> str:
             f"RH>=90 state steps={item['state_rh_ge_90_steps']}"
         )
     llm_item = summary.get("aggregate", {}).get("llm_director", {})
+    if "plan_cache_enabled_steps" in llm_item:
+        lines.extend(
+            [
+                "",
+                "## Plan Cache",
+                f"- enabled rows={llm_item.get('plan_cache_enabled_steps', 0)}, "
+                f"cache hits={llm_item.get('plan_cache_hit_steps', 0)}",
+            ]
+        )
     if "humidity_memory_available_steps" in llm_item:
         lines.extend(
             [
@@ -704,6 +730,9 @@ def main() -> None:
     parser.add_argument("--llm-interval", type=int, default=12)
     parser.add_argument("--llm-max-iterations", type=int, default=1)
     parser.add_argument("--llm-max-tokens", type=int, default=260)
+    parser.add_argument("--llm-plan-cache-mode", type=str, choices=["off", "record", "replay", "refresh"], default="off")
+    parser.add_argument("--llm-plan-cache-path", type=str, default=AgentConfig.plan_cache_path)
+    parser.add_argument("--llm-plan-cache-strict", action="store_true")
     parser.add_argument("--llm-expert-rollout", action="store_true")
     parser.add_argument("--llm-expert-policy-path", type=str, default=AgentConfig.expert_policy_path)
     parser.add_argument("--llm-expert-max-distance", type=float, default=AgentConfig.expert_candidate_max_distance)
@@ -733,6 +762,8 @@ def main() -> None:
 
     llm_elapsed = 0.0
     api_key = os.getenv("BAILIAN_API_KEY")
+    if not api_key and args.llm_plan_cache_mode == "replay":
+        api_key = "plan-cache-replay"
     if not args.skip_llm and api_key:
         t1 = time.perf_counter()
         rows.extend(
@@ -757,6 +788,9 @@ def main() -> None:
                 humidity_memory_teacher_policy_id=args.llm_humidity_memory_teacher_policy_id,
                 humidity_memory_baseline_controller_id=args.llm_humidity_memory_baseline_controller_id,
                 humidity_memory_version=args.llm_humidity_memory_version,
+                plan_cache_mode=args.llm_plan_cache_mode,
+                plan_cache_path=args.llm_plan_cache_path,
+                plan_cache_strict=args.llm_plan_cache_strict,
                 uncertainty_scale=args.uncertainty_scale,
             )
         )
@@ -778,6 +812,9 @@ def main() -> None:
             "expert_rollout": bool(args.llm_expert_rollout),
             "humidity_memory": bool(args.llm_humidity_memory),
             "humidity_memory_version": str(args.llm_humidity_memory_version),
+            "plan_cache_mode": str(args.llm_plan_cache_mode),
+            "plan_cache_path": str(args.llm_plan_cache_path),
+            "plan_cache_strict": bool(args.llm_plan_cache_strict),
         },
         "timing": {"ppo_seconds": float(ppo_elapsed), "llm_seconds": float(llm_elapsed)},
         "aggregate": aggregate,
