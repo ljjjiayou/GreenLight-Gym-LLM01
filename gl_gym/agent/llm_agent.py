@@ -25,6 +25,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from gl_gym.environments.baseline import RuleBasedController
 from gl_gym.common.utils import load_model_hyperparams, calculate_vpd_kpa
 from gl_gym.agent.expert_distillation import DistilledExpertPolicy
+from gl_gym.agent.humidity_experience_memory import HumidityExperienceConfig, HumidityExperienceMemory
 from gl_gym.agent.plan_intent import (
     action_record_for_labeling,
     infer_plan_intent,
@@ -118,6 +119,16 @@ class AgentConfig:
     expert_candidate_max_distance: float = 0.0
     expert_candidate_blend: float = 0.55
     expert_intent_gate_enabled: bool = True
+    humidity_memory_enabled: bool = False
+    humidity_memory_path: str = "gl_gym/result/experience_memory/humidity_memory_s240_day240_20260429.jsonl"
+    humidity_memory_max_distance: float = 1.15
+    humidity_memory_min_trust: float = 0.50
+    humidity_memory_top_k: int = 1
+    humidity_memory_candidate_blend: float = 0.75
+    humidity_memory_teacher_policy_id: str = ""
+    humidity_memory_baseline_controller_id: str = ""
+    humidity_memory_version: str = "hem_rspc_v1"
+    humidity_memory_post_guardrail_shape: bool = True
 
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
@@ -810,6 +821,7 @@ class RuleBasedLLMDirector:
         # 加载规则控制器 (PID 或其他算法)
         self.rule_controller = self._init_rule_controller(rule_params)
         self.expert_policy = self._init_expert_policy()
+        self.humidity_memory = self._init_humidity_memory()
         
         # 状态追踪
         self.steps_since_last_llm = 0
@@ -821,6 +833,7 @@ class RuleBasedLLMDirector:
         self.last_fallback_selection: Dict[str, Any] = {}
         self.last_rollout_selection: Dict[str, Any] = {}
         self.last_expert_prediction: Dict[str, Any] = {}
+        self.last_humidity_memory_prediction: Dict[str, Any] = {}
         self.last_llm_trigger_step: int = -10**9
         self.emergency_replan_cooldown_steps: int = max(6, int(self.config.control_interval // 2))
         self.emergency_replan_confirm_steps: int = 2
@@ -894,6 +907,112 @@ class RuleBasedLLMDirector:
         except Exception as exc:
             print(f"[Director] Failed to load distilled expert policy, disabling expert rollout: {exc}")
         return None
+
+    def _init_humidity_memory(self) -> Optional[HumidityExperienceMemory]:
+        if not bool(getattr(self.config, "humidity_memory_enabled", False)):
+            return None
+        memory_path = str(getattr(self.config, "humidity_memory_path", "") or "")
+        if not memory_path:
+            return None
+        try:
+            memory = HumidityExperienceMemory.load_jsonl(memory_path)
+            print(f"[Director] Loaded humidity experience memory: {memory_path}")
+            return memory
+        except FileNotFoundError:
+            print(f"[Director] Humidity memory not found, disabling HEM rollout: {memory_path}")
+        except Exception as exc:
+            print(f"[Director] Failed to load humidity memory, disabling HEM rollout: {exc}")
+        return None
+
+    def _state_plan_memory_row(self, state, plan: Optional[Dict[str, Any]]) -> Dict[str, float]:
+        plan = plan or {}
+        target_temp = self._get_plan_target(plan, "target_temp", state)
+        target_co2 = self._get_plan_target(plan, "target_co2", state)
+        target_rh = self._get_plan_target(plan, "target_rh", state)
+        return {
+            "timestep": float(getattr(state, "timestep", 0.0)),
+            "step": float(getattr(state, "timestep", 0.0)),
+            "hour_of_day": float(getattr(state, "hour_of_day", 12.0)),
+            "day_of_year": float(getattr(state, "day_of_year", 180.0)),
+            "temp_air": float(getattr(state, "temp_air", 20.0)),
+            "rh_air": float(getattr(state, "rh_air", 70.0)),
+            "co2_air": float(getattr(state, "co2_air", 430.0)),
+            "glob_rad": float(getattr(state, "glob_rad", 0.0)),
+            "temp_out": float(getattr(state, "temp_out", getattr(state, "temp_air", 20.0))),
+            "rh_out": float(getattr(state, "rh_out", 70.0)),
+            "wind_speed": float(getattr(state, "wind_speed", 0.0)),
+            "dew_margin_air": float(getattr(state, "dew_margin_air", 3.0)),
+            "canopy_dew_margin": float(getattr(state, "canopy_dew_margin", 3.0)),
+            "forecast_humidity_risk": float(getattr(state, "forecast_humidity_risk", 0.0)),
+            "target_temp": float(target_temp if target_temp is not None else getattr(state, "temp_air", 20.0)),
+            "target_co2": float(target_co2 if target_co2 is not None else getattr(state, "co2_air", 430.0)),
+            "target_rh": float(target_rh if target_rh is not None else 76.0),
+        }
+
+    def _predict_humidity_memory_control(
+        self,
+        state,
+        plan: Optional[Dict[str, Any]],
+    ) -> Optional[np.ndarray]:
+        self.last_humidity_memory_prediction = {"enabled": bool(getattr(self.config, "humidity_memory_enabled", False))}
+        memory = getattr(self, "humidity_memory", None)
+        if memory is None:
+            self.last_humidity_memory_prediction["available"] = False
+            return None
+        try:
+            row = self._state_plan_memory_row(state, plan)
+            required_metadata = {
+                key: value
+                for key, value in {
+                    "teacher_policy_id": getattr(self.config, "humidity_memory_teacher_policy_id", ""),
+                    "baseline_controller_id": getattr(self.config, "humidity_memory_baseline_controller_id", ""),
+                    "memory_schema_version": getattr(self.config, "humidity_memory_version", ""),
+                }.items()
+                if value
+            }
+            matches = memory.retrieve(
+                row,
+                target_row=row,
+                top_k=int(getattr(self.config, "humidity_memory_top_k", 1)),
+                max_distance=float(getattr(self.config, "humidity_memory_max_distance", 1.15)),
+                min_trust=float(getattr(self.config, "humidity_memory_min_trust", 0.50)),
+                required_metadata=required_metadata or None,
+            )
+            if not matches:
+                self.last_humidity_memory_prediction = {
+                    "enabled": True,
+                    "available": False,
+                    "accepted": False,
+                    "required_metadata": required_metadata,
+                }
+                return None
+            match = matches[0]
+            control = np.clip(np.asarray(match["candidate_action"], dtype=np.float32), 0.0, 1.0)
+            strategy = label_strategy(action_record_for_labeling(state, control), action_prefix="u")
+            self.last_humidity_memory_prediction = {
+                "enabled": True,
+                "available": True,
+                "accepted": True,
+                "case_id": match.get("case_id"),
+                "distance": float(match.get("distance", 0.0)),
+                "trust": float(match.get("trust", 0.0)),
+                "support_count": int(match.get("support_count", 0)),
+                "status": match.get("status"),
+                "score": float(match.get("score", 0.0)),
+                "strategy_label": strategy.label,
+                "strategy_confidence": float(strategy.confidence),
+                "required_metadata": required_metadata,
+            }
+            return control
+        except Exception as exc:
+            self.last_humidity_memory_prediction = {
+                "enabled": True,
+                "available": True,
+                "accepted": False,
+                "error": str(exc),
+            }
+            print(f"[Director] Humidity memory rollout failed: {exc}")
+            return None
 
     def _predict_expert_control(
         self,
@@ -1868,11 +1987,75 @@ class RuleBasedLLMDirector:
         self.pending_control = np.asarray(control, dtype=np.float32).copy()
         return self.pending_control.copy()
 
+    def _apply_humidity_memory_final_shape(self, state, control: np.ndarray) -> np.ndarray:
+        final = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        if not bool(getattr(self.config, "humidity_memory_post_guardrail_shape", True)):
+            return final
+        selection = getattr(self, "last_rollout_selection", {}) or {}
+        prediction = getattr(self, "last_humidity_memory_prediction", {}) or {}
+        source = str(selection.get("source", ""))
+        if not source.startswith("humidity_memory") or not bool(prediction.get("accepted", False)):
+            return final
+
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        vpd_now = float(calculate_vpd_kpa(temp_air, rh_air))
+        dew_margin = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        wind_speed = float(getattr(state, "wind_speed", 0.0))
+        hour_of_day = float(getattr(state, "hour_of_day", 12.0))
+        glob_rad = float(getattr(state, "glob_rad", 0.0))
+        is_dark = hour_of_day < 6.0 or hour_of_day > 18.0 or glob_rad < 5.0
+        safe_economic_band = (
+            temp_air >= 16.0
+            and 78.0 <= rh_air <= 88.5
+            and vpd_now >= 0.25
+            and dew_margin >= 1.0
+            and wind_speed <= 6.0
+        )
+        shape_info = {
+            "applied": False,
+            "source": source,
+            "temp_air": temp_air,
+            "rh_air": rh_air,
+            "vpd_kpa": vpd_now,
+            "dew_margin": dew_margin,
+            "wind_speed": wind_speed,
+            "is_dark": is_dark,
+        }
+        if not safe_economic_band:
+            shape_info["reason"] = "outside_safe_economic_band"
+            selection["humidity_memory_post_guardrail_shape"] = shape_info
+            return final
+
+        memory_cfg = getattr(getattr(self, "humidity_memory", None), "config", HumidityExperienceConfig())
+        before = final.copy()
+        final[0] = min(float(final[0]), float(memory_cfg.free_air_exchange_heat_cap))
+        final[1] = min(float(final[1]), float(memory_cfg.free_air_exchange_co2_cap))
+        final[2] = min(float(final[2]), float(memory_cfg.free_air_exchange_screen_cap))
+        final[3] = max(float(final[3]), float(memory_cfg.free_air_exchange_min_ventilation))
+        final[4] = min(float(final[4]), float(memory_cfg.free_air_exchange_lighting_cap))
+        if is_dark and temp_air < 18.0:
+            final[0] = max(float(final[0]), 0.04)
+            final[3] = min(float(final[3]), 0.65)
+        shape_info.update(
+            {
+                "applied": True,
+                "before": [float(x) for x in before],
+                "after": [float(x) for x in final],
+            }
+        )
+        selection["humidity_memory_post_guardrail_shape"] = shape_info
+        return np.clip(final, 0.0, 1.0).astype(np.float32)
+
     def _flush_buffered_control(self, state) -> np.ndarray:
         """将缓存控制量统一过护栏并清空缓存。"""
         if self.pending_control is None:
             self.pending_control = self._select_fallback_control(state=state)
         final_control = apply_safety_guardrails(state, self.pending_control)
+        final_control = self._apply_humidity_memory_final_shape(state, final_control)
         self.pending_control = None
         return np.asarray(final_control, dtype=np.float32)
 
@@ -2269,6 +2452,7 @@ class RuleBasedLLMDirector:
             lamp_budget_remaining=lamp_budget_remaining,
             dehumidify_mode=dehumidify_mode,
         )
+        humidity_memory_control = self._predict_humidity_memory_control(state=state, plan=plan)
 
         plan_start = int(plan.get("created_timestep", int(state.timestep)))
         plan_end = int(plan.get("expires_timestep", plan_start + 1))
@@ -2308,6 +2492,23 @@ class RuleBasedLLMDirector:
                         ),
                     ]
                 )
+            if humidity_memory_control is not None:
+                memory_blend = float(np.clip(getattr(self.config, "humidity_memory_candidate_blend", 0.75), 0.0, 1.0))
+                candidate_controls.extend(
+                    [
+                        ("humidity_memory", humidity_memory_control, 0.0),
+                        (
+                            "humidity_memory_anchor_blend",
+                            memory_blend * humidity_memory_control + (1.0 - memory_blend) * anchor_control,
+                            0.0,
+                        ),
+                        (
+                            "humidity_memory_rule_blend",
+                            memory_blend * humidity_memory_control + (1.0 - memory_blend) * rule_control,
+                            1.0 - memory_blend,
+                        ),
+                    ]
+                )
             scored_candidates = []
             for name, candidate_control, candidate_rule_weight in candidate_controls:
                 clipped = np.clip(np.asarray(candidate_control, dtype=np.float32), 0.0, 1.0)
@@ -2331,6 +2532,7 @@ class RuleBasedLLMDirector:
                     for score, name, _, candidate_rule_weight, _ in scored_candidates
                 ],
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
+                "humidity_memory_prediction": dict(getattr(self, "last_humidity_memory_prediction", {})),
             }
         else:
             self.last_rollout_selection = {
@@ -2339,6 +2541,7 @@ class RuleBasedLLMDirector:
                 "rule_weight": float(rule_weight),
                 "candidates": [],
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
+                "humidity_memory_prediction": dict(getattr(self, "last_humidity_memory_prediction", {})),
             }
 
         target_temp = self._get_plan_target(plan, "target_temp", state)

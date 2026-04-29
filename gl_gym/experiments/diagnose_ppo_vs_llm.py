@@ -270,6 +270,13 @@ def run_llm_trace(
     expert_rollout: bool,
     expert_policy_path: str,
     expert_max_distance: float,
+    humidity_memory_enabled: bool,
+    humidity_memory_path: str,
+    humidity_memory_max_distance: float,
+    humidity_memory_min_trust: float,
+    humidity_memory_teacher_policy_id: str,
+    humidity_memory_baseline_controller_id: str,
+    humidity_memory_version: str,
     uncertainty_scale: float,
 ) -> List[Dict[str, Any]]:
     raw_env = build_env(config, year, day, seed, uncertainty_scale)
@@ -287,6 +294,13 @@ def run_llm_trace(
         expert_rollout_enabled=bool(expert_rollout),
         expert_policy_path=expert_policy_path or AgentConfig.expert_policy_path,
         expert_candidate_max_distance=float(expert_max_distance),
+        humidity_memory_enabled=bool(humidity_memory_enabled),
+        humidity_memory_path=humidity_memory_path or AgentConfig.humidity_memory_path,
+        humidity_memory_max_distance=float(humidity_memory_max_distance),
+        humidity_memory_min_trust=float(humidity_memory_min_trust),
+        humidity_memory_teacher_policy_id=str(humidity_memory_teacher_policy_id or ""),
+        humidity_memory_baseline_controller_id=str(humidity_memory_baseline_controller_id or ""),
+        humidity_memory_version=str(humidity_memory_version or AgentConfig.humidity_memory_version),
     )
     agent = RuleBasedLLMDirector(
         agent_interface=interface,
@@ -320,6 +334,9 @@ def run_llm_trace(
         plan = result.get("plan", {}) if isinstance(result, dict) else {}
         rollout = plan.get("rollout_selection", {}) if isinstance(plan, dict) else {}
         expert_info = rollout.get("expert_prediction", {}) if isinstance(rollout, dict) else {}
+        humidity_memory_info = rollout.get("humidity_memory_prediction", {}) if isinstance(rollout, dict) else {}
+        humidity_memory_shape = rollout.get("humidity_memory_post_guardrail_shape", {}) if isinstance(rollout, dict) else {}
+        rollout_source = str(rollout.get("source", result.get("action", "unknown")))
         applied_control = result.get("applied_control", getattr(raw_env, "u", np.zeros(6)))
         row = {
             "algo": "llm_director",
@@ -329,7 +346,7 @@ def run_llm_trace(
             "step": int(step),
             "reward": float(result.get("reward", 0.0)),
             "done": bool(result.get("done", False)),
-            "source": str(rollout.get("source", result.get("action", "unknown"))),
+            "source": rollout_source,
             "replan_reason": result.get("replan_reason"),
             "anchor_source": plan.get("anchor_source") if isinstance(plan, dict) else None,
             "target_temp": plan.get("current_target_temp") if isinstance(plan, dict) else None,
@@ -339,6 +356,17 @@ def run_llm_trace(
             "expert_available": bool(expert_info.get("available", False)) if isinstance(expert_info, dict) else False,
             "expert_accepted": bool(expert_info.get("accepted", False)) if isinstance(expert_info, dict) else False,
             "expert_feature_distance": float(expert_info.get("feature_distance", 0.0)) if isinstance(expert_info, dict) else 0.0,
+            "humidity_memory_available": bool(humidity_memory_info.get("available", False)) if isinstance(humidity_memory_info, dict) else False,
+            "humidity_memory_accepted": bool(humidity_memory_info.get("accepted", False)) if isinstance(humidity_memory_info, dict) else False,
+            "humidity_memory_selected": rollout_source.startswith("humidity_memory"),
+            "humidity_memory_case_id": humidity_memory_info.get("case_id") if isinstance(humidity_memory_info, dict) else None,
+            "humidity_memory_distance": float(humidity_memory_info.get("distance", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_trust": float(humidity_memory_info.get("trust", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_support_count": int(humidity_memory_info.get("support_count", 0)) if isinstance(humidity_memory_info, dict) else 0,
+            "humidity_memory_strategy_label": humidity_memory_info.get("strategy_label") if isinstance(humidity_memory_info, dict) else None,
+            "humidity_memory_strategy_confidence": float(humidity_memory_info.get("strategy_confidence", 0.0)) if isinstance(humidity_memory_info, dict) else 0.0,
+            "humidity_memory_post_shape_applied": bool(humidity_memory_shape.get("applied", False)) if isinstance(humidity_memory_shape, dict) else False,
+            "humidity_memory_post_shape_reason": humidity_memory_shape.get("reason") if isinstance(humidity_memory_shape, dict) else None,
             **state_to_record(state),
             **control_to_record(applied_control),
             **control_to_record(result.get("anchor_control", np.zeros(6)), prefix="anchor"),
@@ -648,6 +676,13 @@ def main() -> None:
     parser.add_argument("--llm-expert-rollout", action="store_true")
     parser.add_argument("--llm-expert-policy-path", type=str, default=AgentConfig.expert_policy_path)
     parser.add_argument("--llm-expert-max-distance", type=float, default=AgentConfig.expert_candidate_max_distance)
+    parser.add_argument("--llm-humidity-memory", action="store_true")
+    parser.add_argument("--llm-humidity-memory-path", type=str, default=AgentConfig.humidity_memory_path)
+    parser.add_argument("--llm-humidity-memory-max-distance", type=float, default=AgentConfig.humidity_memory_max_distance)
+    parser.add_argument("--llm-humidity-memory-min-trust", type=float, default=AgentConfig.humidity_memory_min_trust)
+    parser.add_argument("--llm-humidity-memory-teacher-policy-id", type=str, default="")
+    parser.add_argument("--llm-humidity-memory-baseline-controller-id", type=str, default="")
+    parser.add_argument("--llm-humidity-memory-version", type=str, default=AgentConfig.humidity_memory_version)
     parser.add_argument("--output-json", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_diag.json")
     parser.add_argument("--output-csv", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_trace.csv")
     parser.add_argument("--output-report", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_diag.md")
@@ -684,6 +719,13 @@ def main() -> None:
                 expert_rollout=args.llm_expert_rollout,
                 expert_policy_path=args.llm_expert_policy_path,
                 expert_max_distance=args.llm_expert_max_distance,
+                humidity_memory_enabled=args.llm_humidity_memory,
+                humidity_memory_path=args.llm_humidity_memory_path,
+                humidity_memory_max_distance=args.llm_humidity_memory_max_distance,
+                humidity_memory_min_trust=args.llm_humidity_memory_min_trust,
+                humidity_memory_teacher_policy_id=args.llm_humidity_memory_teacher_policy_id,
+                humidity_memory_baseline_controller_id=args.llm_humidity_memory_baseline_controller_id,
+                humidity_memory_version=args.llm_humidity_memory_version,
                 uncertainty_scale=args.uncertainty_scale,
             )
         )
@@ -703,6 +745,8 @@ def main() -> None:
             "max_steps": int(args.max_steps),
             "uncertainty_scale": float(args.uncertainty_scale),
             "expert_rollout": bool(args.llm_expert_rollout),
+            "humidity_memory": bool(args.llm_humidity_memory),
+            "humidity_memory_version": str(args.llm_humidity_memory_version),
         },
         "timing": {"ppo_seconds": float(ppo_elapsed), "llm_seconds": float(llm_elapsed)},
         "aggregate": aggregate,

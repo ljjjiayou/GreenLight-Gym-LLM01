@@ -125,6 +125,11 @@ class TestHumidityExperienceMemory(unittest.TestCase):
         self.assertEqual(candidate.shape[0], 6)
         self.assertGreater(float(candidate[3]), float(action_from_row(_llm_row())[3]))
         self.assertLess(float(candidate[0]), float(action_from_row(_llm_row())[0]))
+        self.assertLessEqual(float(candidate[0]), 0.10)
+        self.assertLessEqual(float(candidate[1]), 0.02)
+        self.assertLessEqual(float(candidate[2]), 0.35)
+        self.assertGreaterEqual(float(candidate[3]), 0.55)
+        self.assertLessEqual(float(candidate[4]), 0.02)
 
     def test_metadata_filter_prevents_cross_version_reuse(self):
         experience, _ = build_experience_from_pair(

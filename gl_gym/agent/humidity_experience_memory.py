@@ -99,6 +99,11 @@ class HumidityExperienceConfig:
     risk_override_max_rh_gap: float = 13.0
     risk_override_min_vpd_kpa: float = 0.28
     risk_override_min_air_dew_margin: float = 2.0
+    free_air_exchange_screen_cap: float = 0.35
+    free_air_exchange_heat_cap: float = 0.10
+    free_air_exchange_min_ventilation: float = 0.55
+    free_air_exchange_co2_cap: float = 0.02
+    free_air_exchange_lighting_cap: float = 0.02
     retrieval_max_distance: float = 1.15
     min_trust: float = 0.50
     merge_max_distance: float = 0.45
@@ -701,6 +706,29 @@ class HumidityExperienceMemory:
             else:
                 target.evidence[key] = float(value)
 
+    def _shape_free_air_exchange_candidate(
+        self,
+        candidate: np.ndarray,
+        experience: HumidityExperience,
+    ) -> np.ndarray:
+        shaped = np.clip(np.asarray(candidate, dtype=np.float32), 0.0, 1.0)
+        expert = np.asarray(experience.expert_action, dtype=np.float32)
+        if expert.shape[0] < len(ACTION_NAMES):
+            expert = np.pad(expert, (0, len(ACTION_NAMES) - expert.shape[0]))
+        shaped[0] = min(float(shaped[0]), float(self.config.free_air_exchange_heat_cap))
+        shaped[1] = min(float(shaped[1]), float(self.config.free_air_exchange_co2_cap))
+        screen_cap = min(
+            float(self.config.free_air_exchange_screen_cap),
+            max(0.05, float(expert[2]) + 0.20),
+        )
+        shaped[2] = min(float(shaped[2]), screen_cap)
+        shaped[3] = max(
+            float(shaped[3]),
+            min(1.0, max(float(self.config.free_air_exchange_min_ventilation), float(expert[3]) * 0.85)),
+        )
+        shaped[4] = min(float(shaped[4]), float(self.config.free_air_exchange_lighting_cap))
+        return np.clip(shaped, 0.0, 1.0).astype(np.float32)
+
     def retrieve(
         self,
         row: Dict[str, Any],
@@ -757,6 +785,8 @@ class HumidityExperienceMemory:
                 continue
             residual = np.asarray(experience.residual_action, dtype=np.float32)
             candidate = np.clip(base_action + residual, 0.0, 1.0)
+            if experience.strategy_label == "free_air_exchange":
+                candidate = self._shape_free_air_exchange_candidate(candidate, experience)
             matches.append(
                 {
                     "case_id": experience.case_id,
