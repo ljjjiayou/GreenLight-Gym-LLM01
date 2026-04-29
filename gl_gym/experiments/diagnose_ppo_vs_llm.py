@@ -33,6 +33,7 @@ from gl_gym.agent.expert_distillation import ACTION_NAMES
 from gl_gym.agent.interface import GreenhouseAgentInterface
 from gl_gym.agent.llm_agent import AgentConfig, RuleBasedLLMDirector, create_langchain_tools
 from gl_gym.agent.ppo_strategy_labeler import label_strategy
+from gl_gym.common.utils import calculate_vpd_kpa
 from gl_gym.environments.baseline import RuleBasedController as GreenhouseRuleController
 from gl_gym.environments.tomato_env import TomatoEnv
 
@@ -51,6 +52,16 @@ METRIC_MAP = {
     "rh_violation": "rh_violation",
     "lamp_violation": "lamp_violation",
 }
+
+
+RH_LOW_LIMIT = 50.0
+RH_DRY_RISK = 55.0
+RH_HIGH_LIMIT = 90.0
+RH_DEW_RISK = 94.0
+VPD_LOW_LIMIT = 0.25
+VPD_HIGH_LIMIT = 1.20
+DEW_MARGIN_RISK = 0.60
+COLD_TEMP_LIMIT = 12.0
 
 
 DEFAULT_RULE_PARAMS = {
@@ -204,8 +215,52 @@ def append_strategy_label(row: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
+def _dry_vent_cap(temp_air: float) -> float:
+    if temp_air >= 28.0:
+        return 0.35
+    if temp_air >= 24.0:
+        return 0.18
+    return 0.12
+
+
+def append_climate_risk_metrics(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Add mechanism-level risk metrics without changing controller behavior."""
+    temp_air = float(row.get("temp_air", 20.0))
+    rh_air = float(row.get("rh_air", 70.0))
+    vent = float(row.get("u_ventilation", 0.0))
+    dew_margin = min(
+        float(row.get("dew_margin_air", 3.0)),
+        float(row.get("canopy_dew_margin", 3.0)),
+    )
+    vpd = float(calculate_vpd_kpa(temp_air, rh_air))
+    dry_risk = rh_air < RH_DRY_RISK or vpd > VPD_HIGH_LIMIT
+    dew_risk = rh_air >= RH_DEW_RISK or dew_margin < DEW_MARGIN_RISK
+    extreme_dew_risk = rh_air >= RH_DEW_RISK or dew_margin < 0.40
+    cold_vent_risk = temp_air < COLD_TEMP_LIMIT and vent > 0.12 and not extreme_dew_risk
+    dry_vent_risk = dry_risk and vent > _dry_vent_cap(temp_air)
+
+    row.update(
+        {
+            "vpd_air": vpd,
+            "vpd_kpa": vpd,
+            "rh_low_violation": max(RH_LOW_LIMIT - rh_air, 0.0),
+            "rh_high_violation": max(rh_air - RH_HIGH_LIMIT, 0.0),
+            "vpd_low_excess": max(VPD_LOW_LIMIT - vpd, 0.0),
+            "vpd_high_excess": max(vpd - VPD_HIGH_LIMIT, 0.0),
+            "dew_margin_min": dew_margin,
+            "dry_risk": bool(dry_risk),
+            "dew_risk": bool(dew_risk),
+            "cold_vent_risk": bool(cold_vent_risk),
+            "dry_vent_risk": bool(dry_vent_risk),
+            "dry_vent_cap": float(_dry_vent_cap(temp_air)),
+        }
+    )
+    return row
+
+
 def finalize_trace_row(row: Dict[str, Any]) -> Dict[str, Any]:
     append_regime_labels(row)
+    append_climate_risk_metrics(row)
     append_strategy_label(row)
     return row
 
@@ -416,6 +471,20 @@ def sum_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             summary[f"mean_u_{action}"] = float(mean(float(r.get(f"u_{action}", 0.0)) for r in rows))
         summary["mean_rh"] = float(mean(float(r.get("rh_air", 0.0)) for r in rows))
         summary["mean_temp"] = float(mean(float(r.get("temp_air", 0.0)) for r in rows))
+        summary["mean_vpd"] = float(mean(float(r.get("vpd_air", 0.0)) for r in rows))
+        summary["total_rh_low_violation"] = float(sum(float(r.get("rh_low_violation", 0.0)) for r in rows))
+        summary["total_rh_high_violation"] = float(sum(float(r.get("rh_high_violation", 0.0)) for r in rows))
+        summary["total_vpd_low_excess"] = float(sum(float(r.get("vpd_low_excess", 0.0)) for r in rows))
+        summary["total_vpd_high_excess"] = float(sum(float(r.get("vpd_high_excess", 0.0)) for r in rows))
+        summary["dry_risk_steps"] = int(sum(bool(r.get("dry_risk", False)) for r in rows))
+        summary["dew_risk_steps"] = int(sum(bool(r.get("dew_risk", False)) for r in rows))
+        summary["cold_vent_risk_steps"] = int(sum(bool(r.get("cold_vent_risk", False)) for r in rows))
+        summary["dry_vent_risk_steps"] = int(sum(bool(r.get("dry_vent_risk", False)) for r in rows))
+        source_counts: Dict[str, int] = {}
+        for row in rows:
+            source = str(row.get("source", "unknown"))
+            source_counts[source] = source_counts.get(source, 0) + 1
+        summary["source_counts"] = dict(sorted(source_counts.items()))
         if any("plan_cache_enabled" in r for r in rows):
             summary["plan_cache_enabled_steps"] = int(sum(bool(r.get("plan_cache_enabled", False)) for r in rows))
             summary["plan_cache_hit_steps"] = int(sum(bool(r.get("plan_cache_hit", False)) for r in rows))
@@ -527,13 +596,26 @@ def safety_patterns(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             and (float(r.get("rh_air", 0.0)) >= 85.0 or float(r.get("u_ventilation", 0.0)) >= 0.30)
         ]
         high_rh = [r for r in selected if float(r.get("rh_air", 0.0)) >= 90.0]
+        low_rh = [r for r in selected if float(r.get("rh_air", 0.0)) < 50.0]
+        dry_risk = [r for r in selected if bool(r.get("dry_risk", False))]
+        dew_risk = [r for r in selected if bool(r.get("dew_risk", False))]
+        cold_vent_risk = [r for r in selected if bool(r.get("cold_vent_risk", False))]
+        dry_vent_risk = [r for r in selected if bool(r.get("dry_vent_risk", False))]
+        high_vpd = [r for r in selected if float(r.get("vpd_air", 0.0)) > VPD_HIGH_LIMIT]
         out[algo] = {
             "heat_vent_conflict_steps": len(heat_vent),
             "co2_leak_steps": len(co2_leak),
             "lamp_risk_steps": len(lamp_risk),
             "state_rh_ge_90_steps": len(high_rh),
+            "state_rh_lt_50_steps": len(low_rh),
+            "state_vpd_gt_1p2_steps": len(high_vpd),
+            "dry_risk_steps": len(dry_risk),
+            "dew_risk_steps": len(dew_risk),
+            "cold_vent_risk_steps": len(cold_vent_risk),
+            "dry_vent_risk_steps": len(dry_vent_risk),
             "mean_vent_when_rh_ge_90": float(mean(float(r.get("u_ventilation", 0.0)) for r in high_rh)) if high_rh else 0.0,
             "mean_heat_when_rh_ge_90": float(mean(float(r.get("u_heating", 0.0)) for r in high_rh)) if high_rh else 0.0,
+            "mean_vent_when_dry_risk": float(mean(float(r.get("u_ventilation", 0.0)) for r in dry_risk)) if dry_risk else 0.0,
         }
     return out
 
