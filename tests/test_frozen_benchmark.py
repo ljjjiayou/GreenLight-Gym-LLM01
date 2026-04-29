@@ -10,13 +10,16 @@ class TestFrozenBenchmark(unittest.TestCase):
             years=[2010, 2020],
             days=[59, 240],
             seeds=[42],
-            controllers=["llm", "llm_hem", "ppo"],
+            controllers=["llm", "llm_sero_shadow", "llm_hem", "ppo"],
             max_steps=240,
         )
 
-        self.assertEqual(len(jobs), 12)
+        self.assertEqual(len(jobs), 16)
         self.assertEqual(jobs[0].scenario_id, "y2010_d59_s42_n240")
         self.assertEqual(jobs[-1].controller, "ppo")
+
+    def test_accepts_sero_shadow_controller(self):
+        self.assertEqual(parse_controller_list("llm,llm_sero_shadow"), ["llm", "llm_sero_shadow"])
 
     def test_rejects_unknown_controller(self):
         with self.assertRaises(ValueError):
@@ -80,6 +83,34 @@ class TestFrozenBenchmark(unittest.TestCase):
         self.assertEqual(patterns["dry_vent_risk_steps"], 1)
         self.assertEqual(patterns["dry_risk_steps"], 1)
         self.assertGreater(patterns["mean_vent_when_dry_risk"], 0.0)
+
+    def test_sums_mc_sero_shadow_diagnostics(self):
+        rows = [
+            self._row(
+                mc_sero_enabled=True,
+                mc_sero_available=True,
+                mc_sero_would_select=True,
+                mc_sero_best_candidate="dry_recovery",
+                mc_sero_margin=0.30,
+            ),
+            self._row(
+                mc_sero_enabled=True,
+                mc_sero_available=True,
+                mc_sero_would_select=False,
+                mc_sero_best_candidate="anchor",
+                mc_sero_margin=0.05,
+                mc_sero_reject_reason="insufficient_margin",
+            ),
+        ]
+
+        summary = sum_metrics(rows)
+
+        self.assertEqual(summary["mc_sero_enabled_steps"], 2)
+        self.assertEqual(summary["mc_sero_available_steps"], 2)
+        self.assertEqual(summary["mc_sero_would_select_steps"], 1)
+        self.assertAlmostEqual(summary["mean_mc_sero_margin"], 0.175)
+        self.assertEqual(summary["mc_sero_best_candidate_counts"], {"anchor": 1, "dry_recovery": 1})
+        self.assertEqual(summary["mc_sero_reject_reason_counts"], {"insufficient_margin": 1})
 
 
 if __name__ == "__main__":

@@ -158,6 +158,20 @@ class AgentConfig:
     humidity_memory_max_forecast_risk: float = 0.72
     humidity_memory_night_gap_steps: int = 6
 
+    # MC-SERO shadow diagnostics. "shadow" evaluates mechanism candidates but
+    # never changes the applied LLM-RSPC action in this phase.
+    mc_sero_mode: str = "off"                     # off | shadow
+    mc_sero_horizon_steps: int = 6
+    mc_sero_min_margin: float = 0.10
+    mc_sero_top_k: int = 6
+    mc_sero_temp_penalty_weight: float = 2.00
+    mc_sero_rh_penalty_weight: float = 1.70
+    mc_sero_dry_penalty_weight: float = 1.20
+    mc_sero_vpd_penalty_weight: float = 1.30
+    mc_sero_dew_penalty_weight: float = 1.40
+    mc_sero_energy_penalty_weight: float = 0.45
+    mc_sero_conflict_penalty_weight: float = 0.85
+
     # Dry-side recovery: prevent low RH / high VPD violations caused by over-venting
     # or heat-vent pulses after the crop is already too dry.
     dry_rh_on: float = 55.0
@@ -2029,6 +2043,364 @@ class RuleBasedLLMDirector:
         control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
         return float(0.70 * control[0] + 0.22 * control[1] + 1.05 * control[4] + 0.05 * control[3])
 
+    def _mc_sero_mode(self) -> str:
+        mode = str(getattr(self.config, "mc_sero_mode", "off") or "off").strip().lower()
+        return mode if mode in {"off", "shadow"} else "off"
+
+    def _mc_sero_dry_vent_cap(self, temp_air: float) -> float:
+        if temp_air >= 28.0:
+            return float(getattr(self.config, "dry_hot_vent_cap", 0.35))
+        if temp_air >= 24.0:
+            return float(getattr(self.config, "dry_warm_vent_cap", 0.18))
+        return float(getattr(self.config, "dry_vent_cap", 0.12))
+
+    @staticmethod
+    def _state_control_vector(state) -> np.ndarray:
+        return np.asarray(
+            [
+                float(getattr(state, "u_boil", 0.0)),
+                float(getattr(state, "u_co2", 0.0)),
+                float(getattr(state, "u_th_scr", 0.0)),
+                float(getattr(state, "u_vent", 0.0)),
+                float(getattr(state, "u_lamp", 0.0)),
+                float(getattr(state, "u_bl_scr", 0.0)),
+            ],
+            dtype=np.float32,
+        )
+
+    def _build_mc_sero_mechanism_candidates(
+        self,
+        state,
+        baseline_control: np.ndarray,
+    ) -> List[Tuple[str, np.ndarray]]:
+        """Build mechanism candidates for shadow scoring only."""
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        rh_out = float(getattr(state, "rh_out", rh_air))
+        temp_out = float(getattr(state, "temp_out", temp_air))
+        hour = float(getattr(state, "hour_of_day", 12.0))
+        rad = float(getattr(state, "glob_rad", 0.0))
+        vpd_air = float(calculate_vpd_kpa(temp_air, rh_air))
+        dry_risk = rh_air < float(getattr(self.config, "dry_rh_on", 55.0)) or vpd_air > float(
+            getattr(self.config, "dry_vpd_on", 1.20)
+        )
+        is_night = bool(hour >= 18.0 or hour < 6.0 or rad < 10.0)
+        outdoor_dry_potential = bool(rh_out <= rh_air - 3.0 or temp_out <= temp_air - 2.0)
+        current = np.clip(self._state_control_vector(state), 0.0, 1.0)
+        baseline = np.clip(np.asarray(baseline_control, dtype=np.float32), 0.0, 1.0)
+        candidates: List[Tuple[str, np.ndarray]] = []
+
+        def add(name: str, control: np.ndarray) -> None:
+            candidates.append((name, np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)))
+
+        economy = np.minimum(current, baseline).astype(np.float32)
+        economy[0] = min(float(economy[0]), 0.08 if temp_air >= 16.0 else 0.16)
+        economy[1] = min(float(economy[1]), 0.02)
+        economy[4] = 0.0
+        if is_night and temp_air < 18.0:
+            economy[2] = max(float(economy[2]), 0.65)
+        if dry_risk:
+            economy[3] = min(float(economy[3]), self._mc_sero_dry_vent_cap(temp_air))
+        add("economy_hold", economy)
+
+        economic_dehum = economy.copy()
+        economic_vent = 0.26 if outdoor_dry_potential else 0.16
+        if rh_air >= 86.0:
+            economic_vent += 0.08
+        economic_dehum[3] = max(float(economic_dehum[3]), economic_vent)
+        if dry_risk:
+            economic_dehum[3] = min(float(economic_dehum[3]), self._mc_sero_dry_vent_cap(temp_air))
+        economic_dehum[1] = 0.0
+        economic_dehum[4] = 0.0
+        economic_dehum[2] = min(float(economic_dehum[2]), 0.50 if is_night else 0.42)
+        if temp_air < 15.5:
+            economic_dehum[0] = max(float(economic_dehum[0]), 0.10)
+        add("economic_dehumidify", economic_dehum)
+
+        safe_dehum = economy.copy()
+        safe_dehum[0] = max(float(safe_dehum[0]), 0.10 if temp_air < 18.0 else 0.02)
+        safe_dehum[1] = 0.0
+        safe_dehum[2] = min(float(safe_dehum[2]), 0.35)
+        safe_dehum[3] = max(float(safe_dehum[3]), 0.46 if rh_air < 92.0 else 0.54)
+        safe_dehum[4] = 0.0
+        add("safe_dehumidify", safe_dehum)
+
+        emergency_dehum = economy.copy()
+        emergency_dehum[0] = max(float(emergency_dehum[0]), 0.28 if temp_air < 16.0 else 0.14)
+        emergency_dehum[1] = 0.0
+        emergency_dehum[2] = min(float(emergency_dehum[2]), 0.25)
+        emergency_dehum[3] = max(float(emergency_dehum[3]), 0.66)
+        emergency_dehum[4] = 0.0
+        add("emergency_dehumidify", emergency_dehum)
+
+        dry_recovery = economy.copy()
+        dry_recovery[0] = min(float(dry_recovery[0]), 0.08 if temp_air >= 18.0 else 0.16)
+        dry_recovery[1] = 0.0
+        dry_recovery[3] = min(float(dry_recovery[3]), self._mc_sero_dry_vent_cap(temp_air))
+        dry_recovery[4] = 0.0
+        if is_night:
+            dry_recovery[2] = max(float(dry_recovery[2]), 0.70)
+        add("dry_recovery", dry_recovery)
+
+        heat_buffer = economy.copy()
+        heat_buffer[0] = max(float(heat_buffer[0]), 0.24 if temp_air < 16.0 else 0.12)
+        heat_buffer[1] = 0.0
+        heat_buffer[2] = max(float(heat_buffer[2]), 0.82 if is_night else 0.55)
+        heat_buffer[3] = min(float(heat_buffer[3]), 0.10)
+        heat_buffer[4] = 0.0
+        add("heat_buffer", heat_buffer)
+
+        return candidates
+
+    @staticmethod
+    def _mc_sero_proxy_step(
+        temp: float,
+        rh: float,
+        co2: float,
+        rad: float,
+        temp_out: float,
+        rh_out: float,
+        hour: float,
+        control: np.ndarray,
+    ) -> Dict[str, float]:
+        control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        heat, co2_u, screen, vent, lamp, shade = [float(x) for x in control[:6]]
+        is_day = 6.0 <= float(hour) <= 18.0
+        total_rad = float(rad) + 100.0 * lamp
+
+        vent_cooling = vent * max(temp - temp_out, 0.0) * 0.18
+        shade_cooling = shade * min(max(rad, 0.0) / 500.0, 1.0) * 0.18
+        screen_retention = screen * (0.10 if not is_day else 0.03)
+        temp_next = temp + 0.62 * heat + 0.16 * lamp + screen_retention - vent_cooling - shade_cooling
+
+        outdoor_drier = 1.0 if rh_out <= rh else -0.35
+        vent_rh_delta = -5.0 * vent * outdoor_drier
+        heat_rh_delta = -1.5 * heat
+        lamp_rh_delta = -0.4 * lamp
+        screen_rh_delta = 0.45 * screen if not is_day else 0.10 * screen
+        rh_next = float(np.clip(rh + vent_rh_delta + heat_rh_delta + lamp_rh_delta + screen_rh_delta, 35.0, 100.0))
+
+        co2_assimilation = 20.0 if is_day and total_rad > 120.0 else 4.0
+        co2_leak = 190.0 * vent * max((co2 - 410.0) / 500.0, 0.0)
+        co2_next = max(320.0, co2 + 170.0 * co2_u - co2_leak - co2_assimilation)
+        vpd_next = float(calculate_vpd_kpa(float(temp_next), float(rh_next)))
+
+        return {
+            "temp_next": float(temp_next),
+            "rh_next": float(rh_next),
+            "co2_next": float(co2_next),
+            "vpd_next": float(vpd_next),
+            "total_rad": float(total_rad),
+        }
+
+    def _score_mc_sero_candidate(self, state, control: np.ndarray) -> Tuple[float, Dict[str, float]]:
+        """Score a candidate over a deterministic short horizon for shadow diagnostics."""
+        cfg = self.config
+        control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        horizon = max(1, int(getattr(cfg, "mc_sero_horizon_steps", 6)))
+        temp = float(getattr(state, "temp_air", 20.0))
+        rh = float(getattr(state, "rh_air", 70.0))
+        co2 = float(getattr(state, "co2_air", 430.0))
+        rad = float(getattr(state, "glob_rad", 0.0))
+        temp_out = float(getattr(state, "temp_out", temp))
+        rh_out = float(getattr(state, "rh_out", rh))
+        hour = float(getattr(state, "hour_of_day", 12.0))
+        fruit_weight = float(getattr(state, "fruit_weight", 0.0))
+        temp_floor = 10.0 if fruit_weight < 1.0 else 12.0
+        dew_margin_base = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        vpd_base = float(calculate_vpd_kpa(temp, rh))
+        terms: Dict[str, float] = {
+            "temp_low": 0.0,
+            "temp_high": 0.0,
+            "rh_high": 0.0,
+            "rh_low": 0.0,
+            "vpd_high": 0.0,
+            "vpd_low": 0.0,
+            "dew": 0.0,
+            "dry_vent": 0.0,
+            "cold_vent": 0.0,
+            "energy": 0.0,
+            "conflict": 0.0,
+        }
+
+        heat, co2_u, _screen, vent, lamp, _shade = [float(x) for x in control[:6]]
+        dry_cap = self._mc_sero_dry_vent_cap(temp)
+        initial_dry_risk = rh < float(getattr(self.config, "dry_rh_on", 55.0)) or vpd_base > float(
+            getattr(self.config, "dry_vpd_on", 1.20)
+        )
+        initial_extreme_dew_risk = rh >= 94.0 or dew_margin_base < 0.40
+        conflict = 0.0
+        conflict += max(heat - 0.12, 0.0) * max(vent - 0.18, 0.0) * (4.0 if rh < 88.0 else 1.4)
+        conflict += co2_u * max(vent - 0.16, 0.0) * 4.0
+        conflict += lamp * max(vent - 0.25, 0.0) * 3.0
+        if rh >= 86.0:
+            conflict += lamp * 1.2 + co2_u * 0.7
+        if initial_dry_risk:
+            terms["dry_vent"] = max(vent - dry_cap, 0.0) ** 2
+        if temp < 12.0 and vent > 0.18 and not initial_extreme_dew_risk:
+            terms["cold_vent"] = (vent - 0.18) ** 2
+        terms["energy"] = float(self._candidate_energy_proxy(control))
+        terms["conflict"] = float(conflict)
+
+        for idx in range(horizon):
+            response = self._mc_sero_proxy_step(temp, rh, co2, rad, temp_out, rh_out, hour + idx / 12.0, control)
+            temp = response["temp_next"]
+            rh = response["rh_next"]
+            co2 = response["co2_next"]
+            vpd = response["vpd_next"]
+            dew_margin_proxy = max(
+                0.0,
+                dew_margin_base + 0.90 * (vpd - vpd_base) - 0.025 * max(rh - 85.0, 0.0),
+            )
+            terms["temp_low"] += max(temp_floor - temp, 0.0) ** 2 + 0.25 * max(15.0 - temp, 0.0) ** 2
+            terms["temp_high"] += 0.35 * max(temp - 30.0, 0.0) ** 2
+            terms["rh_high"] += (
+                0.05 * max(rh - 84.0, 0.0) ** 2
+                + 0.18 * max(rh - 90.0, 0.0) ** 2
+                + 0.55 * max(rh - 95.0, 0.0) ** 2
+            )
+            terms["rh_low"] += (
+                0.10 * max(55.0 - rh, 0.0) ** 2
+                + 0.35 * max(50.0 - rh, 0.0) ** 2
+                + 1.20 * max(45.0 - rh, 0.0) ** 2
+            )
+            terms["vpd_high"] += 0.85 * max(vpd - 1.20, 0.0) ** 2 + 1.50 * max(vpd - 1.60, 0.0) ** 2
+            terms["vpd_low"] += 0.55 * max(0.25 - vpd, 0.0) ** 2
+            terms["dew"] += max(1.20 - dew_margin_proxy, 0.0) * (1.0 + max(rh - 85.0, 0.0) / 10.0)
+
+        for key in ("temp_low", "temp_high", "rh_high", "rh_low", "vpd_high", "vpd_low", "dew"):
+            terms[key] = float(terms[key] / horizon)
+        terms["temp_terminal"] = float(temp)
+        terms["rh_terminal"] = float(rh)
+        terms["vpd_terminal"] = float(calculate_vpd_kpa(temp, rh))
+
+        score = (
+            float(getattr(cfg, "mc_sero_temp_penalty_weight", 2.00)) * (terms["temp_low"] + terms["temp_high"])
+            + float(getattr(cfg, "mc_sero_rh_penalty_weight", 1.70)) * terms["rh_high"]
+            + float(getattr(cfg, "mc_sero_dry_penalty_weight", 1.20)) * terms["rh_low"]
+            + float(getattr(cfg, "mc_sero_vpd_penalty_weight", 1.30)) * (terms["vpd_high"] + terms["vpd_low"])
+            + float(getattr(cfg, "mc_sero_dew_penalty_weight", 1.40)) * terms["dew"]
+            + 160.0 * terms["dry_vent"]
+            + 45.0 * terms["cold_vent"]
+            + float(getattr(cfg, "mc_sero_energy_penalty_weight", 0.45)) * terms["energy"]
+            + float(getattr(cfg, "mc_sero_conflict_penalty_weight", 0.85)) * terms["conflict"]
+        )
+        terms["score"] = float(score)
+        return float(score), terms
+
+    def _mc_sero_candidate_risk_reason(self, state, control: np.ndarray) -> str:
+        control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        vpd = float(calculate_vpd_kpa(temp_air, rh_air))
+        dew_margin = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        dry_risk = rh_air < float(getattr(self.config, "dry_rh_on", 55.0)) or vpd > float(
+            getattr(self.config, "dry_vpd_on", 1.20)
+        )
+        if dry_risk and float(control[3]) > self._mc_sero_dry_vent_cap(temp_air) + 1e-4:
+            return "dry_vent_risk"
+        extreme_dew_risk = rh_air >= 94.0 or dew_margin < 0.40
+        if temp_air < 12.0 and float(control[3]) > 0.18 and not extreme_dew_risk:
+            return "cold_vent_risk"
+        return ""
+
+    def _evaluate_mc_sero_shadow(
+        self,
+        state,
+        rollout_candidates: List[Tuple[str, np.ndarray]],
+        baseline_source: str,
+        baseline_control: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Evaluate MC-SERO candidates without changing the selected control."""
+        mode = self._mc_sero_mode()
+        if mode != "shadow":
+            return {"enabled": False, "mode": mode}
+
+        candidate_items: List[Tuple[str, np.ndarray]] = []
+        seen = set()
+
+        def add(name: str, control: np.ndarray) -> None:
+            unique = str(name)
+            if unique in seen:
+                return
+            seen.add(unique)
+            candidate_items.append((unique, np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)))
+
+        for name, control in rollout_candidates:
+            add(str(name), control)
+        for name, control in self._build_mc_sero_mechanism_candidates(state, baseline_control):
+            add(str(name), control)
+
+        baseline_control = np.clip(np.asarray(baseline_control, dtype=np.float32), 0.0, 1.0)
+        baseline_score, baseline_terms = self._score_mc_sero_candidate(state, baseline_control)
+        if not any(name == str(baseline_source) for name, _ in candidate_items):
+            add(str(baseline_source or "baseline_actual"), baseline_control)
+
+        scored: List[Dict[str, Any]] = []
+        for name, control in candidate_items:
+            score, terms = self._score_mc_sero_candidate(state, control)
+            scored.append(
+                {
+                    "name": name,
+                    "score": float(score),
+                    "control": [float(x) for x in control[:6]],
+                    "score_terms": {key: float(value) for key, value in terms.items()},
+                }
+            )
+        scored.sort(key=lambda item: float(item["score"]))
+        if not scored:
+            return {"enabled": True, "mode": "shadow", "available": False, "reject_reason": "no_candidates"}
+
+        best = scored[0]
+        best_control = np.asarray(best["control"], dtype=np.float32)
+        margin = float(baseline_score - float(best["score"]))
+        reject_reason = self._mc_sero_candidate_risk_reason(state, best_control)
+        if not reject_reason:
+            if str(best["name"]) == str(baseline_source):
+                reject_reason = "baseline_best"
+            elif margin < float(getattr(self.config, "mc_sero_min_margin", 0.10)):
+                reject_reason = "insufficient_margin"
+        would_select = bool(
+            str(best["name"]) != str(baseline_source)
+            and margin >= float(getattr(self.config, "mc_sero_min_margin", 0.10))
+            and not reject_reason
+        )
+        if would_select:
+            reject_reason = ""
+
+        top_k = max(1, int(getattr(self.config, "mc_sero_top_k", 6)))
+        return {
+            "enabled": True,
+            "mode": "shadow",
+            "available": True,
+            "would_select": bool(would_select),
+            "best_candidate": str(best["name"]),
+            "best_control": [float(x) for x in best_control[:6]],
+            "best_score": float(best["score"]),
+            "baseline_source": str(baseline_source),
+            "baseline_score": float(baseline_score),
+            "margin": float(margin),
+            "reject_reason": str(reject_reason),
+            "score_terms": dict(best["score_terms"]),
+            "baseline_terms": {key: float(value) for key, value in baseline_terms.items()},
+            "candidate_count": int(len(scored)),
+            "horizon_steps": int(max(1, int(getattr(self.config, "mc_sero_horizon_steps", 6)))),
+            "top_candidates": [
+                {
+                    "name": str(item["name"]),
+                    "score": float(item["score"]),
+                    "score_terms": dict(item["score_terms"]),
+                }
+                for item in scored[:top_k]
+            ],
+        }
+
     def _is_humidity_memory_night_window(self, state) -> bool:
         hour = float(getattr(state, "hour_of_day", 12.0))
         rad = float(getattr(state, "glob_rad", 0.0))
@@ -3048,6 +3420,12 @@ class RuleBasedLLMDirector:
                 scored_candidates.append((score, name, clipped, candidate_rule_weight, candidate_details))
             scored_candidates.sort(key=lambda item: item[0])
             _, selected_name, selected_control, selected_rule_weight, selected_details = scored_candidates[0]
+            mc_sero_shadow = self._evaluate_mc_sero_shadow(
+                state,
+                rollout_candidates=[(name, control_item) for _score, name, control_item, _rw, _details in raw_scored_candidates],
+                baseline_source=str(selected_name),
+                baseline_control=np.asarray(selected_control, dtype=np.float32),
+            )
             if str(selected_name).startswith("humidity_memory"):
                 self.last_humidity_memory_selected_step = int(float(getattr(state, "timestep", 0.0)))
                 if best_memory_eval is not None:
@@ -3096,8 +3474,19 @@ class RuleBasedLLMDirector:
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
                 "humidity_memory_prediction": humidity_memory_prediction,
                 "humidity_memory_horizon_filter": dict(best_memory_eval or {}),
+                "mc_sero_shadow": mc_sero_shadow,
             }
         else:
+            mc_sero_shadow = self._evaluate_mc_sero_shadow(
+                state,
+                rollout_candidates=[
+                    ("fixed_blend", control),
+                    ("anchor", anchor_control),
+                    ("rule", rule_control),
+                ],
+                baseline_source="fixed_blend",
+                baseline_control=np.asarray(control, dtype=np.float32),
+            )
             self.last_rollout_selection = {
                 "source": "fixed_blend",
                 "score": None,
@@ -3105,6 +3494,7 @@ class RuleBasedLLMDirector:
                 "candidates": [],
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
                 "humidity_memory_prediction": dict(getattr(self, "last_humidity_memory_prediction", {})),
+                "mc_sero_shadow": mc_sero_shadow,
             }
 
         target_temp = self._get_plan_target(plan, "target_temp", state)

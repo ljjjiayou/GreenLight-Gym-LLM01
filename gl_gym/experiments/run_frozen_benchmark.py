@@ -52,7 +52,7 @@ class BenchmarkJob:
 
 
 def parse_controller_list(text: str) -> List[str]:
-    allowed = {"ppo", "llm", "llm_hem"}
+    allowed = {"ppo", "llm", "llm_hem", "llm_sero_shadow"}
     controllers = [part.strip() for part in str(text).split(",") if part.strip()]
     invalid = [name for name in controllers if name not in allowed]
     if invalid:
@@ -138,6 +138,7 @@ def run_job(
             humidity_memory_teacher_policy_id=humidity_memory_teacher_policy_id,
             humidity_memory_baseline_controller_id=humidity_memory_baseline_controller_id,
             humidity_memory_version=humidity_memory_version,
+            mc_sero_mode="shadow" if job.controller == "llm_sero_shadow" else "off",
             plan_cache_mode=plan_cache_mode,
             plan_cache_path=plan_cache_path,
             plan_cache_strict=plan_cache_strict,

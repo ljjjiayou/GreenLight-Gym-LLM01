@@ -332,6 +332,7 @@ def run_llm_trace(
     humidity_memory_teacher_policy_id: str,
     humidity_memory_baseline_controller_id: str,
     humidity_memory_version: str,
+    mc_sero_mode: str,
     plan_cache_mode: str,
     plan_cache_path: str,
     plan_cache_strict: bool,
@@ -360,6 +361,7 @@ def run_llm_trace(
         humidity_memory_teacher_policy_id=str(humidity_memory_teacher_policy_id or ""),
         humidity_memory_baseline_controller_id=str(humidity_memory_baseline_controller_id or ""),
         humidity_memory_version=str(humidity_memory_version or AgentConfig.humidity_memory_version),
+        mc_sero_mode=str(mc_sero_mode or AgentConfig.mc_sero_mode),
         plan_cache_mode=str(plan_cache_mode or "off"),
         plan_cache_path=str(plan_cache_path or AgentConfig.plan_cache_path),
         plan_cache_strict=bool(plan_cache_strict),
@@ -401,6 +403,7 @@ def run_llm_trace(
         expert_info = rollout.get("expert_prediction", {}) if isinstance(rollout, dict) else {}
         humidity_memory_info = rollout.get("humidity_memory_prediction", {}) if isinstance(rollout, dict) else {}
         humidity_memory_shape = rollout.get("humidity_memory_post_guardrail_shape", {}) if isinstance(rollout, dict) else {}
+        mc_sero_info = rollout.get("mc_sero_shadow", {}) if isinstance(rollout, dict) else {}
         rollout_source = str(rollout.get("source", result.get("action", "unknown")))
         applied_control = result.get("applied_control", getattr(raw_env, "u", np.zeros(6)))
         row = {
@@ -447,6 +450,17 @@ def run_llm_trace(
             "humidity_memory_horizon_filter_rejected": bool(humidity_memory_info.get("horizon_filter_rejected", False)) if isinstance(humidity_memory_info, dict) else False,
             "humidity_memory_post_shape_applied": bool(humidity_memory_shape.get("applied", False)) if isinstance(humidity_memory_shape, dict) else False,
             "humidity_memory_post_shape_reason": humidity_memory_shape.get("reason") if isinstance(humidity_memory_shape, dict) else None,
+            "mc_sero_enabled": bool(mc_sero_info.get("enabled", False)) if isinstance(mc_sero_info, dict) else False,
+            "mc_sero_available": bool(mc_sero_info.get("available", False)) if isinstance(mc_sero_info, dict) else False,
+            "mc_sero_would_select": bool(mc_sero_info.get("would_select", False)) if isinstance(mc_sero_info, dict) else False,
+            "mc_sero_best_candidate": mc_sero_info.get("best_candidate") if isinstance(mc_sero_info, dict) else None,
+            "mc_sero_best_control": mc_sero_info.get("best_control", []) if isinstance(mc_sero_info, dict) else [],
+            "mc_sero_margin": float(mc_sero_info.get("margin", 0.0)) if isinstance(mc_sero_info, dict) else 0.0,
+            "mc_sero_reject_reason": mc_sero_info.get("reject_reason") if isinstance(mc_sero_info, dict) else None,
+            "mc_sero_baseline_source": mc_sero_info.get("baseline_source") if isinstance(mc_sero_info, dict) else None,
+            "mc_sero_score_terms": mc_sero_info.get("score_terms", {}) if isinstance(mc_sero_info, dict) else {},
+            "mc_sero_candidate_count": int(mc_sero_info.get("candidate_count", 0) or 0) if isinstance(mc_sero_info, dict) else 0,
+            "mc_sero_horizon_steps": int(mc_sero_info.get("horizon_steps", 0) or 0) if isinstance(mc_sero_info, dict) else 0,
             **state_to_record(state),
             **control_to_record(applied_control),
             **control_to_record(result.get("anchor_control", np.zeros(6)), prefix="anchor"),
@@ -498,6 +512,27 @@ def sum_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             summary["mean_humidity_memory_horizon_penalty"] = float(
                 mean(float(r.get("humidity_memory_horizon_penalty", 0.0)) for r in rows)
             )
+        if any("mc_sero_enabled" in r for r in rows):
+            summary["mc_sero_enabled_steps"] = int(sum(bool(r.get("mc_sero_enabled", False)) for r in rows))
+            summary["mc_sero_available_steps"] = int(sum(bool(r.get("mc_sero_available", False)) for r in rows))
+            summary["mc_sero_would_select_steps"] = int(sum(bool(r.get("mc_sero_would_select", False)) for r in rows))
+            available_margins = [
+                float(r.get("mc_sero_margin", 0.0))
+                for r in rows
+                if bool(r.get("mc_sero_available", False))
+            ]
+            summary["mean_mc_sero_margin"] = float(mean(available_margins)) if available_margins else 0.0
+            candidate_counts: Dict[str, int] = {}
+            reject_counts: Dict[str, int] = {}
+            for row in rows:
+                candidate = str(row.get("mc_sero_best_candidate") or "none")
+                if candidate != "none":
+                    candidate_counts[candidate] = candidate_counts.get(candidate, 0) + 1
+                reason = str(row.get("mc_sero_reject_reason") or "")
+                if reason:
+                    reject_counts[reason] = reject_counts.get(reason, 0) + 1
+            summary["mc_sero_best_candidate_counts"] = dict(sorted(candidate_counts.items()))
+            summary["mc_sero_reject_reason_counts"] = dict(sorted(reject_counts.items()))
     return summary
 
 
@@ -780,6 +815,19 @@ def build_report(summary: Dict[str, Any]) -> str:
                 f"- mean horizon penalty={llm_item.get('mean_humidity_memory_horizon_penalty', 0.0):.5f}",
             ]
         )
+    if "mc_sero_enabled_steps" in llm_item:
+        lines.extend(
+            [
+                "",
+                "## MC-SERO Shadow",
+                f"- enabled={llm_item.get('mc_sero_enabled_steps', 0)}, "
+                f"available={llm_item.get('mc_sero_available_steps', 0)}, "
+                f"would_select={llm_item.get('mc_sero_would_select_steps', 0)}",
+                f"- mean margin={llm_item.get('mean_mc_sero_margin', 0.0):.5f}",
+                f"- best candidates={llm_item.get('mc_sero_best_candidate_counts', {})}",
+                f"- reject reasons={llm_item.get('mc_sero_reject_reason_counts', {})}",
+            ]
+        )
     lines.extend(["", "## Strategy Label Audit"])
     for algo, item in summary.get("strategy_label_audit", {}).items():
         lines.append(
@@ -830,6 +878,7 @@ def main() -> None:
     parser.add_argument("--llm-humidity-memory-teacher-policy-id", type=str, default="")
     parser.add_argument("--llm-humidity-memory-baseline-controller-id", type=str, default="")
     parser.add_argument("--llm-humidity-memory-version", type=str, default=AgentConfig.humidity_memory_version)
+    parser.add_argument("--llm-mc-sero-mode", type=str, choices=["off", "shadow"], default=AgentConfig.mc_sero_mode)
     parser.add_argument("--output-json", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_diag.json")
     parser.add_argument("--output-csv", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_trace.csv")
     parser.add_argument("--output-report", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_diag.md")
@@ -875,6 +924,7 @@ def main() -> None:
                 humidity_memory_teacher_policy_id=args.llm_humidity_memory_teacher_policy_id,
                 humidity_memory_baseline_controller_id=args.llm_humidity_memory_baseline_controller_id,
                 humidity_memory_version=args.llm_humidity_memory_version,
+                mc_sero_mode=args.llm_mc_sero_mode,
                 plan_cache_mode=args.llm_plan_cache_mode,
                 plan_cache_path=args.llm_plan_cache_path,
                 plan_cache_strict=args.llm_plan_cache_strict,
@@ -900,6 +950,7 @@ def main() -> None:
             "expert_rollout": bool(args.llm_expert_rollout),
             "humidity_memory": bool(args.llm_humidity_memory),
             "humidity_memory_version": str(args.llm_humidity_memory_version),
+            "mc_sero_mode": str(args.llm_mc_sero_mode),
             "plan_cache_mode": str(args.llm_plan_cache_mode),
             "plan_cache_path": str(args.llm_plan_cache_path),
             "plan_cache_strict": bool(args.llm_plan_cache_strict),
