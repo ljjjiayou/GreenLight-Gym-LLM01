@@ -7,8 +7,10 @@ from gl_gym.agent.plan_cache import SCHEMA_VERSION
 from gl_gym.experiments.frozen_benchmark_protocol import (
     ScenarioSpec,
     audit_plan_cache,
+    build_controller_delta_report,
     build_canary_commands,
     build_scenarios,
+    compare_controller_deltas,
     compare_record_replay,
     make_manifest,
     validate_shadow_invariance,
@@ -30,6 +32,12 @@ def _summary(scenario_id, controller, **aggregate_overrides):
         "total_rh_low_violation": 0.0,
         "total_rh_high_violation": 0.0,
         "total_vpd_high_excess": 0.0,
+        "rh_ge_90_steps": 0,
+        "rh_ge_94_steps": 0,
+        "dew_margin_air_lt1_steps": 0,
+        "dew_margin_air_lt0_steps": 0,
+        "canopy_dew_margin_lt1_steps": 0,
+        "canopy_dew_margin_lt0_steps": 0,
         "mean_u_heating": 0.1,
         "mean_u_co2": 0.0,
         "mean_u_screen": 0.5,
@@ -168,6 +176,33 @@ class TestFrozenBenchmarkProtocol(unittest.TestCase):
         self.assertFalse(check["ok"])
         self.assertEqual(check["failures"][0]["reason"], "aggregate_delta")
         self.assertAlmostEqual(check["failures"][0]["deltas"]["total_profit"], -0.1)
+
+    def test_controller_delta_report_pairs_scenarios_and_blocks(self):
+        result = {
+            "summaries": [
+                _summary("y2010_d59_s44_n240", "llm", total_reward=100.0, total_rh_low_violation=10.0, total_vpd_high_excess=4.0),
+                _summary(
+                    "y2010_d59_s44_n240",
+                    "llm_rspc_v2",
+                    total_reward=104.0,
+                    total_rh_low_violation=2.0,
+                    total_vpd_high_excess=1.0,
+                    canopy_dew_margin_lt1_steps=3,
+                    tomato_safety_v2_applied_steps=12,
+                ),
+                _summary("y2010_d59_s44_n240", "llm_sero_shadow", total_reward=100.0, total_rh_low_violation=10.0, total_vpd_high_excess=4.0),
+            ]
+        }
+
+        comparison = compare_controller_deltas(result)
+        report = build_controller_delta_report(comparison)
+
+        self.assertTrue(comparison["ok"])
+        self.assertEqual(comparison["scenario_count"], 1)
+        self.assertEqual(comparison["block_count"], 1)
+        self.assertAlmostEqual(comparison["scenarios"][0]["delta"]["total_rh_low_violation"], -8.0)
+        self.assertAlmostEqual(comparison["blocks"][0]["mean_delta"]["total_vpd_high_excess"], -3.0)
+        self.assertIn("y2010_d59_s44_n240", report)
 
     def test_canary_commands_are_single_scenario_and_strict_replay(self):
         commands = build_canary_commands(

@@ -35,7 +35,16 @@ class TestFailureWindowExtractor(unittest.TestCase):
     def test_extracts_dry_stress_window(self):
         rows = [
             _row(0),
-            _row(1, rh_air=48.0, vpd_air=1.4, rh_low_violation=2.0, vpd_high_excess=0.2, u_ventilation=0.3),
+            _row(
+                1,
+                rh_air=48.0,
+                vpd_air=1.4,
+                rh_low_violation=2.0,
+                vpd_high_excess=0.2,
+                u_ventilation=0.3,
+                dew_margin_air=0.8,
+                canopy_dew_margin=-0.1,
+            ),
             _row(2, rh_air=46.0, vpd_air=1.6, rh_low_violation=4.0, vpd_high_excess=0.4, u_ventilation=0.2),
             _row(3),
         ]
@@ -48,6 +57,8 @@ class TestFailureWindowExtractor(unittest.TestCase):
         self.assertEqual(dry[0]["end_step"], 2)
         self.assertAlmostEqual(dry[0]["rh_low_area"], 6.0)
         self.assertAlmostEqual(dry[0]["vpd_high_area"], 0.6)
+        self.assertEqual(dry[0]["dew_margin_air_lt1_steps"], 1)
+        self.assertEqual(dry[0]["canopy_dew_margin_lt0_steps"], 1)
         self.assertEqual(len(dry[0]["pre_context"]), 1)
         self.assertEqual(len(dry[0]["post_context"]), 1)
 
@@ -97,4 +108,3 @@ class TestFailureWindowExtractor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

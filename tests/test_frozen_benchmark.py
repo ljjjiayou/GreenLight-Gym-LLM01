@@ -87,6 +87,20 @@ class TestFrozenBenchmark(unittest.TestCase):
         self.assertEqual(patterns["dry_risk_steps"], 1)
         self.assertGreater(patterns["mean_vent_when_dry_risk"], 0.0)
 
+    def test_sums_dew_margin_risk_metrics(self):
+        rows = [
+            self._row(rh_air=91.0, dew_margin_air=0.8, canopy_dew_margin=-0.2),
+            self._row(rh_air=70.0, dew_margin_air=2.0, canopy_dew_margin=0.5),
+        ]
+
+        summary = sum_metrics(rows)
+
+        self.assertEqual(summary["rh_ge_90_steps"], 1)
+        self.assertEqual(summary["dew_margin_air_lt1_steps"], 1)
+        self.assertEqual(summary["canopy_dew_margin_lt1_steps"], 2)
+        self.assertEqual(summary["canopy_dew_margin_lt0_steps"], 1)
+        self.assertAlmostEqual(summary["min_canopy_dew_margin"], -0.2)
+
     def test_sums_mc_sero_shadow_diagnostics(self):
         rows = [
             self._row(

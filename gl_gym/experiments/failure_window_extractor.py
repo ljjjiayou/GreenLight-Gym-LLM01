@@ -199,6 +199,12 @@ def _summarize_window(
         "rh_high_area": float(sum(_num(row, "rh_high_violation") for row in selected)),
         "vpd_high_area": float(sum(_num(row, "vpd_high_excess") for row in selected)),
         "temp_violation_area": float(sum(_num(row, "temp_violation") for row in selected)),
+        "rh_ge_90_steps": int(sum(_num(row, "rh_air", 0.0) >= 90.0 for row in selected)),
+        "dew_margin_air_lt1_steps": int(sum(_num(row, "dew_margin_air", 99.0) < 1.0 for row in selected)),
+        "canopy_dew_margin_lt1_steps": int(sum(_num(row, "canopy_dew_margin", 99.0) < 1.0 for row in selected)),
+        "canopy_dew_margin_lt0_steps": int(sum(_num(row, "canopy_dew_margin", 99.0) < 0.0 for row in selected)),
+        "min_dew_margin_air": float(min(_num(row, "dew_margin_air", 99.0) for row in selected)),
+        "min_canopy_dew_margin": float(min(_num(row, "canopy_dew_margin", 99.0) for row in selected)),
         "mean_actions": action_means,
         "source_counts": source_counts,
         "mc_sero_best_candidate_counts": candidate_counts,
@@ -256,13 +262,13 @@ def build_report(windows: Sequence[Dict[str, Any]]) -> str:
         "",
         f"- Windows: {len(windows)}",
         "",
-        "| trace | kind | steps | duration | min RH | max VPD | temp viol | mean vent | sources |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| trace | kind | steps | duration | min RH | max VPD | temp viol | canopy<0 | mean vent | sources |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for window in windows:
         mean_vent = float(window.get("mean_actions", {}).get("u_ventilation", 0.0))
         lines.append(
-            "| {trace} | {kind} | {start}-{end} | {duration} | {min_rh:.2f} | {max_vpd:.2f} | {temp:.3f} | {vent:.3f} | {sources} |".format(
+            "| {trace} | {kind} | {start}-{end} | {duration} | {min_rh:.2f} | {max_vpd:.2f} | {temp:.3f} | {canopy_lt0} | {vent:.3f} | {sources} |".format(
                 trace=window.get("trace_id"),
                 kind=window.get("kind"),
                 start=window.get("start_step"),
@@ -271,6 +277,7 @@ def build_report(windows: Sequence[Dict[str, Any]]) -> str:
                 min_rh=float(window.get("min_rh", 0.0)),
                 max_vpd=float(window.get("max_vpd", 0.0)),
                 temp=float(window.get("temp_violation_area", 0.0)),
+                canopy_lt0=int(window.get("canopy_dew_margin_lt0_steps", 0) or 0),
                 vent=mean_vent,
                 sources=json.dumps(window.get("source_counts", {}), ensure_ascii=False),
             )
