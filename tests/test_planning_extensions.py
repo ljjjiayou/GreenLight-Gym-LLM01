@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 
 try:
-    from gl_gym.agent.llm_agent import AgentConfig, RuleBasedLLMDirector, apply_safety_guardrails
+    from gl_gym.agent.llm_agent import AgentConfig, RuleBasedLLMDirector, apply_safety_guardrails, apply_tomato_safety_v2
     from gl_gym.agent.tools import ControlAction
 
     IMPORT_ERROR = None
@@ -192,6 +192,147 @@ class TestPlanningExtensions(unittest.TestCase):
         self.assertEqual(float(control[4]), 0.0)
         self.assertLessEqual(float(control[3]), 0.180001)
         self.assertGreaterEqual(float(control[5]), 0.5)
+
+    def test_tomato_safety_v2_disabled_is_noop(self):
+        cfg = AgentConfig(tomato_safety_v2_enabled=False)
+        original = np.array([0.3, 0.5, 0.0, 0.8, 0.6, 0.0], dtype=np.float32)
+
+        control, info = apply_tomato_safety_v2(
+            DummyState(temp_air=25.0, rh_air=42.0, glob_rad=320.0, hour_of_day=13.0),
+            original,
+            config=cfg,
+            target_rh=72.0,
+        )
+
+        self.assertTrue(np.allclose(control, original))
+        self.assertFalse(info["enabled"])
+        self.assertFalse(info["applied"])
+
+    def test_tomato_safety_v2_caps_dry_high_vpd_ventilation(self):
+        cfg = AgentConfig(tomato_safety_v2_enabled=True)
+
+        control, info = apply_tomato_safety_v2(
+            DummyState(temp_air=25.0, rh_air=42.0, glob_rad=320.0, hour_of_day=13.0),
+            np.array([0.3, 0.5, 0.0, 0.8, 0.6, 0.0], dtype=np.float32),
+            config=cfg,
+            target_rh=72.0,
+        )
+
+        self.assertTrue(info["enabled"])
+        self.assertTrue(info["applied"])
+        self.assertIn("dry_vpd_guard", info["reasons"])
+        self.assertIn("hard_dry_vpd_guard", info["reasons"])
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
+        self.assertLessEqual(float(control[3]), 0.140001)
+        self.assertGreaterEqual(float(control[5]), 0.649)
+
+    def test_tomato_safety_v2_hot_dry_prefers_cooling_ventilation(self):
+        cfg = AgentConfig(tomato_safety_v2_enabled=True)
+
+        control, info = apply_tomato_safety_v2(
+            DummyState(
+                temp_air=30.0,
+                rh_air=43.0,
+                glob_rad=760.0,
+                hour_of_day=12.0,
+                dew_margin_air=2.0,
+                canopy_dew_margin=2.0,
+            ),
+            np.array([0.2, 0.5, 0.0, 0.12, 0.6, 0.65], dtype=np.float32),
+            config=cfg,
+            target_rh=72.0,
+        )
+
+        self.assertTrue(info["applied"])
+        self.assertIn("hot_dry_cooling_guard", info["reasons"])
+        self.assertIn("hard_dry_vpd_guard", info["reasons"])
+        self.assertGreaterEqual(float(control[3]), 0.779)
+        self.assertGreaterEqual(float(control[2]), 0.999)
+        self.assertLessEqual(float(control[5]), 0.001)
+        self.assertEqual(float(control[0]), 0.0)
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
+
+    def test_tomato_safety_v2_hot_dry_overrides_low_canopy_dew_when_air_is_dry(self):
+        cfg = AgentConfig(tomato_safety_v2_enabled=True)
+
+        control, info = apply_tomato_safety_v2(
+            DummyState(
+                temp_air=28.5,
+                rh_air=60.0,
+                glob_rad=800.0,
+                hour_of_day=11.0,
+                dew_margin_air=8.0,
+                canopy_dew_margin=-0.2,
+            ),
+            np.array([0.0, 0.2, 0.0, 0.12, 0.1, 0.5], dtype=np.float32),
+            config=cfg,
+            target_rh=70.0,
+        )
+
+        self.assertIn("hot_dry_cooling_guard", info["reasons"])
+        self.assertGreaterEqual(float(control[3]), 0.599)
+        self.assertGreaterEqual(float(control[2]), 0.999)
+
+    def test_tomato_safety_v2_buffers_low_temp_without_extreme_dew(self):
+        cfg = AgentConfig(tomato_safety_v2_enabled=True)
+
+        control, info = apply_tomato_safety_v2(
+            DummyState(
+                temp_air=11.5,
+                rh_air=88.0,
+                glob_rad=0.0,
+                hour_of_day=3.0,
+                dew_margin_air=1.2,
+                canopy_dew_margin=1.1,
+            ),
+            np.array([0.0, 0.5, 0.2, 0.8, 0.6, 0.0], dtype=np.float32),
+            config=cfg,
+            target_rh=75.0,
+        )
+
+        self.assertTrue(info["applied"])
+        self.assertIn("cold_buffer_guard", info["reasons"])
+        self.assertGreaterEqual(float(control[0]), 0.899)
+        self.assertGreaterEqual(float(control[2]), 0.899)
+        self.assertLessEqual(float(control[3]), 0.080001)
+        self.assertEqual(float(control[1]), 0.0)
+        self.assertEqual(float(control[4]), 0.0)
+
+    def test_tomato_safety_v2_does_not_block_extreme_dew_venting(self):
+        cfg = AgentConfig(tomato_safety_v2_enabled=True)
+
+        control, info = apply_tomato_safety_v2(
+            DummyState(
+                temp_air=14.0,
+                rh_air=95.0,
+                glob_rad=0.0,
+                hour_of_day=3.0,
+                dew_margin_air=0.3,
+                canopy_dew_margin=0.3,
+            ),
+            np.array([0.2, 0.0, 0.2, 0.7, 0.0, 0.0], dtype=np.float32),
+            config=cfg,
+            target_rh=72.0,
+        )
+
+        self.assertFalse(info["applied"])
+        self.assertGreaterEqual(float(control[3]), 0.699)
+
+    def test_tomato_safety_v2_suppresses_strict_replay_emergency_replans_only(self):
+        director = object.__new__(RuleBasedLLMDirector)
+        director.config = AgentConfig(
+            tomato_safety_v2_enabled=True,
+            plan_cache_mode="replay",
+            plan_cache_key_policy="scenario_timestep",
+            plan_cache_strict=True,
+        )
+
+        self.assertTrue(director._should_suppress_tomato_v2_replay_emergency_replan())
+
+        director.config.plan_cache_key_policy = "prompt"
+        self.assertFalse(director._should_suppress_tomato_v2_replay_emergency_replan())
 
     def test_cold_non_extreme_humidity_caps_ventilation(self):
         control = apply_safety_guardrails(

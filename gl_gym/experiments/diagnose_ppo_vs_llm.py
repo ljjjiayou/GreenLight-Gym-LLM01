@@ -333,6 +333,7 @@ def run_llm_trace(
     humidity_memory_baseline_controller_id: str,
     humidity_memory_version: str,
     mc_sero_mode: str,
+    tomato_safety_v2_enabled: bool,
     plan_cache_mode: str,
     plan_cache_path: str,
     plan_cache_strict: bool,
@@ -362,6 +363,7 @@ def run_llm_trace(
         humidity_memory_baseline_controller_id=str(humidity_memory_baseline_controller_id or ""),
         humidity_memory_version=str(humidity_memory_version or AgentConfig.humidity_memory_version),
         mc_sero_mode=str(mc_sero_mode or AgentConfig.mc_sero_mode),
+        tomato_safety_v2_enabled=bool(tomato_safety_v2_enabled),
         plan_cache_mode=str(plan_cache_mode or "off"),
         plan_cache_path=str(plan_cache_path or AgentConfig.plan_cache_path),
         plan_cache_strict=bool(plan_cache_strict),
@@ -404,6 +406,8 @@ def run_llm_trace(
         humidity_memory_info = rollout.get("humidity_memory_prediction", {}) if isinstance(rollout, dict) else {}
         humidity_memory_shape = rollout.get("humidity_memory_post_guardrail_shape", {}) if isinstance(rollout, dict) else {}
         mc_sero_info = rollout.get("mc_sero_shadow", {}) if isinstance(rollout, dict) else {}
+        tomato_v2_info = rollout.get("tomato_safety_v2", {}) if isinstance(rollout, dict) else {}
+        tomato_v2_suppressed = tomato_v2_info.get("suppressed_replan", {}) if isinstance(tomato_v2_info, dict) else {}
         rollout_source = str(rollout.get("source", result.get("action", "unknown")))
         applied_control = result.get("applied_control", getattr(raw_env, "u", np.zeros(6)))
         row = {
@@ -461,6 +465,16 @@ def run_llm_trace(
             "mc_sero_score_terms": mc_sero_info.get("score_terms", {}) if isinstance(mc_sero_info, dict) else {},
             "mc_sero_candidate_count": int(mc_sero_info.get("candidate_count", 0) or 0) if isinstance(mc_sero_info, dict) else 0,
             "mc_sero_horizon_steps": int(mc_sero_info.get("horizon_steps", 0) or 0) if isinstance(mc_sero_info, dict) else 0,
+            "tomato_safety_v2_enabled": bool(tomato_v2_info.get("enabled", False)) if isinstance(tomato_v2_info, dict) else False,
+            "tomato_safety_v2_applied": bool(tomato_v2_info.get("applied", False)) if isinstance(tomato_v2_info, dict) else False,
+            "tomato_safety_v2_reasons": ",".join(str(x) for x in tomato_v2_info.get("reasons", [])) if isinstance(tomato_v2_info, dict) else "",
+            "tomato_safety_v2_vent_before": float(tomato_v2_info.get("vent_before", 0.0)) if isinstance(tomato_v2_info, dict) else 0.0,
+            "tomato_safety_v2_vent_after": float(tomato_v2_info.get("vent_after", 0.0)) if isinstance(tomato_v2_info, dict) else 0.0,
+            "tomato_safety_v2_heat_before": float(tomato_v2_info.get("heat_before", 0.0)) if isinstance(tomato_v2_info, dict) else 0.0,
+            "tomato_safety_v2_heat_after": float(tomato_v2_info.get("heat_after", 0.0)) if isinstance(tomato_v2_info, dict) else 0.0,
+            "tomato_safety_v2_suppressed_replan": bool(tomato_v2_suppressed.get("applied", False)) if isinstance(tomato_v2_suppressed, dict) else False,
+            "tomato_safety_v2_suppressed_replan_reason": str(tomato_v2_suppressed.get("reason", "")) if isinstance(tomato_v2_suppressed, dict) else "",
+            "tomato_safety_v2_suppressed_replan_count": int(tomato_v2_info.get("suppressed_replan_step_count", 0) or 0) if isinstance(tomato_v2_info, dict) else 0,
             **state_to_record(state),
             **control_to_record(applied_control),
             **control_to_record(result.get("anchor_control", np.zeros(6)), prefix="anchor"),
@@ -533,6 +547,18 @@ def sum_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                     reject_counts[reason] = reject_counts.get(reason, 0) + 1
             summary["mc_sero_best_candidate_counts"] = dict(sorted(candidate_counts.items()))
             summary["mc_sero_reject_reason_counts"] = dict(sorted(reject_counts.items()))
+        if any("tomato_safety_v2_enabled" in r for r in rows):
+            summary["tomato_safety_v2_enabled_steps"] = int(sum(bool(r.get("tomato_safety_v2_enabled", False)) for r in rows))
+            summary["tomato_safety_v2_applied_steps"] = int(sum(bool(r.get("tomato_safety_v2_applied", False)) for r in rows))
+            reason_counts: Dict[str, int] = {}
+            for row in rows:
+                reasons = str(row.get("tomato_safety_v2_reasons", "") or "")
+                for reason in [part.strip() for part in reasons.split(",") if part.strip()]:
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            summary["tomato_safety_v2_reason_counts"] = dict(sorted(reason_counts.items()))
+            summary["tomato_safety_v2_suppressed_replan_steps"] = int(
+                sum(bool(r.get("tomato_safety_v2_suppressed_replan", False)) for r in rows)
+            )
     return summary
 
 
@@ -879,6 +905,7 @@ def main() -> None:
     parser.add_argument("--llm-humidity-memory-baseline-controller-id", type=str, default="")
     parser.add_argument("--llm-humidity-memory-version", type=str, default=AgentConfig.humidity_memory_version)
     parser.add_argument("--llm-mc-sero-mode", type=str, choices=["off", "shadow"], default=AgentConfig.mc_sero_mode)
+    parser.add_argument("--llm-tomato-safety-v2", action="store_true")
     parser.add_argument("--output-json", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_diag.json")
     parser.add_argument("--output-csv", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_trace.csv")
     parser.add_argument("--output-report", type=str, default="gl_gym/result/diagnostics/ppo_vs_llm_diag.md")
@@ -925,6 +952,7 @@ def main() -> None:
                 humidity_memory_baseline_controller_id=args.llm_humidity_memory_baseline_controller_id,
                 humidity_memory_version=args.llm_humidity_memory_version,
                 mc_sero_mode=args.llm_mc_sero_mode,
+                tomato_safety_v2_enabled=args.llm_tomato_safety_v2,
                 plan_cache_mode=args.llm_plan_cache_mode,
                 plan_cache_path=args.llm_plan_cache_path,
                 plan_cache_strict=args.llm_plan_cache_strict,
@@ -951,6 +979,7 @@ def main() -> None:
             "humidity_memory": bool(args.llm_humidity_memory),
             "humidity_memory_version": str(args.llm_humidity_memory_version),
             "mc_sero_mode": str(args.llm_mc_sero_mode),
+            "tomato_safety_v2": bool(args.llm_tomato_safety_v2),
             "plan_cache_mode": str(args.llm_plan_cache_mode),
             "plan_cache_path": str(args.llm_plan_cache_path),
             "plan_cache_strict": bool(args.llm_plan_cache_strict),

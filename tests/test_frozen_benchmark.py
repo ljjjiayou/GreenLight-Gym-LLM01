@@ -21,6 +21,9 @@ class TestFrozenBenchmark(unittest.TestCase):
     def test_accepts_sero_shadow_controller(self):
         self.assertEqual(parse_controller_list("llm,llm_sero_shadow"), ["llm", "llm_sero_shadow"])
 
+    def test_accepts_rspc_v2_controller(self):
+        self.assertEqual(parse_controller_list("llm,llm_rspc_v2"), ["llm", "llm_rspc_v2"])
+
     def test_rejects_unknown_controller(self):
         with self.assertRaises(ValueError):
             parse_controller_list("llm,bad")
@@ -111,6 +114,29 @@ class TestFrozenBenchmark(unittest.TestCase):
         self.assertAlmostEqual(summary["mean_mc_sero_margin"], 0.175)
         self.assertEqual(summary["mc_sero_best_candidate_counts"], {"anchor": 1, "dry_recovery": 1})
         self.assertEqual(summary["mc_sero_reject_reason_counts"], {"insufficient_margin": 1})
+
+    def test_sums_tomato_safety_v2_suppressed_replans(self):
+        rows = [
+            self._row(
+                tomato_safety_v2_enabled=True,
+                tomato_safety_v2_applied=True,
+                tomato_safety_v2_reasons="hot_dry_cooling_guard",
+                tomato_safety_v2_suppressed_replan=True,
+            ),
+            self._row(
+                tomato_safety_v2_enabled=True,
+                tomato_safety_v2_applied=False,
+                tomato_safety_v2_reasons="",
+                tomato_safety_v2_suppressed_replan=False,
+            ),
+        ]
+
+        summary = sum_metrics(rows)
+
+        self.assertEqual(summary["tomato_safety_v2_enabled_steps"], 2)
+        self.assertEqual(summary["tomato_safety_v2_applied_steps"], 1)
+        self.assertEqual(summary["tomato_safety_v2_suppressed_replan_steps"], 1)
+        self.assertEqual(summary["tomato_safety_v2_reason_counts"], {"hot_dry_cooling_guard": 1})
 
 
 if __name__ == "__main__":

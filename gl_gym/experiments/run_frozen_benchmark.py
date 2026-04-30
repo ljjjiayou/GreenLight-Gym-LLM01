@@ -33,6 +33,7 @@ from gl_gym.experiments.diagnose_ppo_vs_llm import (
     run_ppo_trace,
     safety_patterns,
     sum_metrics,
+    write_rows_csv,
 )
 
 load_dotenv()
@@ -52,7 +53,7 @@ class BenchmarkJob:
 
 
 def parse_controller_list(text: str) -> List[str]:
-    allowed = {"ppo", "llm", "llm_hem", "llm_sero_shadow"}
+    allowed = {"ppo", "llm", "llm_hem", "llm_sero_shadow", "llm_rspc_v2"}
     controllers = [part.strip() for part in str(text).split(",") if part.strip()]
     invalid = [name for name in controllers if name not in allowed]
     if invalid:
@@ -109,7 +110,7 @@ def run_job(
     humidity_memory_teacher_policy_id: str,
     humidity_memory_baseline_controller_id: str,
     humidity_memory_version: str,
-) -> Dict[str, Any]:
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     start = time.perf_counter()
     if job.controller == "ppo":
         if model is None:
@@ -139,13 +140,35 @@ def run_job(
             humidity_memory_baseline_controller_id=humidity_memory_baseline_controller_id,
             humidity_memory_version=humidity_memory_version,
             mc_sero_mode="shadow" if job.controller == "llm_sero_shadow" else "off",
+            tomato_safety_v2_enabled=(job.controller == "llm_rspc_v2"),
             plan_cache_mode=plan_cache_mode,
             plan_cache_path=plan_cache_path,
             plan_cache_strict=plan_cache_strict,
             plan_cache_key_policy=plan_cache_key_policy,
             uncertainty_scale=uncertainty_scale,
         )
-    return summarize_trace(job, rows, time.perf_counter() - start)
+    return summarize_trace(job, rows, time.perf_counter() - start), rows
+
+
+def _trace_json_default(value: Any) -> Any:
+    if hasattr(value, "item"):
+        return value.item()
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return str(value)
+
+
+def write_trace_outputs(trace_dir: str, job: BenchmarkJob, rows: List[Dict[str, Any]]) -> None:
+    if not trace_dir:
+        return
+    trace_path = Path(trace_dir)
+    trace_path.mkdir(parents=True, exist_ok=True)
+    stem = f"{job.scenario_id}_{job.controller}"
+    write_rows_csv(trace_path / f"{stem}.csv", rows)
+    jsonl_path = trace_path / f"{stem}.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=_trace_json_default) + "\n")
 
 
 def main() -> None:
@@ -172,6 +195,7 @@ def main() -> None:
     parser.add_argument("--humidity-memory-baseline-controller-id", type=str, default="")
     parser.add_argument("--humidity-memory-version", type=str, default=AgentConfig.humidity_memory_version)
     parser.add_argument("--output-json", type=str, default="gl_gym/result/benchmarks/frozen_benchmark_summary.json")
+    parser.add_argument("--output-trace-dir", type=str, default="")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -197,28 +221,28 @@ def main() -> None:
     summaries: List[Dict[str, Any]] = []
     for index, job in enumerate(jobs, start=1):
         print(f"[{index}/{len(jobs)}] {job.controller} {job.scenario_id}")
-        summaries.append(
-            run_job(
-                job,
-                config=config,
-                model=model,
-                vecnorm_path=Path(args.vecnorm_path),
-                api_key=api_key,
-                uncertainty_scale=args.uncertainty_scale,
-                llm_model=args.llm_model,
-                llm_interval=args.llm_interval,
-                llm_max_iterations=args.llm_max_iterations,
-                llm_max_tokens=args.llm_max_tokens,
-                plan_cache_mode=args.plan_cache_mode,
-                plan_cache_path=args.plan_cache_path,
-                plan_cache_strict=args.plan_cache_strict,
-                plan_cache_key_policy=args.plan_cache_key_policy,
-                humidity_memory_path=args.humidity_memory_path,
-                humidity_memory_teacher_policy_id=args.humidity_memory_teacher_policy_id,
-                humidity_memory_baseline_controller_id=args.humidity_memory_baseline_controller_id,
-                humidity_memory_version=args.humidity_memory_version,
-            )
+        summary, rows = run_job(
+            job,
+            config=config,
+            model=model,
+            vecnorm_path=Path(args.vecnorm_path),
+            api_key=api_key,
+            uncertainty_scale=args.uncertainty_scale,
+            llm_model=args.llm_model,
+            llm_interval=args.llm_interval,
+            llm_max_iterations=args.llm_max_iterations,
+            llm_max_tokens=args.llm_max_tokens,
+            plan_cache_mode=args.plan_cache_mode,
+            plan_cache_path=args.plan_cache_path,
+            plan_cache_strict=args.plan_cache_strict,
+            plan_cache_key_policy=args.plan_cache_key_policy,
+            humidity_memory_path=args.humidity_memory_path,
+            humidity_memory_teacher_policy_id=args.humidity_memory_teacher_policy_id,
+            humidity_memory_baseline_controller_id=args.humidity_memory_baseline_controller_id,
+            humidity_memory_version=args.humidity_memory_version,
         )
+        write_trace_outputs(args.output_trace_dir, job, rows)
+        summaries.append(summary)
 
     output = {
         "benchmark": {
@@ -230,6 +254,7 @@ def main() -> None:
             "plan_cache_mode": str(args.plan_cache_mode),
             "plan_cache_path": str(args.plan_cache_path),
             "plan_cache_key_policy": str(args.plan_cache_key_policy),
+            "output_trace_dir": str(args.output_trace_dir),
         },
         "summaries": summaries,
     }

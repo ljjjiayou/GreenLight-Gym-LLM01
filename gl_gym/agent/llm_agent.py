@@ -188,6 +188,18 @@ class AgentConfig:
     cold_dehumidify_vent_cap: float = 0.12
     cold_dehumidify_extreme_vent_cap: float = 0.25
 
+    # Tomato safety v2 is opt-in so frozen baselines stay untouched.
+    tomato_safety_v2_enabled: bool = False
+    tomato_safety_v2_dry_rh_on: float = 55.0
+    tomato_safety_v2_dry_rh_hard: float = 50.0
+    tomato_safety_v2_dry_vpd_on: float = 1.20
+    tomato_safety_v2_dry_vpd_hard: float = 1.60
+    tomato_safety_v2_target_rh_gap: float = 10.0
+    tomato_safety_v2_low_temp_threshold: float = 15.5
+    tomato_safety_v2_extreme_dew_rh: float = 94.0
+    tomato_safety_v2_extreme_dew_margin: float = 0.40
+    tomato_safety_v2_suppress_replay_emergency_replans: bool = True
+
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
     lamp_budget_soft_cap: float = 0.40            # 预算接近上限时的补光软上限
@@ -627,6 +639,145 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
     return np.clip(guarded, 0.0, 1.0)
 
 
+def apply_tomato_safety_v2(
+    state,
+    target_control: np.ndarray,
+    config: Optional[AgentConfig] = None,
+    target_rh: Optional[float] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Opt-in tomato dry-side and low-temperature safety shaping.
+
+    This layer is deliberately conservative and disabled by default. It is used
+    only by the `llm_rspc_v2` benchmark controller to protect tomato seedlings
+    from low RH / high VPD and cold over-ventilation windows without changing the
+    ordinary LLM-RSPC baseline.
+    """
+    cfg = config or AgentConfig()
+    shaped = np.asarray(target_control, dtype=np.float32).copy()
+    before = shaped.copy()
+
+    temp_air = float(getattr(state, "temp_air", 20.0))
+    rh_air = float(getattr(state, "rh_air", 70.0))
+    glob_rad = float(getattr(state, "glob_rad", 0.0))
+    hour_of_day = float(getattr(state, "hour_of_day", 12.0))
+    dew_margin = min(
+        float(getattr(state, "dew_margin_air", 3.0)),
+        float(getattr(state, "canopy_dew_margin", 3.0)),
+    )
+    vpd = float(calculate_vpd_kpa(temp_air, rh_air))
+    is_night = hour_of_day < 6.0 or hour_of_day > 18.0
+    extreme_dew_risk = (
+        rh_air >= float(getattr(cfg, "tomato_safety_v2_extreme_dew_rh", 94.0))
+        or dew_margin < float(getattr(cfg, "tomato_safety_v2_extreme_dew_margin", 0.40))
+    )
+    high_temp_cooling = temp_air >= 32.0
+
+    reasons: List[str] = []
+    details: Dict[str, Any] = {
+        "enabled": bool(getattr(cfg, "tomato_safety_v2_enabled", False)),
+        "applied": False,
+        "reasons": reasons,
+        "temp_air": temp_air,
+        "rh_air": rh_air,
+        "vpd_kpa": vpd,
+        "dew_margin": dew_margin,
+        "target_rh": None if target_rh is None else float(target_rh),
+        "before": before.tolist(),
+    }
+
+    if not bool(getattr(cfg, "tomato_safety_v2_enabled", False)):
+        details["after"] = shaped.tolist()
+        return np.clip(shaped, 0.0, 1.0), details
+
+    dry_risk = (
+        rh_air < float(getattr(cfg, "tomato_safety_v2_dry_rh_on", 55.0))
+        or vpd > float(getattr(cfg, "tomato_safety_v2_dry_vpd_on", 1.20))
+    )
+    hard_dry_risk = (
+        rh_air < float(getattr(cfg, "tomato_safety_v2_dry_rh_hard", 50.0))
+        or vpd > float(getattr(cfg, "tomato_safety_v2_dry_vpd_hard", 1.60))
+    )
+    target_mismatch = (
+        target_rh is not None
+        and float(target_rh) - rh_air > float(getattr(cfg, "tomato_safety_v2_target_rh_gap", 10.0))
+    )
+
+    hot_dry_dew_block = extreme_dew_risk and rh_air >= 80.0
+    hot_dry_cooling = (
+        dry_risk
+        and not hot_dry_dew_block
+        and (temp_air >= 27.0 or (temp_air >= 25.5 and glob_rad >= 600.0))
+    )
+
+    if hot_dry_cooling:
+        reasons.append("hot_dry_cooling_guard")
+        if hard_dry_risk or vpd > 1.8 or temp_air >= 30.0:
+            vent_floor = 0.78
+        else:
+            vent_floor = 0.60
+        shaped[3] = max(float(shaped[3]), vent_floor)
+        shaped[3] = min(float(shaped[3]), 1.00)
+        shaped[0] = 0.0
+        shaped[1] = 0.0
+        shaped[2] = max(float(shaped[2]), 1.00)
+        shaped[4] = 0.0
+        shaped[5] = min(float(shaped[5]), 0.0 if hard_dry_risk else 0.15)
+        if hard_dry_risk:
+            reasons.append("hard_dry_vpd_guard")
+
+    if dry_risk and not high_temp_cooling and not hot_dry_cooling:
+        reasons.append("dry_vpd_guard")
+        if temp_air >= 28.0:
+            vent_cap = 0.24 if hard_dry_risk else 0.30
+        elif temp_air >= 24.0:
+            vent_cap = 0.14 if hard_dry_risk else 0.18
+        else:
+            vent_cap = 0.08 if hard_dry_risk else 0.10
+        shaped[3] = min(float(shaped[3]), vent_cap)
+        shaped[1] = 0.0
+        shaped[4] = 0.0
+        if temp_air >= 12.0:
+            shaped[0] = min(float(shaped[0]), 0.02 if hard_dry_risk else 0.05)
+        if temp_air < 20.0:
+            shaped[2] = max(float(shaped[2]), 0.80 if hard_dry_risk else 0.70)
+        if glob_rad > 180.0 or temp_air > 24.0 or hard_dry_risk:
+            shaped[5] = max(float(shaped[5]), 0.65 if hard_dry_risk else 0.50)
+        if hard_dry_risk:
+            reasons.append("hard_dry_vpd_guard")
+
+    if target_mismatch and not high_temp_cooling and not hot_dry_cooling:
+        reasons.append("target_rh_action_mismatch")
+        shaped[3] = min(float(shaped[3]), 0.14 if temp_air >= 24.0 else 0.08)
+        shaped[1] = 0.0
+        shaped[4] = 0.0
+        if temp_air < 20.0:
+            shaped[2] = max(float(shaped[2]), 0.70)
+        if glob_rad > 200.0:
+            shaped[5] = max(float(shaped[5]), 0.50)
+
+    if temp_air < float(getattr(cfg, "tomato_safety_v2_low_temp_threshold", 15.5)) and not extreme_dew_risk:
+        reasons.append("cold_buffer_guard")
+        if temp_air < 12.0:
+            shaped[0] = max(float(shaped[0]), 0.90)
+            shaped[2] = max(float(shaped[2]), 0.90)
+            shaped[3] = min(float(shaped[3]), 0.08)
+        else:
+            shaped[0] = max(float(shaped[0]), 0.16 if is_night else 0.08)
+            shaped[2] = max(float(shaped[2]), 0.75 if is_night else 0.65)
+            shaped[3] = min(float(shaped[3]), 0.18 if rh_air >= 88.0 else 0.12)
+        shaped[1] = 0.0
+        shaped[4] = 0.0
+
+    shaped = np.clip(shaped, 0.0, 1.0)
+    details["applied"] = bool(np.max(np.abs(shaped - before)) > 1e-6)
+    details["after"] = shaped.tolist()
+    details["vent_before"] = float(before[3]) if len(before) > 3 else 0.0
+    details["vent_after"] = float(shaped[3]) if len(shaped) > 3 else 0.0
+    details["heat_before"] = float(before[0]) if len(before) > 0 else 0.0
+    details["heat_after"] = float(shaped[0]) if len(shaped) > 0 else 0.0
+    return shaped, details
+
+
 def log_control_tracking(prefix: str, target_control: np.ndarray, applied_control: np.ndarray, action_cmd: Optional[np.ndarray] = None) -> None:
     """记录控制跟踪日志：对比目标控制量与环境实际执行量。
 
@@ -933,6 +1084,9 @@ class RuleBasedLLMDirector:
         self.last_rollout_selection: Dict[str, Any] = {}
         self.last_expert_prediction: Dict[str, Any] = {}
         self.last_humidity_memory_prediction: Dict[str, Any] = {}
+        self.last_tomato_safety_v2: Dict[str, Any] = {"enabled": bool(getattr(self.config, "tomato_safety_v2_enabled", False))}
+        self.last_tomato_safety_v2_suppressed_replan: Dict[str, Any] = {"applied": False}
+        self.tomato_safety_v2_suppressed_replan_steps: int = 0
         self.last_plan_cache_event: Dict[str, Any] = {"mode": str(getattr(self.config, "plan_cache_mode", "off"))}
         self.last_humidity_memory_selected_step: int = -10**9
         self.last_llm_trigger_step: int = -10**9
@@ -2795,8 +2949,43 @@ class RuleBasedLLMDirector:
             self.pending_control = self._select_fallback_control(state=state)
         final_control = apply_safety_guardrails(state, self.pending_control)
         final_control = self._apply_humidity_memory_final_shape(state, final_control)
+        final_control = self._apply_tomato_safety_v2(state, final_control)
         self.pending_control = None
         return np.asarray(final_control, dtype=np.float32)
+
+    def _apply_tomato_safety_v2(
+        self,
+        state,
+        control: np.ndarray,
+        target_rh: Optional[float] = None,
+    ) -> np.ndarray:
+        if target_rh is None and isinstance(getattr(self, "current_plan", None), dict):
+            try:
+                target_rh = self._get_plan_target(self.current_plan, "target_rh", state)
+            except Exception:
+                target_rh = None
+        shaped, info = apply_tomato_safety_v2(
+            state,
+            np.asarray(control, dtype=np.float32),
+            config=self.config,
+            target_rh=target_rh,
+        )
+        self.last_tomato_safety_v2 = info
+        suppressed_replan = dict(getattr(self, "last_tomato_safety_v2_suppressed_replan", {"applied": False}))
+        info["suppressed_replan"] = suppressed_replan
+        info["suppressed_replan_step_count"] = int(getattr(self, "tomato_safety_v2_suppressed_replan_steps", 0))
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            self.last_rollout_selection["tomato_safety_v2"] = info
+        return np.asarray(shaped, dtype=np.float32)
+
+    def _should_suppress_tomato_v2_replay_emergency_replan(self) -> bool:
+        return (
+            bool(getattr(self.config, "tomato_safety_v2_enabled", False))
+            and bool(getattr(self.config, "tomato_safety_v2_suppress_replay_emergency_replans", True))
+            and str(getattr(self.config, "plan_cache_mode", "off")) == "replay"
+            and str(getattr(self.config, "plan_cache_key_policy", "prompt")) == "scenario_timestep"
+            and bool(getattr(self.config, "plan_cache_strict", False))
+        )
 
     def _enforce_setpoint_contract(
         self,
@@ -3277,6 +3466,11 @@ class RuleBasedLLMDirector:
             }
 
         except Exception as e:
+            if (
+                str(getattr(self.config, "plan_cache_mode", "off")) == "replay"
+                and bool(getattr(self.config, "plan_cache_strict", False))
+            ):
+                raise
             import traceback
             traceback.print_exc()
             return {
@@ -3817,10 +4011,23 @@ class RuleBasedLLMDirector:
         current_interval = self._update_dynamic_interval(state)
 
         replan_reason = None
+        self.last_tomato_safety_v2_suppressed_replan = {"applied": False}
         if not self._is_plan_active(int(state.timestep)):
             replan_reason = "init_plan" if self.current_plan is None else "plan_expired"
         elif self._should_emergency_replan(analysis, state):
-            replan_reason = "emergency_replan"
+            if self._should_suppress_tomato_v2_replay_emergency_replan():
+                self.tomato_safety_v2_suppressed_replan_steps += 1
+                self.last_tomato_safety_v2_suppressed_replan = {
+                    "applied": True,
+                    "step": int(state.timestep),
+                    "reason": "emergency_replan",
+                    "critical_level": str(analysis.get("critical_level", "normal")),
+                    "critical_violations": list(analysis.get("critical_violations", [])),
+                }
+                self.emergency_streak_steps = 0
+                self.rh_emergency_streak_steps = 0
+            else:
+                replan_reason = "emergency_replan"
 
         llm_attempts = 0
         llm_action_found = False

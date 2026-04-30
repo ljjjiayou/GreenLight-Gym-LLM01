@@ -92,6 +92,7 @@ def make_director(tmp_path, mode, tools, graph, key_policy="prompt"):
     director.config = AgentConfig(
         plan_cache_mode=mode,
         plan_cache_path=str(tmp_path),
+        plan_cache_strict=True,
         plan_cache_key_policy=key_policy,
         max_iterations=1,
     )
@@ -231,6 +232,20 @@ class TestPlanCache(unittest.TestCase):
             self.assertTrue(replay["success"])
             self.assertTrue(replay["plan"]["plan_cache_event"]["hit"])
             self.assertEqual(replay["plan"]["plan_cache_event"]["key_policy"], "scenario_timestep")
+
+    def test_strict_replay_cache_miss_raises_instead_of_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plans.json"
+            replay_tools = FakeTools()
+            replay_director = make_director(path, "replay", replay_tools, RaisingGraph())
+
+            with self.assertRaises(RuntimeError):
+                RuleBasedLLMDirector._replan_with_llm(
+                    replay_director,
+                    DummyState(),
+                    {"state": DummyState()},
+                    "init_plan",
+                )
 
 
 if __name__ == "__main__":
