@@ -1,0 +1,25 @@
+# C-STCC v817.0 Level-0 Scorer Diagnostic
+
+Offline scorer diagnostic only. No online LLM, no predictive rollout, no final-action change, no reward claim.
+
+## Boundary
+
+- Audit success rate: 1.000
+- Final-action invariant rate: 1.000
+- Final action changed steps: 0
+- Online LLM / rollout / real projection steps: 0 / 0 / 0
+- JSON row max KB: 38.783
+
+## Scorer Diagnostic
+
+- Risk rows: 126
+- Risk rule margin coverage: 1.000
+- Risk rule margin mean/max: 0.036931 / 0.071708
+- Conservative no-candidate count: 720
+- Conservative no-candidate reasons: `{"confidence_below_candidate_threshold": 720}`
+- Rule best templates: `{"co2_vent_conflict_reduce": 101, "hold_all": 594, "ventilation_ramp_limited": 25}`
+
+## Decision
+
+- Next action: v8171_conservative_risk_candidate_allocation_plan
+- Readiness reasons: conservative_prior_has_no_candidate

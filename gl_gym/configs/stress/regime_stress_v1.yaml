@@ -1,0 +1,78 @@
+schema_version: regime_stress_config_v1
+suite_name: regime_stress_v1
+description: Extreme greenhouse regime stress suite built from existing benchmark traces.
+
+trace_selection:
+  controller_preference:
+    - llm_rspc_v2
+    - llm
+    - llm_sero_shadow
+    - ppo
+  extension_preference:
+    - .csv
+    - .jsonl
+
+windowing:
+  merge_gap_steps: 1
+  min_window_steps: 1
+  top_window_count: 5
+
+splits:
+  regression_scenarios:
+    - year: 2010
+      day: 180
+      seed: 44
+      max_steps: 240
+    - year: 2015
+      day: 180
+      seed: 44
+      max_steps: 240
+  validation:
+    years: [2010, 2015, 2020]
+    days: [59, 120, 180, 240]
+    seeds: [44]
+    max_steps: 240
+  tuning_seeds: [43]
+  holdout_seeds: [42]
+  default_split: tuning
+
+derived_features:
+  rad_heat_load_fields:
+    - rad_heat_load
+    - glob_rad
+    - forecast_rad_peak_2h
+    - forecast_rad_mean_1h
+  radiation_spike_lookback_steps: 4
+  radiation_spike_temp_rise_c: 1.0
+
+regimes:
+  hot_dry:
+    temp_air_min: 30.0
+    rad_heat_load_min: 600.0
+    rh_air_max: 55.0
+    vpd_air_min: 1.6
+  hot_humid:
+    temp_air_min: 28.0
+    rh_air_min: 85.0
+    dew_margin_min_max: 1.0
+  cold_humid:
+    temp_air_max: 16.5
+    rh_air_min: 88.0
+    vpd_air_max: 0.35
+    dew_margin_min_max: 1.0
+  cold_dry:
+    temp_air_max: 16.5
+    rh_air_max: 55.0
+  dawn_dew:
+    hour_start: 4.0
+    hour_end: 8.0
+    rh_air_min: 88.0
+    canopy_dew_margin_max: 1.2
+  radiation_spike:
+    rad_heat_load_min: 650.0
+  wind_stress:
+    wind_speed_min: 6.0
+    temp_air_min: 28.0
+    rh_air_min: 85.0
+    dew_margin_min_max: 1.0
+    canopy_dew_margin_max: 1.2

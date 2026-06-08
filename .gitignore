@@ -1,6 +1,7 @@
 .vscode/
 .env
 .codex_literature_pdfs/
+node_modules/
 __pycache__/
 build/
 data/

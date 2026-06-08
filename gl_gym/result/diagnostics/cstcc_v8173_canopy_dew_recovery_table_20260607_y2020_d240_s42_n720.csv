@@ -1,0 +1,2 @@
+mean_action_delta_u_heating,mean_action_delta_u_screen,mean_action_delta_u_ventilation,mean_delta_canopy_dew_margin_hat,mean_delta_dew_margin_air_hat,mean_delta_rh_hat,mean_delta_vpd_hat,policy,risk_combo_id,row_count
+0.0,0.0,-9.93410742555767e-09,-3.352761256125714e-09,-2.483526856389418e-09,2.4835268563894175e-08,-0.03000003476937599,canopy_dew_first_v1,canopy_dew_lt0+dew_or_humidity,6

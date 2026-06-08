@@ -1,0 +1,292 @@
+first_delta_u_heating,first_delta_u_screen,first_delta_u_ventilation,hour_of_day,outside_air_dryer,phase_distribution,pulse_window_active,risk_combo_id,step,template_applicable,template_name,ventilation_increase_steps
+0.09999999999999998,0.0,-0.19999999999999996,0.0,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,0,True,conservative_dew_stabilize,0
+0.14000000357627868,0.0,-0.19999999999999996,0.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,0,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,0.0,-0.19999999999999996,0.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,0,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,18.25,False,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,73,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,18.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,73,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,18.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,73,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,5.0,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,212,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,5.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,212,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,5.0,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,212,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,5.25,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,213,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,5.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,213,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,5.25,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,213,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,5.5,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,214,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,5.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,214,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,5.5,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,214,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-5.18550052674982e-07,0.06999999284744263,9.0,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,516,True,conservative_dew_stabilize,12
+0.2,-5.18550052674982e-07,0.0,9.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,516,True,conservative_canopy_dew_warmup,8
+0.2,-5.18550052674982e-07,0.0,9.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,516,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,9.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,517,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,9.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,517,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,9.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,517,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-4.721400443941093e-07,0.06999999284744263,9.5,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,518,True,conservative_dew_stabilize,12
+0.2,-4.721400443941093e-07,0.0,9.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,518,True,conservative_canopy_dew_warmup,8
+0.2,-4.721400443941093e-07,0.0,9.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,518,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,9.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,519,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,9.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,519,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,9.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,519,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-4.3349206180209876e-07,0.06999999284744263,10.0,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,520,True,conservative_dew_stabilize,12
+0.2,-4.3349206180209876e-07,0.0,10.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,520,True,conservative_canopy_dew_warmup,8
+0.2,-4.3349206180209876e-07,0.0,10.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,520,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,10.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,521,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,10.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,521,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,10.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,521,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-8.356903435924323e-07,0.06999999284744263,10.5,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,522,True,conservative_dew_stabilize,12
+0.2,-8.356903435924323e-07,0.0,10.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,522,True,conservative_canopy_dew_warmup,8
+0.2,-8.356903435924323e-07,0.0,10.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,522,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,10.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,523,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,10.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,523,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,10.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,523,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-1.5599539437971544e-06,0.04999999999999999,11.0,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,524,True,conservative_dew_stabilize,12
+0.2,-1.5599539437971544e-06,0.0,11.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,524,True,conservative_canopy_dew_warmup,8
+0.2,-1.5599539437971544e-06,0.0,11.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,524,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-1.4892739272909239e-06,0.04999999999999999,11.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,525,True,conservative_dew_stabilize,12
+0.2,-1.4892739272909239e-06,0.0,11.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,525,True,conservative_canopy_dew_warmup,8
+0.2,-1.4892739272909239e-06,0.0,11.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,525,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-1.0788508006953634e-06,0.04999999999999999,11.5,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,526,True,conservative_dew_stabilize,12
+0.2,-1.0788508006953634e-06,0.0,11.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,526,True,conservative_canopy_dew_warmup,8
+0.2,-1.0788508006953634e-06,0.0,11.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,526,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-7.815344815753633e-07,0.04999999999999999,11.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,527,True,conservative_dew_stabilize,12
+0.2,-7.815344815753633e-07,0.0,11.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,527,True,conservative_canopy_dew_warmup,8
+0.2,-7.815344815753633e-07,0.0,11.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,527,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-5.679992227669572e-07,0.04999999999999999,12.0,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,528,True,conservative_dew_stabilize,12
+0.2,-5.679992227669572e-07,0.0,12.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,528,True,conservative_canopy_dew_warmup,8
+0.2,-5.679992227669572e-07,0.0,12.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,528,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,12.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,529,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,12.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,529,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,12.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,529,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,12.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,531,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,12.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,531,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,12.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,531,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-3.2233378988166805e-07,0.06999999284744263,13.25,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,533,True,conservative_dew_stabilize,12
+0.2,-3.2233378988166805e-07,0.0,13.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,533,True,conservative_canopy_dew_warmup,8
+0.2,-3.2233378988166805e-07,0.0,13.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,533,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-5.865844059371739e-07,0.06999999284744263,13.5,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,534,True,conservative_dew_stabilize,12
+0.2,-5.865844059371739e-07,0.0,13.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,534,True,conservative_canopy_dew_warmup,8
+0.2,-5.865844059371739e-07,0.0,13.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,534,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-1.067468588189513e-06,0.06999999284744263,13.75,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,535,True,conservative_dew_stabilize,12
+0.2,-1.067468588189513e-06,0.0,13.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,535,True,conservative_canopy_dew_warmup,8
+0.2,-1.067468588189513e-06,0.0,13.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,535,True,conservative_dew_pulse_heat_then_vent,0
+0.2,-1.8613463907968253e-06,0.06999999284744263,14.0,True,"{""dew_warm_stabilize"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,536,True,conservative_dew_stabilize,12
+0.2,-1.8613463907968253e-06,0.0,14.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,536,True,conservative_canopy_dew_warmup,8
+0.2,-1.8613463907968253e-06,0.0,14.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,536,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-2.814125148187241e-11,-1.1920928910669204e-08,8.75,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,611,True,conservative_dew_stabilize,0
+0.14,-2.814125148187241e-11,-0.17000001192092895,8.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,611,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-2.814125148187241e-11,-0.15000001192092893,8.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,611,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-4.093825278772556e-11,-1.1920928910669204e-08,9.0,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,612,True,conservative_dew_stabilize,0
+0.14,-4.093825278772556e-11,-0.17000001192092895,9.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,612,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-4.093825278772556e-11,-0.15000001192092893,9.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,612,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-7.145966457455799e-11,-1.1920928910669204e-08,9.25,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,613,True,conservative_dew_stabilize,0
+0.14,-7.145966457455799e-11,-0.17000001192092895,9.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,613,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-7.145966457455799e-11,-0.15000001192092893,9.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,613,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.2418922834545043e-10,-1.1920928910669204e-08,9.5,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,614,True,conservative_dew_stabilize,0
+0.14,-1.2418922834545043e-10,-0.17000001192092895,9.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,614,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-1.2418922834545043e-10,-0.15000001192092893,9.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,614,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-2.1582753639837193e-10,-1.1920928910669204e-08,9.75,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,615,True,conservative_dew_stabilize,0
+0.14000000357627868,-2.1582753639837193e-10,-0.17000001192092895,9.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,615,True,conservative_canopy_dew_warmup,8
+0.09000000357627869,-2.1582753639837193e-10,-0.15000001192092893,9.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,615,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-3.769916878670898e-10,-1.1920928910669204e-08,10.0,True,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,616,True,conservative_dew_stabilize,0
+0.14000000357627868,-3.769916878670898e-10,-0.17000001192092895,10.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,616,True,conservative_canopy_dew_warmup,8
+0.09000000357627869,-3.769916878670898e-10,-0.15000001192092893,10.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,616,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,11.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,623,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,11.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,623,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,11.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,623,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,12.0,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,624,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,12.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,624,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,12.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,624,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,0.0,-1.1920928910669204e-08,12.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,625,True,conservative_dew_stabilize,0
+0.14000000357627868,0.0,-0.17000001192092895,12.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,625,True,conservative_canopy_dew_warmup,8
+0.09000000357627869,0.0,-0.15000001192092893,12.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,625,True,conservative_dew_pulse_heat_then_vent,0
+0.2,0.0,0.04999999999999999,12.5,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,626,True,conservative_dew_stabilize,12
+0.2,0.0,0.0,12.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,626,True,conservative_canopy_dew_warmup,8
+0.2,0.0,0.0,12.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,626,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,0.0,0.050000000000000044,12.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,627,True,conservative_dew_stabilize,12
+0.14,0.0,-0.09999998927116394,12.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,627,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,0.0,-0.07999998927116392,12.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,627,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,0.0,0.050000000000000044,13.0,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,628,True,conservative_dew_stabilize,12
+0.14,0.0,-0.09999998927116394,13.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,628,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,0.0,-0.07999998927116392,13.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,628,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,0.0,0.050000000000000044,13.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,629,True,conservative_dew_stabilize,12
+0.14,0.0,-0.09999998927116394,13.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,629,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,0.0,-0.07999998927116392,13.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,629,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,0.0,0.050000000000000044,13.5,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,630,True,conservative_dew_stabilize,12
+0.14,0.0,-0.09999998927116394,13.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,630,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,0.0,-0.07999998927116392,13.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,630,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,0.0,0.050000000000000044,13.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,631,True,conservative_dew_stabilize,12
+0.14,0.0,-0.09999998927116394,13.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,631,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,0.0,-0.07999998927116392,13.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,631,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.8890676756200264e-07,0.050000000000000044,14.0,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity,632,True,conservative_dew_stabilize,12
+0.14,-1.8890676756200264e-07,-0.09999998927116394,14.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity,632,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-1.8890676756200264e-07,-0.07999998927116392,14.0,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity,632,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.5673285247430613e-07,-1.1920928910669204e-08,14.25,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity,633,True,conservative_dew_stabilize,0
+0.14,-1.5673285247430613e-07,-0.17000001192092895,14.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity,633,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-1.5673285247430613e-07,-0.15000001192092893,14.25,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity,633,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.3036240886776795e-07,-1.1920928910669204e-08,14.5,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity,634,True,conservative_dew_stabilize,0
+0.14,-1.3036240886776795e-07,-0.17000001192092895,14.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity,634,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-1.3036240886776795e-07,-0.15000001192092893,14.5,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity,634,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.0842882147699129e-07,-1.1920928910669204e-08,14.75,True,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity,635,True,conservative_dew_stabilize,0
+0.14,-1.0842882147699129e-07,-0.17000001192092895,14.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity,635,True,conservative_canopy_dew_warmup,8
+0.08000000000000002,-1.0842882147699129e-07,-0.15000001192092893,14.75,True,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity,635,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-9.128573452699129e-08,-1.1920928910669204e-08,15.0,False,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity,636,True,conservative_dew_stabilize,0
+0.14,-9.128573452699129e-08,-0.17000001192092895,15.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity,636,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-9.128573452699129e-08,-0.15000001192092893,15.0,False,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity,636,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-9.576737625138776e-08,-1.1920928910669204e-08,15.25,False,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt0+dew_or_humidity,637,True,conservative_dew_stabilize,0
+0.14,-9.576737625138776e-08,-0.17000001192092895,15.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt0+dew_or_humidity,637,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-9.576737625138776e-08,-0.15000001192092893,15.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt0+dew_or_humidity,637,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.0028119135085944e-07,-1.1920928910669204e-08,15.5,False,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,638,True,conservative_dew_stabilize,0
+0.14,-1.0028119135085944e-07,-0.17000001192092895,15.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,638,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-1.0028119135085944e-07,-0.15000001192092893,15.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,638,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.0500776426169978e-07,-1.1920928910669204e-08,15.75,False,"{""dew_warm_stabilize"": 12}",False,canopy_dew_lt1+dew_or_humidity,639,True,conservative_dew_stabilize,0
+0.14,-1.0500776426169978e-07,-0.17000001192092895,15.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,canopy_dew_lt1+dew_or_humidity,639,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-1.0500776426169978e-07,-0.15000001192092893,15.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,canopy_dew_lt1+dew_or_humidity,639,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.0923675830554203e-07,-1.1920928910669204e-08,16.0,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,640,True,conservative_dew_stabilize,0
+0.14,-1.0923675830554203e-07,-0.17000001192092895,16.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,640,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-1.0923675830554203e-07,-0.17000001192092895,16.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,640,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-9.017764313057341e-08,-1.1920928910669204e-08,16.25,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,641,True,conservative_dew_stabilize,0
+0.14,-9.017764313057341e-08,-0.17000001192092895,16.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,641,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-9.017764313057341e-08,-0.17000001192092895,16.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,641,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-7.500517540393048e-08,-1.1920928910669204e-08,16.5,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,642,True,conservative_dew_stabilize,0
+0.14,-7.500517540393048e-08,-0.17000001192092895,16.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,642,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-7.500517540393048e-08,-0.17000001192092895,16.5,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,642,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-6.238548877490757e-08,-1.1920928910669204e-08,16.75,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,643,True,conservative_dew_stabilize,0
+0.14,-6.238548877490757e-08,-0.17000001192092895,16.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,643,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-6.238548877490757e-08,-0.17000001192092895,16.75,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,643,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-5.253063051213758e-08,-1.1920928910669204e-08,17.0,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,644,True,conservative_dew_stabilize,0
+0.14,-5.253063051213758e-08,-0.17000001192092895,17.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,644,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-5.253063051213758e-08,-0.17000001192092895,17.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,644,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-5.511031631044716e-08,-1.1920928910669204e-08,17.25,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,645,True,conservative_dew_stabilize,0
+0.14,-5.511031631044716e-08,-0.17000001192092895,17.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,645,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-5.511031631044716e-08,-0.17000001192092895,17.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,645,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-1.1329378821756109e-06,-1.1920928910669204e-08,17.5,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,646,True,conservative_dew_stabilize,0
+0.14,-1.1329378821756109e-06,-0.17000001192092895,17.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,646,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-1.1329378821756109e-06,-0.17000001192092895,17.5,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,646,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.0022196450736373663,-1.1920928910669204e-08,17.75,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,647,True,conservative_dew_stabilize,0
+0.14,-0.0022196450736373663,-0.17000001192092895,17.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,647,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.0022196450736373663,-0.17000001192092895,17.75,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,647,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,18.0,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,648,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,18.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,648,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,18.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,648,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,18.25,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,649,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.17000001192092895,18.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,649,True,conservative_canopy_dew_warmup,0
+0.1600000035762787,-0.06,-0.17000001192092895,18.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,649,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,18.5,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,650,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.17000001192092895,18.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,650,True,conservative_canopy_dew_warmup,0
+0.1600000035762787,-0.06,-0.17000001192092895,18.5,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,650,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,18.75,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,651,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,18.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,651,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,18.75,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,651,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,19.0,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,652,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,19.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,652,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,19.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,652,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,19.25,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,653,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,19.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,653,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,19.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,653,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,19.5,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,654,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,19.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,654,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,19.5,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,654,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,19.75,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,655,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,19.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,655,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,19.75,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,655,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,20.0,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,656,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.17000001192092895,20.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,656,True,conservative_canopy_dew_warmup,0
+0.1600000035762787,-0.06,-0.17000001192092895,20.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,656,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,20.25,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,657,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,20.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,657,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,20.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,657,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,20.5,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,658,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,20.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,658,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,20.5,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,658,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,20.75,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,659,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,20.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,659,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,20.75,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,659,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,21.0,False,"{""dew_warm_stabilize"": 12}",True,canopy_dew_lt1+dew_or_humidity,660,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,21.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,canopy_dew_lt1+dew_or_humidity,660,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.17000001192092895,21.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,canopy_dew_lt1+dew_or_humidity,660,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,21.25,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,661,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,21.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,661,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.15000001192092893,21.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,661,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,21.5,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,662,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,21.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,662,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.15000001192092893,21.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,662,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-1.1920928910669204e-08,21.75,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,663,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.17000001192092895,21.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,663,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.15000001192092893,21.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,663,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,22.0,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,664,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,22.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,664,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,22.0,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,664,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,22.25,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,665,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,22.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,665,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,22.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,665,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.13000000715255733,22.5,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,666,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,22.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,666,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,-0.06,-0.2,22.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,666,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.13000000715255733,22.75,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,667,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,22.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,667,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,-0.06,-0.2,22.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,667,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.13000000715255733,23.0,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,668,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,23.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,668,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,-0.06,-0.2,23.0,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,668,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.13000000715255733,23.25,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,669,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,23.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,669,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,-0.06,-0.2,23.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,669,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.13000000715255733,23.5,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,670,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,23.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,670,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,-0.06,-0.2,23.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,670,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,23.75,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,671,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,23.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,671,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,23.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,671,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,0.0,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,672,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,0.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,672,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,0.0,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,672,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,0.25,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,673,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,0.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,673,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,0.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,673,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,0.5,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,674,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,0.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,674,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,0.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,674,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,0.75,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,675,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,0.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,675,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,0.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,675,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,1.0,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,676,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,1.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,676,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,1.0,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,676,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,1.25,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,677,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,1.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,677,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,1.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,677,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,1.5,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,678,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,1.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,678,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,1.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,678,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,1.75,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,679,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,1.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,679,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,1.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,679,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,2.0,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,680,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,2.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,680,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,2.0,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,680,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,2.25,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,681,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,2.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,681,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,2.25,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,681,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,2.5,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,682,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,2.5,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,682,True,conservative_canopy_dew_warmup,0
+0.08000000000000002,-0.06,-0.2,2.5,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,682,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.13000000715255733,2.75,False,"{""dew_warm_stabilize"": 12}",False,dew_or_humidity,683,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,2.75,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",False,dew_or_humidity,683,True,conservative_canopy_dew_warmup,0
+0.09000000357627869,-0.06,-0.2,2.75,False,"{""pulse_window_inactive_warmup_only"": 12}",False,dew_or_humidity,683,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.1124704003334045,4.0,False,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,688,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,4.0,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,688,True,conservative_canopy_dew_warmup,0
+0.1600000035762787,-0.06,-0.2,4.0,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,688,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.1242973923683166,4.25,False,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,689,True,conservative_dew_stabilize,0
+0.14000000357627868,-0.06,-0.2,4.25,False,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,689,True,conservative_canopy_dew_warmup,0
+0.1600000035762787,-0.06,-0.2,4.25,False,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,689,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,4.5,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,690,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,4.5,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,690,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,4.5,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,690,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,4.75,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,691,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,4.75,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,691,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,4.75,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,691,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,5.0,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,692,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,5.0,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,692,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,5.0,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,692,True,conservative_dew_pulse_heat_then_vent,0
+0.09999999999999998,-0.06,-0.149999988079071,5.25,True,"{""dew_warm_stabilize"": 12}",True,dew_or_humidity,693,True,conservative_dew_stabilize,0
+0.14,-0.06,-0.2,5.25,True,"{""canopy_post_warmup_vent_if_outside_dryer"": 8, ""canopy_warmup_screen_slit_before_vent"": 4}",True,dew_or_humidity,693,True,conservative_canopy_dew_warmup,0
+0.16000000000000003,-0.06,-0.2,5.25,True,"{""pulse_heat_screen_slit_before_vent"": 4, ""pulse_vent_after_heat_if_outside_dryer"": 8}",True,dew_or_humidity,693,True,conservative_dew_pulse_heat_then_vent,0

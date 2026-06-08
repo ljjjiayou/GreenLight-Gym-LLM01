@@ -11,7 +11,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -53,12 +53,36 @@ class BenchmarkJob:
 
 
 def parse_controller_list(text: str) -> List[str]:
-    allowed = {"ppo", "llm", "llm_hem", "llm_sero_shadow", "llm_rspc_v2"}
+    allowed = {
+        "ppo",
+        "llm",
+        "llm_hem",
+        "llm_sero_shadow",
+        "llm_rspc_v2",
+        "llm_rspc_v2_hot_dry_proposer",
+        "llm_rspc_v2_hot_dry_proposer_strict",
+    }
     controllers = [part.strip() for part in str(text).split(",") if part.strip()]
     invalid = [name for name in controllers if name not in allowed]
     if invalid:
         raise ValueError(f"Unknown controllers: {invalid}; allowed={sorted(allowed)}")
     return controllers
+
+
+def parse_agent_config_overrides(text: str | None) -> Dict[str, Any]:
+    if text is None or not str(text).strip():
+        return {}
+    try:
+        data = json.loads(str(text))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--agent-config-overrides must be a JSON object: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("--agent-config-overrides must be a JSON object")
+    allowed = {field.name for field in fields(AgentConfig)}
+    invalid = sorted(str(key) for key in data if str(key) not in allowed)
+    if invalid:
+        raise ValueError(f"Unknown AgentConfig override fields: {invalid}")
+    return {str(key): value for key, value in data.items()}
 
 
 def build_jobs(years: Iterable[int], days: Iterable[int], seeds: Iterable[int], controllers: Iterable[str], max_steps: int) -> List[BenchmarkJob]:
@@ -110,6 +134,7 @@ def run_job(
     humidity_memory_teacher_policy_id: str,
     humidity_memory_baseline_controller_id: str,
     humidity_memory_version: str,
+    agent_config_overrides: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     start = time.perf_counter()
     if job.controller == "ppo":
@@ -140,12 +165,17 @@ def run_job(
             humidity_memory_baseline_controller_id=humidity_memory_baseline_controller_id,
             humidity_memory_version=humidity_memory_version,
             mc_sero_mode="shadow" if job.controller == "llm_sero_shadow" else "off",
-            tomato_safety_v2_enabled=(job.controller == "llm_rspc_v2"),
+            tomato_safety_v2_enabled=job.controller
+            in {"llm_rspc_v2", "llm_rspc_v2_hot_dry_proposer", "llm_rspc_v2_hot_dry_proposer_strict"},
             plan_cache_mode=plan_cache_mode,
             plan_cache_path=plan_cache_path,
             plan_cache_strict=plan_cache_strict,
             plan_cache_key_policy=plan_cache_key_policy,
             uncertainty_scale=uncertainty_scale,
+            rspc_hot_dry_proposer_control_enabled=job.controller
+            in {"llm_rspc_v2_hot_dry_proposer", "llm_rspc_v2_hot_dry_proposer_strict"},
+            rspc_hot_dry_proposer_control_strict_enabled=(job.controller == "llm_rspc_v2_hot_dry_proposer_strict"),
+            agent_config_overrides=agent_config_overrides,
         )
     return summarize_trace(job, rows, time.perf_counter() - start), rows
 
@@ -182,7 +212,7 @@ def main() -> None:
     parser.add_argument("--controllers", type=str, default="llm,llm_hem,ppo")
     parser.add_argument("--max-steps", type=int, default=240)
     parser.add_argument("--uncertainty-scale", type=float, default=0.0)
-    parser.add_argument("--llm-model", type=str, default="qwen-max-latest")
+    parser.add_argument("--llm-model", type=str, default=AgentConfig.model_name)
     parser.add_argument("--llm-interval", type=int, default=12)
     parser.add_argument("--llm-max-iterations", type=int, default=1)
     parser.add_argument("--llm-max-tokens", type=int, default=260)
@@ -194,12 +224,19 @@ def main() -> None:
     parser.add_argument("--humidity-memory-teacher-policy-id", type=str, default="")
     parser.add_argument("--humidity-memory-baseline-controller-id", type=str, default="")
     parser.add_argument("--humidity-memory-version", type=str, default=AgentConfig.humidity_memory_version)
+    parser.add_argument(
+        "--agent-config-overrides",
+        type=str,
+        default="{}",
+        help="JSON object of AgentConfig field overrides; opt-in only.",
+    )
     parser.add_argument("--output-json", type=str, default="gl_gym/result/benchmarks/frozen_benchmark_summary.json")
     parser.add_argument("--output-trace-dir", type=str, default="")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     controllers = parse_controller_list(args.controllers)
+    agent_config_overrides = parse_agent_config_overrides(args.agent_config_overrides)
     jobs = build_jobs(
         years=parse_int_list(args.years),
         days=parse_int_list(args.days),
@@ -208,7 +245,17 @@ def main() -> None:
         max_steps=args.max_steps,
     )
     if args.dry_run:
-        print(json.dumps({"jobs": [asdict(job) for job in jobs], "job_count": len(jobs)}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "jobs": [asdict(job) for job in jobs],
+                    "job_count": len(jobs),
+                    "agent_config_overrides": agent_config_overrides,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -240,6 +287,7 @@ def main() -> None:
             humidity_memory_teacher_policy_id=args.humidity_memory_teacher_policy_id,
             humidity_memory_baseline_controller_id=args.humidity_memory_baseline_controller_id,
             humidity_memory_version=args.humidity_memory_version,
+            agent_config_overrides=agent_config_overrides,
         )
         write_trace_outputs(args.output_trace_dir, job, rows)
         summaries.append(summary)
@@ -255,6 +303,7 @@ def main() -> None:
             "plan_cache_path": str(args.plan_cache_path),
             "plan_cache_key_policy": str(args.plan_cache_key_policy),
             "output_trace_dir": str(args.output_trace_dir),
+            "agent_config_overrides": agent_config_overrides,
         },
         "summaries": summaries,
     }

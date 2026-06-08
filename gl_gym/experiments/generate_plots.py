@@ -162,7 +162,7 @@ def main():
     interface = GreenhouseAgentInterface(env_llm)
     tools = create_langchain_tools(interface)
     agent_cfg = AgentConfig(
-        model_name="qwen-max-latest",
+        model_name=AgentConfig.model_name,
         api_key=api_key,
         verbose=True,
         control_interval=12,

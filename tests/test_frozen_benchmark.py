@@ -1,7 +1,16 @@
 import unittest
 
-from gl_gym.experiments.diagnose_ppo_vs_llm import finalize_trace_row, safety_patterns, sum_metrics
-from gl_gym.experiments.run_frozen_benchmark import build_jobs, parse_controller_list
+from gl_gym.experiments.diagnose_ppo_vs_llm import (
+    finalize_trace_row,
+    post_guardrail_runtime_provenance_to_record,
+    safety_patterns,
+    sum_metrics,
+)
+from gl_gym.experiments.run_frozen_benchmark import (
+    build_jobs,
+    parse_agent_config_overrides,
+    parse_controller_list,
+)
 
 
 class TestFrozenBenchmark(unittest.TestCase):
@@ -24,9 +33,31 @@ class TestFrozenBenchmark(unittest.TestCase):
     def test_accepts_rspc_v2_controller(self):
         self.assertEqual(parse_controller_list("llm,llm_rspc_v2"), ["llm", "llm_rspc_v2"])
 
+    def test_accepts_hot_dry_proposer_controller(self):
+        self.assertEqual(
+            parse_controller_list("llm_rspc_v2_hot_dry_proposer"),
+            ["llm_rspc_v2_hot_dry_proposer"],
+        )
+
+    def test_accepts_strict_hot_dry_proposer_controller(self):
+        self.assertEqual(
+            parse_controller_list("llm_rspc_v2_hot_dry_proposer_strict"),
+            ["llm_rspc_v2_hot_dry_proposer_strict"],
+        )
+
     def test_rejects_unknown_controller(self):
         with self.assertRaises(ValueError):
             parse_controller_list("llm,bad")
+
+    def test_parses_agent_config_overrides(self):
+        overrides = parse_agent_config_overrides(
+            '{"fallback_rh_penalty_weight": 1.8, "fallback_temp_penalty_weight": 1.2}'
+        )
+
+        self.assertEqual(overrides["fallback_rh_penalty_weight"], 1.8)
+        self.assertEqual(overrides["fallback_temp_penalty_weight"], 1.2)
+        with self.assertRaises(ValueError):
+            parse_agent_config_overrides('{"not_a_config_field": 1}')
 
     def _row(self, **overrides):
         row = {
@@ -151,6 +182,79 @@ class TestFrozenBenchmark(unittest.TestCase):
         self.assertEqual(summary["tomato_safety_v2_applied_steps"], 1)
         self.assertEqual(summary["tomato_safety_v2_suppressed_replan_steps"], 1)
         self.assertEqual(summary["tomato_safety_v2_reason_counts"], {"hot_dry_cooling_guard": 1})
+
+    def test_sums_runtime_error_diagnostics(self):
+        rows = [
+            self._row(source="anchor", plan_cache_enabled=True, plan_cache_hit=True),
+            self._row(
+                source="runtime_error",
+                runtime_error="LLM plan cache miss in strict replay mode: key=abc",
+                runtime_error_type="strict_plan_cache_miss",
+                plan_cache_enabled=True,
+                plan_cache_hit=False,
+            ),
+        ]
+
+        summary = sum_metrics(rows)
+
+        self.assertEqual(summary["source_counts"], {"anchor": 1, "runtime_error": 1})
+        self.assertEqual(summary["runtime_error_steps"], 1)
+        self.assertEqual(summary["strict_cache_miss_runtime_error_steps"], 1)
+        self.assertEqual(summary["runtime_error_counts"], {"strict_plan_cache_miss": 1})
+        self.assertEqual(summary["plan_cache_enabled_steps"], 2)
+        self.assertEqual(summary["plan_cache_hit_steps"], 1)
+
+    def test_exports_runtime_provenance_trace_fields_and_summary_counts(self):
+        record = {
+            "hook_id": "dry_recovery_override",
+            "rule_id": "rspc_post_score_dry_recovery_vent_cap",
+            "rule_family": "rspc_post_score_dry_recovery",
+            "rule_reason": "dry side risk caps ventilation",
+            "source_function": "_plan_control_step",
+            "pre_rule_action": {"ventilation": 0.55},
+            "post_rule_action": {"ventilation": 0.3},
+            "delta_action": {"ventilation": -0.25},
+            "input_features": {"rh_air": 50.0},
+        }
+        row = self._row(
+            **post_guardrail_runtime_provenance_to_record(
+                {"post_guardrail_runtime_provenance": [record]}
+            )
+        )
+
+        self.assertEqual(row["post_guardrail_runtime_provenance"], [record])
+        self.assertEqual(row["post_guardrail_runtime_provenance_count"], 1)
+        self.assertEqual(row["post_guardrail_runtime_reason_missing_count"], 0)
+        self.assertEqual(row["unknown_post_guardrail_rewrite_count"], 0)
+
+        summary = sum_metrics([row])
+
+        self.assertEqual(summary["post_guardrail_runtime_provenance_record_count"], 1)
+        self.assertEqual(summary["post_guardrail_runtime_reason_missing_count"], 0)
+        self.assertEqual(summary["unknown_post_guardrail_rewrite_count"], 0)
+
+    def test_unknown_runtime_provenance_record_blocks_summary_counts(self):
+        record = {
+            "hook_id": "unknown_hook",
+            "rule_id": "unknown_post_guardrail_rewrite",
+            "rule_family": "post_guardrail_unknown",
+            "rule_reason": "",
+            "source_function": "unknown_source",
+            "pre_rule_action": {"ventilation": 0.0},
+            "post_rule_action": {"ventilation": 0.1},
+            "delta_action": {"ventilation": 0.1},
+            "input_features": {"rh_air": 70.0},
+            "reason_missing": True,
+        }
+        row = self._row(
+            **post_guardrail_runtime_provenance_to_record(
+                {"post_guardrail_runtime_provenance": [record]}
+            )
+        )
+
+        self.assertEqual(row["post_guardrail_runtime_provenance_count"], 1)
+        self.assertEqual(row["post_guardrail_runtime_reason_missing_count"], 1)
+        self.assertEqual(row["unknown_post_guardrail_rewrite_count"], 1)
 
 
 if __name__ == "__main__":

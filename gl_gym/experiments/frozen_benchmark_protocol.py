@@ -20,6 +20,7 @@ project_root = Path(__file__).resolve().parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from gl_gym.agent.llm_agent import AgentConfig
 from gl_gym.agent.plan_cache import SCHEMA_VERSION
 from gl_gym.experiments.diagnose_ppo_vs_llm import parse_int_list
 
@@ -161,6 +162,7 @@ def audit_plan_cache(
             {
                 "entry_count": 0,
                 "keys": [],
+                "timesteps": [],
                 "statuses": {},
                 "missing_buffered_action": 0,
                 "missing_parsed_plan": 0,
@@ -170,6 +172,17 @@ def audit_plan_cache(
         status = _entry_status(raw_entry)
         env["entry_count"] += 1
         env["keys"].append(str(key))
+        timestep = raw_entry.get("timestep")
+        if timestep is None:
+            key_payload = raw_entry.get("key_payload")
+            if isinstance(key_payload, Mapping):
+                state_summary = key_payload.get("state_summary")
+                if isinstance(state_summary, Mapping):
+                    timestep = state_summary.get("timestep")
+        try:
+            env["timesteps"].append(int(float(timestep)))
+        except Exception:
+            pass
         env["statuses"][status] = int(env["statuses"].get(status, 0)) + 1
         status_counts[status] = status_counts.get(status, 0) + 1
 
@@ -182,6 +195,12 @@ def audit_plan_cache(
         if status == "written_empty":
             written_empty_count += 1
             env["written_empty"] += 1
+
+    for env in envs.values():
+        timesteps = sorted(set(int(x) for x in env.get("timesteps", [])))
+        env["timesteps"] = timesteps
+        env["timestep_count"] = int(len(timesteps))
+        env["max_timestep"] = int(max(timesteps)) if timesteps else None
 
     required_envs = [scenario.env_id for scenario in scenarios or []]
     missing_envs = [env_id for env_id in required_envs if env_id not in envs]
@@ -453,6 +472,10 @@ def validate_strict_replay_result(result: Mapping[str, Any]) -> Dict[str, Any]:
         hits = int(aggregate.get("plan_cache_hit_steps", 0) or 0)
         source_counts = aggregate.get("source_counts", {})
         unknown_steps = int(source_counts.get("unknown", 0)) if isinstance(source_counts, dict) else 0
+        runtime_error_steps = int(aggregate.get("runtime_error_steps", 0) or 0)
+        strict_cache_miss_runtime_error_steps = int(
+            aggregate.get("strict_cache_miss_runtime_error_steps", 0) or 0
+        )
         reasons: List[str] = []
         if steps <= 0:
             reasons.append("zero_steps")
@@ -462,6 +485,10 @@ def validate_strict_replay_result(result: Mapping[str, Any]) -> Dict[str, Any]:
             reasons.append("cache_not_hit_all_steps")
         if unknown_steps:
             reasons.append("unknown_source_steps")
+        if runtime_error_steps:
+            reasons.append("runtime_error_steps")
+        if strict_cache_miss_runtime_error_steps:
+            reasons.append("strict_cache_miss_runtime_error_steps")
         if reasons:
             failures.append(
                 {
@@ -471,6 +498,8 @@ def validate_strict_replay_result(result: Mapping[str, Any]) -> Dict[str, Any]:
                     "cache_enabled_steps": enabled,
                     "cache_hit_steps": hits,
                     "unknown_source_steps": unknown_steps,
+                    "runtime_error_steps": runtime_error_steps,
+                    "strict_cache_miss_runtime_error_steps": strict_cache_miss_runtime_error_steps,
                     "reasons": reasons,
                 }
             )
@@ -555,7 +584,7 @@ def make_manifest(
     scenarios: Sequence[ScenarioSpec],
     cache_path: str,
     commit: str,
-    llm_model: str = "qwen-max-latest",
+    llm_model: str = AgentConfig.model_name,
     key_policy: str = "scenario_timestep",
     llm_interval: int = 12,
 ) -> Dict[str, Any]:

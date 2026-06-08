@@ -19,6 +19,7 @@ if experiments_dir not in sys.path:
 os.chdir(project_root)
 
 from gl_gym.common.utils import load_env_params, load_model_hyperparams
+from gl_gym.agent.llm_agent import AgentConfig
 from compare_ppo_rule_based import build_markdown_report, parse_int_list, run_llm_case, summarize
 
 
@@ -232,7 +233,7 @@ def main():
     parser.add_argument("--base-seed", type=int, default=666)
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--uncertainty-scale", type=float, default=0.0)
-    parser.add_argument("--llm-model", type=str, default="qwen-max-latest")
+    parser.add_argument("--llm-model", type=str, default=AgentConfig.model_name)
     parser.add_argument("--interval-grid", type=str, default="7,8,9")
     parser.add_argument("--max-tokens-grid", type=str, default="450,500,550")
     parser.add_argument("--max-iterations-grid", type=str, default="3,4,6")

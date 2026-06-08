@@ -31,7 +31,7 @@ def run_one_case(
     day: int,
     max_steps: int = 10,
     interval: int = 12,
-    model_name: str = "qwen-max-latest",
+    model_name: str = AgentConfig.model_name,
     seed: int | None = None,
 ):
     base_env_params = dict(config["GreenLightEnv"])
@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--interval", type=int, default=12, help="LLM control interval")
     parser.add_argument("--intervals", type=str, default="", help="comma-separated intervals for batch eval")
-    parser.add_argument("--model-name", type=str, default="qwen-max-latest")
+    parser.add_argument("--model-name", type=str, default=AgentConfig.model_name)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--base-seed", type=int, default=666)
     parser.add_argument("--save-json", type=str, default="")

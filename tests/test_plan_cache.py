@@ -21,7 +21,7 @@ from gl_gym.agent.tools import ControlAction
 
 @dataclass
 class DummyConfig:
-    model_name: str = "qwen-max-latest"
+    model_name: str = "qwen3.7-max"
     base_url: str = "https://example.test/v1"
     temperature: float = 0.0
     max_tokens: int = 260

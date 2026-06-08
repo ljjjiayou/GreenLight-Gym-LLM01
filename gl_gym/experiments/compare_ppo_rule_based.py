@@ -497,7 +497,7 @@ def main():
     parser.add_argument("--output-report", type=str, default="gl_gym/result/i12_hybrid_mild_120_240.md", help="Output Markdown report path")
     
     # LLM 参数
-    parser.add_argument("--llm-model", type=str, default="qwen-max-latest", help="LLM model name")
+    parser.add_argument("--llm-model", type=str, default=AgentConfig.model_name, help="LLM model name")
     parser.add_argument("--llm-interval", type=int, default=12, help="Control interval steps")
     parser.add_argument("--llm-max-iterations", type=int, default=1, help="Max reasoning steps")
     parser.add_argument("--llm-max-tokens", type=int, default=260, help="Max output tokens")

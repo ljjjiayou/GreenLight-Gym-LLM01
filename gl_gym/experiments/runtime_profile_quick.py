@@ -59,7 +59,7 @@ def run_case(name: str, interval: int, max_tokens: int, max_steps: int = 60, see
     tools = create_langchain_tools(interface)
 
     cfg = AgentConfig(
-        model_name="qwen-max-latest",
+        model_name=AgentConfig.model_name,
         api_key=api_key,
         verbose=False,
         max_iterations=1,

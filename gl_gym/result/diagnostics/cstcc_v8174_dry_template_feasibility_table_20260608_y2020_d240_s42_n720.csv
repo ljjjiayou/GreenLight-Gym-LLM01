@@ -1,0 +1,8 @@
+applicable_count,dry_risk_dew_template_misfire_count,external_marker_count,feasible_count,generated_count,max_delta_violation_count,policy,score_eligible_count,template_name,ventilation_floor_violation_count
+97,0,0,97,720,0,canopy_dew_first_v1,97,conservative_canopy_dew_warmup,0
+97,0,0,97,720,0,canopy_dew_first_v1,97,conservative_dew_pulse_heat_then_vent,0
+97,0,0,97,720,0,canopy_dew_first_v1,97,conservative_dew_stabilize,0
+0,0,0,0,720,0,canopy_dew_first_v1,0,conservative_dry_low_balance,0
+11,0,0,11,720,0,canopy_dew_first_v1,11,conservative_dry_moderate_relief,0
+25,0,0,25,720,0,canopy_dew_first_v1,25,conservative_dry_vent_guard_limited,0
+48,0,720,48,720,0,canopy_dew_first_v1,0,conservative_dry_external_humidification_needed,0

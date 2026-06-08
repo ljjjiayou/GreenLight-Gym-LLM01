@@ -1,0 +1,10 @@
+active_family_count,assigned_primary_family_by_combo,conflict_type_distribution,is_mixed_risk,priority_reason_distribution,resolved_family_distribution,risk_combo_id,row_count
+2,"{""canopy_dew_lt0"": 6}","{""dew_vs_canopy_dew"": 6}",True,"{""severe_canopy_dew_lt0_priority"": 6}","{""canopy_dew_lt0"": 6}",canopy_dew_lt0+dew_or_humidity,6
+3,"{""canopy_dew_lt0"": 8}","{""multi_3plus"": 8}",True,"{""severe_canopy_dew_lt0_priority"": 8}","{""canopy_dew_lt0"": 8}",canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,8
+2,"{""canopy_dew_lt1"": 32}","{""dew_vs_canopy_dew"": 32}",True,"{""moderate_canopy_dew_lt1_priority"": 32}","{""canopy_dew_lt1"": 32}",canopy_dew_lt1+dew_or_humidity,32
+3,"{""canopy_dew_lt1"": 3}","{""multi_3plus"": 3}",True,"{""moderate_canopy_dew_lt1_priority"": 3}","{""canopy_dew_lt1"": 3}",canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,3
+1,"{""dew_or_humidity"": 40}","{""single_risk"": 40}",False,"{""dew_or_humidity_priority"": 40}","{""dew_or_humidity"": 40}",dew_or_humidity,40
+1,"{""dry_or_high_vpd"": 8}","{""single_risk"": 8}",False,"{""dry_or_high_vpd_priority"": 8}","{""dry_or_high_vpd"": 8}",dry_or_high_vpd,8
+4,"{""dry_vent"": 4}","{""multi_3plus"": 4}",True,"{""severe_canopy_dew_lt0_priority"": 4}","{""canopy_dew_lt0"": 4}",dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,4
+4,"{""dry_vent"": 4}","{""multi_3plus"": 4}",True,"{""dry_vent_high_vpd_or_strong_ventilation_priority"": 4}","{""dry_vent"": 4}",dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,4
+2,"{""dry_vent"": 21}","{""single_risk"": 21}",True,"{""dry_vent_high_vpd_or_strong_ventilation_priority"": 21}","{""dry_vent"": 21}",dry_vent+dry_or_high_vpd,21

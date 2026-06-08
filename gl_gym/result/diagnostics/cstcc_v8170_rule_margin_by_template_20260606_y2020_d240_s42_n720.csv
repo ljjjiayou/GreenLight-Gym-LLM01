@@ -1,0 +1,4 @@
+count,max_rule_margin,mean_rule_margin,rule_best_template_name
+101,0.05783333255106582,0.029627084778548533,co2_vent_conflict_reduce
+594,0.12402166151255356,0.021163579830539587,hold_all
+25,0.07170833295896761,0.06643657638474859,ventilation_ramp_limited

@@ -1,0 +1,5 @@
+applicable_count,dry_risk_dew_template_misfire_count,feasible_count,generated_count,max_delta_violation_count,over_ventilation_candidate_count,policy,template_name
+97,0,97,720,0,0,canopy_dew_first_v1,conservative_dew_stabilize
+97,0,97,720,0,0,canopy_dew_first_v1,conservative_canopy_dew_warmup
+97,0,97,720,0,0,canopy_dew_first_v1,conservative_dew_pulse_heat_then_vent
+48,0,48,720,0,0,canopy_dew_first_v1,conservative_dry_vent_guard

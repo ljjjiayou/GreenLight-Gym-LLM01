@@ -86,7 +86,7 @@ def main():
     
     # 3. 配置智能体
     agent_config = AgentConfig(
-        model_name="qwen-max-latest", 
+        model_name=AgentConfig.model_name, 
         verbose=True,           
         max_iterations=2,
         max_tokens=260,

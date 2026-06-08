@@ -10,12 +10,24 @@ LangChain Agent 核心模块
 固定使用百炼平台 qwen-plus 模型。
 """
 
-from typing import Any, Dict, List, Optional, Callable, Tuple
+from typing import Any, Dict, List, Optional, Callable, Tuple, Mapping, Sequence
 from dataclasses import dataclass, field
 from collections import deque
 import json
 import time
+from pathlib import Path
 import numpy as np
+
+from gl_gym.cstcc.audit_writer import (
+    append_jsonl,
+    compact_audit_record,
+    compact_failure_record,
+    default_audit_jsonl_path,
+    should_sample_step,
+)
+from gl_gym.cstcc.config import load_config as load_cstcc_config
+from gl_gym.cstcc.contracts import ACTION_FIELDS as CSTCC_ACTION_FIELDS, SemanticSuggestion
+from gl_gym.cstcc.runtime_shadow import safe_run_cstcc_shadow_step, verify_final_action_invariant
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
@@ -24,13 +36,18 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from gl_gym.environments.baseline import RuleBasedController
 from gl_gym.common.utils import load_model_hyperparams, calculate_vpd_kpa
-from gl_gym.agent.expert_distillation import DistilledExpertPolicy
+from gl_gym.agent.expert_distillation import ACTION_NAMES, DistilledExpertPolicy
 from gl_gym.agent.humidity_experience_memory import HumidityExperienceConfig, HumidityExperienceMemory
 from gl_gym.agent.plan_intent import (
     action_record_for_labeling,
     infer_plan_intent,
     intent_to_dehumidify_mode,
     strategy_intent_alignment,
+)
+from gl_gym.agent.intent_contract import intent_contract_from_setpoint_plan
+from gl_gym.agent.profile_generator import (
+    build_profile_generator_shadow_payload,
+    score_profile_candidate_payloads,
 )
 from gl_gym.agent.plan_cache import (
     PlanCache,
@@ -41,6 +58,10 @@ from gl_gym.agent.plan_cache import (
     to_jsonable,
 )
 from gl_gym.agent.ppo_strategy_labeler import label_strategy
+from gl_gym.agent.structured_anchor import parse_structured_anchor
+from gl_gym.agent.structured_anchor_profile_bridge import (
+    build_structured_anchor_profile_bridge_shadow_payload,
+)
 from gl_gym.agent.tools import ControlAction
 from gl_gym.agent.tools import create_langchain_tools, GreenhouseTools # 导入 Tools 类
 
@@ -82,11 +103,11 @@ class AgentConfig:
     """
     智能体配置类
     
-    固定使用百炼平台 qwen-max-latest 模型，参数经过优化以适应温室控制任务。
+    固定使用百炼平台 qwen3.7-max 模型，参数经过优化以适应温室控制任务。
     """
     
     # 模型相关配置
-    model_name: str = "qwen-max-latest"               # 使用的模型名称
+    model_name: str = "qwen3.7-max"                   # 使用的模型名称
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # 百炼地址
     api_key: Optional[str] = None                # API 密钥
     temperature: float = 0.0                      # 随机性控制 (最小随机性，提升控制稳定性)
@@ -102,6 +123,23 @@ class AgentConfig:
     plan_cache_path: str = "gl_gym/result/plan_cache/llm_plan_cache.json"
     plan_cache_strict: bool = False
     plan_cache_key_policy: str = "prompt"          # prompt | scenario_timestep
+    strict_replay_suppress_uncached_emergency_replans: bool = True
+
+    # Structured planning-anchor migration is default-off and shadow-only. It
+    # parses intent/target/risk anchors without changing final control.
+    structured_anchor_parser_enabled: bool = False
+    structured_anchor_shadow_only: bool = True
+    structured_anchor_required_fields: str = (
+        "profile_intent,target_temp,target_co2,target_rh,"
+        "risk_flags,forbidden_intents,planning_horizon_steps,confidence"
+    )
+    structured_anchor_compact_json_prompt_enabled: bool = False
+    structured_anchor_retry_invalid_or_empty_enabled: bool = False
+    structured_anchor_retry_max_attempts: int = 1
+    structured_anchor_list_max_items: int = 3
+    structured_anchor_profile_bridge_enabled: bool = False
+    structured_anchor_profile_bridge_shadow_only: bool = True
+    structured_anchor_profile_bridge_record_provenance: bool = True
     
     # 控制频率配置 (新增)
     control_interval: int = 12                     # LLM 控制间隔步数
@@ -121,6 +159,9 @@ class AgentConfig:
     fallback_candidate_scoring: bool = True       # 使用多候选安全评分选择 fallback
     fallback_temp_penalty_weight: float = 1.2
     fallback_rh_penalty_weight: float = 1.6
+    fallback_dry_penalty_weight: float = 1.20
+    fallback_vpd_high_penalty_weight: float = 1.00
+    fallback_dew_penalty_weight: float = 0.65
     fallback_cost_penalty_weight: float = 0.45
     fallback_smooth_penalty_weight: float = 0.20
     fallback_conflict_penalty_weight: float = 0.75
@@ -129,6 +170,24 @@ class AgentConfig:
     rollout_candidate_sharing: bool = True
     rollout_rule_weight_start: float = 0.25
     rollout_rule_weight_end: float = 0.55
+    rspc_hot_dry_candidates_enabled: bool = False
+    rspc_hot_dry_require_tomato_v2: bool = True
+    rspc_hot_dry_temp_threshold: float = 28.5
+    rspc_hot_dry_rad_threshold: float = 300.0
+    rspc_hot_dry_rh_threshold: float = 60.0
+    rspc_hot_dry_vpd_threshold: float = 1.55
+    rspc_hot_dry_vent_relief_floor: float = 0.42
+    rspc_hot_dry_hot_vent_relief_floor: float = 0.68
+    rspc_hot_dry_score_weight: float = 1.35
+    rspc_hot_dry_proposer_control_enabled: bool = False
+    rspc_hot_dry_proposer_control_min_margin: float = 0.05
+    rspc_hot_dry_proposer_control_strict_enabled: bool = False
+    rspc_hot_dry_proposer_control_strict_min_margin: float = 0.20
+    rspc_hot_dry_proposer_control_strict_rh_max: float = 45.0
+    rspc_hot_dry_proposer_control_strict_vpd_min: float = 2.25
+    rspc_hot_dry_proposer_control_strict_temp_max: float = 30.5
+    rspc_hot_dry_proposer_control_strict_canopy_margin_min: float = 3.0
+    rspc_hot_dry_proposer_control_strict_candidate: str = "shadow_hot_dry_humidity_retention"
     expert_rollout_enabled: bool = False
     expert_policy_path: str = "train_data/AgriControl/ppo/deterministic/distilled_expert/llm_rspc_expert_ridge.npz"
     expert_candidate_max_distance: float = 0.0
@@ -198,7 +257,145 @@ class AgentConfig:
     tomato_safety_v2_low_temp_threshold: float = 15.5
     tomato_safety_v2_extreme_dew_rh: float = 94.0
     tomato_safety_v2_extreme_dew_margin: float = 0.40
+    tomato_safety_v2_canopy_dew_guard_margin: float = 1.00
+    tomato_safety_v2_canopy_dew_guard_rh: float = 61.0
+    tomato_safety_v2_canopy_dew_screen_cap: float = 0.35
+    tomato_safety_v2_canopy_dew_vent_floor: float = 0.42
+    tomato_safety_v2_canopy_dew_shade_floor: float = 0.50
+    tomato_safety_v2_canopy_dew_temperate_temp_cap: float = 26.5
+    tomato_safety_v2_canopy_dew_temperate_vpd_cap: float = 1.25
+    tomato_safety_v2_canopy_dew_temperate_air_margin: float = 4.0
+    tomato_safety_v2_canopy_dew_temperate_rad: float = 550.0
+    tomato_safety_v2_canopy_dew_temperate_screen_cap: float = 0.75
+    tomato_safety_v2_canopy_dew_temperate_vent_floor: float = 0.20
+    tomato_safety_v2_canopy_dew_preempt_margin: float = 2.00
+    tomato_safety_v2_canopy_dew_preempt_rh: float = 61.0
+    tomato_safety_v2_canopy_dew_preempt_air_margin: float = 3.0
+    tomato_safety_v2_canopy_dew_preempt_temp_min: float = 20.0
+    tomato_safety_v2_canopy_dew_preempt_temp_cap: float = 26.5
+    tomato_safety_v2_canopy_dew_preempt_rad: float = 300.0
+    tomato_safety_v2_canopy_dew_preempt_screen_cap: float = 0.75
+    tomato_safety_v2_canopy_dew_preempt_vent_floor: float = 0.18
+    tomato_safety_v2_canopy_dew_preempt_vent_cap: float = 0.24
+    tomato_safety_v2_canopy_dew_preempt_shade_temp_cap: float = 24.5
+    tomato_safety_v2_canopy_dew_preempt_shade_cap: float = 0.35
+    tomato_safety_v2_canopy_dew_buffer_margin: float = 2.00
+    tomato_safety_v2_canopy_dew_buffer_min_margin: float = 0.50
+    tomato_safety_v2_canopy_dew_buffer_rh: float = 56.5
+    tomato_safety_v2_canopy_dew_buffer_temp: float = 24.0
+    tomato_safety_v2_canopy_dew_buffer_rad: float = 300.0
+    tomato_safety_v2_canopy_dew_buffer_screen_cap: float = 0.60
+    tomato_safety_v2_canopy_dew_buffer_vent_floor: float = 0.42
+    tomato_safety_v2_canopy_dew_buffer_shade_floor: float = 0.50
+    tomato_safety_v2_canopy_dew_buffer_shade_cap: float = 0.50
+    tomato_safety_v2_hot_temp_threshold: float = 32.0
+    tomato_safety_v2_hot_preempt_temp_threshold: float = 31.0
+    tomato_safety_v2_hot_rad_threshold: float = 600.0
+    tomato_safety_v2_hot_rapid_rise_threshold: float = 0.50
+    tomato_safety_v2_hot_rapid_rise_temp_threshold: float = 30.5
+    tomato_safety_v2_hot_hold_temp_threshold: float = 29.0
+    tomato_safety_v2_hot_hold_rad_threshold: float = 350.0
+    tomato_safety_v2_hot_screen_floor: float = 0.00
+    tomato_safety_v2_hot_screen_cap: float = 0.35
+    tomato_safety_v2_hot_vent_floor: float = 0.85
+    tomato_safety_v2_extreme_hot_vent_temp_threshold: float = 35.0
+    tomato_safety_v2_extreme_hot_vent_floor: float = 0.95
+    tomato_safety_v2_hot_shade_floor: float = 0.80
+    tomato_safety_v2_hot_shade_cap: float = 0.90
+    tomato_safety_v2_hot_dry_override_vent_floor: float = 0.90
+    tomato_safety_v2_near_hot_dry_vent_floor: float = 0.85
+    tomato_safety_v2_hot_hold_dry_vent_floor: float = 0.72
+    tomato_safety_v2_soft_hot_dry_screen_floor: float = 0.35
+    tomato_safety_v2_soft_hot_dry_screen_cap: float = 0.60
+    tomato_safety_v2_hot_dry_override_shade_floor: float = 0.85
+    tomato_safety_v2_hot_dry_override_shade_cap: float = 0.85
+    tomato_safety_v2_hot_dry_solver_screen_floor: float = 0.35
+    tomato_safety_v2_hot_dry_solver_temp_threshold: float = 34.0
+    tomato_safety_v2_hot_dry_solver_vpd_threshold: float = 2.80
+    tomato_safety_v2_hot_dry_solver_rh_threshold: float = 45.0
+    tomato_safety_v2_hot_dry_extreme_solver_vpd_threshold: float = 3.05
+    tomato_safety_v2_hot_dry_extreme_solver_rh_threshold: float = 43.5
+    tomato_safety_v2_hot_dry_extreme_solver_vent_floor: float = 0.95
+    tomato_safety_v2_hot_dry_extreme_solver_shade: float = 0.75
+    tomato_safety_v2_extreme_hot_dry_vpd_threshold: float = 3.20
+    tomato_safety_v2_extreme_hot_dry_rh_threshold: float = 38.0
+    tomato_safety_v2_extreme_hot_dry_screen_floor: float = 0.90
+    tomato_safety_v2_extreme_hot_dry_screen_cap: float = 1.00
+    tomato_safety_v2_extreme_hot_dry_vent_floor: float = 0.95
+    tomato_safety_v2_extreme_hot_dry_shade_floor: float = 0.50
+    tomato_safety_v2_extreme_hot_dry_shade_cap: float = 0.50
+    tomato_safety_v2_extreme_hot_dry_hold_temp_threshold: float = 36.0
+    tomato_safety_v2_extreme_hot_dry_hold_vpd_threshold: float = 2.80
+    tomato_safety_v2_hot_dry_rad_relief_threshold: float = 350.0
+    tomato_safety_v2_hot_dry_recovery_rh: float = 55.0
+    tomato_safety_v2_hot_dry_screen_cap: float = 0.75
+    tomato_safety_v2_hot_dry_screen_floor: float = 0.45
+    tomato_safety_v2_hot_dry_shade_floor: float = 0.50
+    tomato_safety_v2_severe_dry_screen_temp_cap: float = 27.0
+    tomato_safety_v2_severe_dry_canopy_reserve_margin: float = 4.0
+    tomato_safety_v2_severe_dry_canopy_reserve_rad: float = 600.0
+    tomato_safety_v2_severe_dry_canopy_reserve_screen_floor: float = 0.70
+    tomato_safety_v2_severe_dry_canopy_reserve_screen_cap: float = 0.82
+    tomato_safety_v2_severe_dry_canopy_reserve_shade: float = 0.50
+    tomato_safety_v2_pre_hot_dry_temp_threshold: float = 28.5
+    tomato_safety_v2_pre_hot_dry_vent_floor: float = 0.60
+    tomato_safety_v2_pre_hot_dry_warm_vent_temp: float = 29.0
+    tomato_safety_v2_pre_hot_dry_warm_vent_floor: float = 0.60
+    tomato_safety_v2_pre_hot_dry_hot_vent_temp: float = 30.5
+    tomato_safety_v2_pre_hot_dry_hot_vent_floor: float = 0.72
+    tomato_safety_v2_pre_hot_dry_vent_cap: float = 0.82
+    tomato_safety_v2_pre_hot_dry_rapid_vent_cap: float = 0.82
+    tomato_safety_v2_pre_hot_dry_screen_floor: float = 0.70
+    tomato_safety_v2_pre_hot_dry_screen_cap: float = 0.82
+    tomato_safety_v2_pre_hot_dry_shade_floor: float = 0.88
+    tomato_safety_v2_pre_hot_dry_shade_cap: float = 0.92
+    tomato_safety_v2_cooldown_dry_temp_threshold: float = 30.5
+    tomato_safety_v2_cooldown_dry_vent_cap: float = 0.28
+    tomato_safety_v2_cooldown_dry_screen_floor: float = 0.82
+    tomato_safety_v2_cooldown_dry_screen_cap: float = 0.85
+    tomato_safety_v2_cooldown_dry_shade_floor: float = 0.45
+    tomato_safety_v2_cooldown_canopy_reserve_margin: float = 3.0
+    tomato_safety_v2_cooldown_canopy_reserve_rad: float = 650.0
+    tomato_safety_v2_cooldown_canopy_reserve_rh: float = 58.0
+    tomato_safety_v2_cooldown_canopy_reserve_vpd_cap: float = 1.65
+    tomato_safety_v2_cooldown_canopy_reserve_screen_cap: float = 0.60
+    tomato_safety_v2_cooldown_canopy_reserve_vent_floor: float = 0.42
+    tomato_safety_v2_cooldown_canopy_reserve_shade: float = 0.50
+    tomato_safety_v2_warm_hard_dry_screen_floor: float = 0.75
+    tomato_safety_v2_warm_hard_dry_screen_temp_cap: float = 25.5
+    tomato_safety_v2_warm_hard_dry_screen_rad_threshold: float = 350.0
     tomato_safety_v2_suppress_replay_emergency_replans: bool = True
+
+    # v43 opt-in transition gate. Defaults preserve the ordinary llm_rspc_v2 path.
+    transition_gate_enabled: bool = False
+    transition_gate_soft_limit_path: str = ""
+    transition_gate_reversal_window_steps: int = 6
+    transition_gate_hard_safety_bypass: bool = True
+    profile_feasibility_gate_enabled: bool = False
+    profile_feasibility_gate_hard_safety_veto: bool = True
+    profile_template_patch_enabled: bool = False
+    fallback_post_selection_veto_enabled: bool = False
+    profile_template_patch_record_provenance: bool = True
+    recovery_anchor_enabled: bool = False
+    recovery_anchor_source: str = "tomato_safety_projected_anchor"
+    recovery_anchor_record_provenance: bool = True
+    profile_action_candidate_shadow_enabled: bool = False
+    profile_action_candidate_shadow_record_provenance: bool = True
+    profile_action_candidate_shadow_max_candidates: int = 5
+    profile_action_envelope_shadow_enabled: bool = False
+    profile_action_envelope_shadow_record_provenance: bool = True
+    profile_action_envelope_shadow_max_candidates: int = 5
+    cstcc_shadow_enabled: bool = False
+    cstcc_shadow_version: str = "v81"
+    cstcc_shadow_audit_log_root: str = "logs/cstcc_shadow"
+    cstcc_shadow_sample_rate: float = 1.0
+    cstcc_shadow_save_full_candidates: bool = False
+    cstcc_shadow_save_raw_sequences: bool = False
+    cstcc_shadow_save_projected_sequences: bool = False
+    cstcc_shadow_fail_closed: bool = False
+    cstcc_shadow_assert_final_action_invariant: bool = True
+    cstcc_shadow_history_steps: int = 60
+    cstcc_shadow_config_path: Optional[str] = None
 
     # Profit-v2: 电费与湿度联动约束
     lamp_daily_budget: float = 3.0                # 每个 day_of_year 的累计补光预算（控制量积分）
@@ -330,11 +527,296 @@ def control_to_action_command(env, target_control: np.ndarray) -> np.ndarray:
     return np.clip(action_cmd, -1.0, 1.0).astype(np.float32)
 
 
+CONTROL_TERM_NAMES = ("heating", "co2", "screen", "ventilation", "lighting", "shading")
+
+
+def _pg_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return float(default)
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return float(default)
+        return numeric
+    except Exception:
+        return float(default)
+
+
+def _pg_state_float(state: Any, name: str, default: float = 0.0) -> float:
+    return _pg_float(getattr(state, name, default), default)
+
+
+def _runtime_control_terms(control: Sequence[float] | np.ndarray) -> Dict[str, float]:
+    array = np.asarray(control, dtype=np.float32).reshape(-1)
+    return {
+        name: float(array[idx]) if idx < int(array.size) else 0.0
+        for idx, name in enumerate(CONTROL_TERM_NAMES)
+    }
+
+
+def _runtime_delta_terms(
+    pre_rule_action: Sequence[float] | np.ndarray,
+    post_rule_action: Sequence[float] | np.ndarray,
+) -> Dict[str, float]:
+    before = np.asarray(pre_rule_action, dtype=np.float32).reshape(-1)
+    after = np.asarray(post_rule_action, dtype=np.float32).reshape(-1)
+    size = max(int(before.size), int(after.size), len(CONTROL_TERM_NAMES))
+    padded_before = np.zeros(size, dtype=np.float32)
+    padded_after = np.zeros(size, dtype=np.float32)
+    padded_before[: int(before.size)] = before
+    padded_after[: int(after.size)] = after
+    delta = padded_after - padded_before
+    return {name: float(delta[idx]) for idx, name in enumerate(CONTROL_TERM_NAMES)}
+
+
+def _post_guardrail_runtime_input_features(state: Any) -> Dict[str, float]:
+    temp_air = _pg_state_float(state, "temp_air", 20.0)
+    rh_air = _pg_state_float(state, "rh_air", 70.0)
+    vpd = float(calculate_vpd_kpa(temp_air, rh_air))
+    dew_margin_air = _pg_state_float(state, "dew_margin_air", 3.0)
+    canopy_margin = _pg_state_float(state, "canopy_dew_margin", dew_margin_air)
+    glob_rad = _pg_state_float(state, "glob_rad", 0.0)
+    return {
+        "timestep": _pg_state_float(state, "timestep", 0.0),
+        "temp_air": temp_air,
+        "rh_air": rh_air,
+        "vpd_air": vpd,
+        "dew_margin_air": dew_margin_air,
+        "canopy_dew_margin": canopy_margin,
+        "combined_dew_margin": min(dew_margin_air, canopy_margin),
+        "glob_rad": glob_rad,
+        "hour_of_day": _pg_state_float(state, "hour_of_day", 12.0),
+        "temp_out": _pg_state_float(state, "temp_out", temp_air),
+        "wind_speed": _pg_state_float(state, "wind_speed", 0.0),
+        "forecast_rad_mean_1h": _pg_state_float(state, "forecast_rad_mean_1h", glob_rad),
+        "forecast_rad_peak_2h": _pg_state_float(state, "forecast_rad_peak_2h", glob_rad),
+    }
+
+
+def _safe_rule_slug(text: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in text).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug[:80] or "unknown"
+
+
+def _runtime_rule_from_rewrite(
+    *,
+    state: Any,
+    hook_id: str,
+    pre_rule_action: Sequence[float] | np.ndarray,
+    post_rule_action: Sequence[float] | np.ndarray,
+    info: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    info = dict(info or {})
+    explicit_rule_id = str(info.get("rule_id", "") or "")
+    explicit_family = str(info.get("rule_family", "") or "")
+    explicit_reason = str(info.get("rule_reason", "") or "")
+    if explicit_rule_id and explicit_family and explicit_reason:
+        return {
+            "rule_id": explicit_rule_id,
+            "rule_family": explicit_family,
+            "rule_priority": int(_pg_float(info.get("rule_priority", 50), 50)),
+            "rule_reason": explicit_reason,
+            "expected_safety_benefit": str(info.get("expected_safety_benefit", "") or "runtime rule documented benefit"),
+            "rule_assumed_tradeoff": str(info.get("rule_assumed_tradeoff", "") or "documented by runtime hook"),
+            "reason_missing": False,
+        }
+
+    delta = _runtime_delta_terms(pre_rule_action, post_rule_action)
+    before = _runtime_control_terms(pre_rule_action)
+    features = _post_guardrail_runtime_input_features(state)
+    hook = str(hook_id)
+    if hook == "tomato_safety_v2_wrapper":
+        reasons = info.get("reasons", [])
+        if isinstance(reasons, Sequence) and not isinstance(reasons, (str, bytes)) and reasons:
+            reason_text = "; ".join(str(reason) for reason in reasons if str(reason))
+            first = str(reasons[0])
+            return {
+                "rule_id": f"tomato_safety_v2_{_safe_rule_slug(first)}",
+                "rule_family": "tomato_safety_v2",
+                "rule_priority": 80,
+                "rule_reason": reason_text,
+                "expected_safety_benefit": "tomato safety v2 post-guardrail risk reduction",
+                "rule_assumed_tradeoff": "may reshape vent, screen, heat, shade, co2, or lighting",
+                "reason_missing": False,
+            }
+        return {
+            "rule_id": "unknown_post_guardrail_rewrite",
+            "rule_family": "tomato_safety_v2_unknown",
+            "rule_priority": 80,
+            "rule_reason": "missing_runtime_reason_blocker",
+            "expected_safety_benefit": "unknown because runtime reason is missing",
+            "rule_assumed_tradeoff": "unknown because runtime reason is missing",
+            "reason_missing": True,
+        }
+
+    if hook == "humidity_memory_final_shape":
+        reason = str(info.get("reason", "") or "")
+        if not reason and bool(info.get("applied", False)):
+            reason = "humidity_memory_post_guardrail_shape_applied"
+        if reason:
+            return {
+                "rule_id": f"humidity_memory_{_safe_rule_slug(reason)}",
+                "rule_family": "humidity_memory_final_shape",
+                "rule_priority": 60,
+                "rule_reason": reason,
+                "expected_safety_benefit": "humidity-memory final shaping tradeoff recorded in metadata",
+                "rule_assumed_tradeoff": "may alter screen, ventilation, heat, lighting, or co2",
+                "reason_missing": False,
+            }
+
+    if hook == "dry_recovery_override":
+        vent_cap = info.get("vent_cap")
+        hot_dry = bool(info.get("hot_dry_vent_relief", False))
+        return {
+            "rule_id": "rspc_post_score_dry_recovery_vent_cap",
+            "rule_family": "rspc_post_score_dry_recovery",
+            "rule_priority": 70,
+            "rule_reason": (
+                f"dry_side_risk caps ventilation at {float(vent_cap):.3f}"
+                if vent_cap is not None
+                else "dry_side_risk caps ventilation"
+            ),
+            "expected_safety_benefit": "reduce excessive dry-side ventilation and preserve humidity",
+            "rule_assumed_tradeoff": (
+                "hot-dry relief floor active" if hot_dry else "may reduce ventilation near canopy/dew boundary"
+            ),
+            "reason_missing": False,
+        }
+
+    if hook == "apply_safety_guardrails" and float(delta.get("ventilation", 0.0)) < -1e-6:
+        temp_air = features["temp_air"]
+        rh_air = features["rh_air"]
+        vpd = features["vpd_air"]
+        wind = features["wind_speed"]
+        temp_out = features["temp_out"]
+        if vpd > 1.2 and temp_air < 32.0:
+            return {
+                "rule_id": "apply_safety_guardrails_dry_vpd_vent_cap",
+                "rule_family": "apply_safety_guardrails_dry_vpd",
+                "rule_priority": 70,
+                "rule_reason": "dry-side VPD/RH guard capped ventilation",
+                "expected_safety_benefit": "avoid worsening low RH or high VPD",
+                "rule_assumed_tradeoff": "may reduce air exchange near canopy/dew risk",
+                "reason_missing": False,
+            }
+        if vpd >= 0.4 and before.get("heating", 0.0) > 0.1 and before.get("ventilation", 0.0) > 0.1:
+            cold = temp_air < 16.0
+            return {
+                "rule_id": (
+                    "apply_safety_guardrails_heat_vent_conflict_cold_close_vent"
+                    if cold
+                    else "apply_safety_guardrails_heat_vent_conflict_limit_vent"
+                ),
+                "rule_family": "apply_safety_guardrails_heat_vent_conflict",
+                "rule_priority": 65,
+                "rule_reason": "heat and ventilation conflict guard reduced ventilation",
+                "expected_safety_benefit": "avoid simultaneous heating and ventilation waste",
+                "rule_assumed_tradeoff": "may reduce ventilation during dry/canopy-risk regimes",
+                "reason_missing": False,
+            }
+        if wind > 8.0 or (wind > 6.0 and temp_out < temp_air):
+            return {
+                "rule_id": "apply_safety_guardrails_wind_cap",
+                "rule_family": "apply_safety_guardrails_wind",
+                "rule_priority": 75,
+                "rule_reason": "wind safety cap reduced ventilation",
+                "expected_safety_benefit": "avoid unsafe vent opening under wind stress",
+                "rule_assumed_tradeoff": "may conflict with humidity or dry-risk relief",
+                "reason_missing": False,
+            }
+        if rh_air <= 55.0 or vpd >= 1.2 or temp_air < 15.5:
+            return {
+                "rule_id": "apply_safety_guardrails_dry_side_or_cold_buffer_vent_cap",
+                "rule_family": "apply_safety_guardrails_dry_or_cold_buffer",
+                "rule_priority": 55,
+                "rule_reason": "dry-side or cold-buffer guard reduced ventilation",
+                "expected_safety_benefit": "avoid dry-side or cold-buffer regression",
+                "rule_assumed_tradeoff": "may reduce air exchange near canopy/dew boundary",
+                "reason_missing": False,
+            }
+
+    if hook == "apply_safety_guardrails":
+        return {
+            "rule_id": "apply_safety_guardrails_general_rewrite",
+            "rule_family": "apply_safety_guardrails_general",
+            "rule_priority": 50,
+            "rule_reason": "generic safety guardrail changed final action",
+            "expected_safety_benefit": "generic hard-boundary and resource guard",
+            "rule_assumed_tradeoff": "depends on changed actuator",
+            "reason_missing": False,
+        }
+
+    return {
+        "rule_id": "unknown_post_guardrail_rewrite",
+        "rule_family": f"{hook}_unknown",
+        "rule_priority": int(_pg_float(info.get("rule_priority", 0), 0)),
+        "rule_reason": "missing_runtime_reason_blocker",
+        "expected_safety_benefit": "unknown because runtime reason is missing",
+        "rule_assumed_tradeoff": "unknown because runtime reason is missing",
+        "reason_missing": True,
+    }
+
+
+def build_post_guardrail_runtime_provenance_record(
+    *,
+    state: Any,
+    hook_id: str,
+    source_function: str,
+    pre_rule_action: Sequence[float] | np.ndarray,
+    post_rule_action: Sequence[float] | np.ndarray,
+    info: Optional[Mapping[str, Any]] = None,
+    epsilon: float = 1e-6,
+) -> Optional[Dict[str, Any]]:
+    before = np.asarray(pre_rule_action, dtype=np.float32).copy()
+    after = np.asarray(post_rule_action, dtype=np.float32).copy()
+    if before.shape != after.shape:
+        size = max(int(before.size), int(after.size))
+        padded_before = np.zeros(size, dtype=np.float32)
+        padded_after = np.zeros(size, dtype=np.float32)
+        padded_before[: int(before.size)] = before.reshape(-1)
+        padded_after[: int(after.size)] = after.reshape(-1)
+        before = padded_before
+        after = padded_after
+    if not bool(np.any(np.abs(after - before) > float(epsilon))):
+        return None
+    rule = _runtime_rule_from_rewrite(
+        state=state,
+        hook_id=str(hook_id),
+        pre_rule_action=before,
+        post_rule_action=after,
+        info=info,
+    )
+    return {
+        "schema_version": "post_guardrail_runtime_provenance_v1",
+        "shadow_only": True,
+        "metadata_only": True,
+        "control_action_changed_by_metadata": False,
+        "hook_id": str(hook_id),
+        "rule_id": str(rule.get("rule_id", "")),
+        "rule_family": str(rule.get("rule_family", "")),
+        "rule_priority": int(_pg_float(rule.get("rule_priority", 0), 0)),
+        "rule_reason": str(rule.get("rule_reason", "")),
+        "source_function": str(source_function),
+        "pre_rule_action": _runtime_control_terms(before),
+        "post_rule_action": _runtime_control_terms(after),
+        "delta_action": _runtime_delta_terms(before, after),
+        "input_features": _post_guardrail_runtime_input_features(state),
+        "expected_safety_benefit": str(rule.get("expected_safety_benefit", "")),
+        "rule_assumed_tradeoff": str(rule.get("rule_assumed_tradeoff", "")),
+        "reason_missing": bool(rule.get("reason_missing", False)),
+    }
+
+
 def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
     guarded = np.asarray(target_control, dtype=np.float32).copy()
     temp_air = float(getattr(state, "temp_air", 20.0))
     rh_air = float(getattr(state, "rh_air", 70.0))
     glob_rad = float(getattr(state, "glob_rad", 0.0))
+    forecast_rad_mean = _first_finite_state_attr(state, ["forecast_rad_mean_1h"], glob_rad)
+    forecast_rad_peak = _first_finite_state_attr(state, ["forecast_rad_peak_2h"], glob_rad)
+    rad_heat_load = max(glob_rad, forecast_rad_mean, forecast_rad_peak)
     hour_of_day = float(getattr(state, "hour_of_day", 12.0))
     temp_out = float(getattr(state, "temp_out", temp_air))
     wind_speed = float(getattr(state, "wind_speed", 0.0))
@@ -351,6 +833,36 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         or (rh_air >= 78.0 and vpd < 0.22)
     )
     humidity_risk = rh_air > 85.0 or low_vpd_humidity_risk or dew_margin < 0.6
+    extreme_dew_risk = rh_air >= 94.0 or dew_margin < 0.4
+    hot_dry_preemptive = (
+        not extreme_dew_risk
+        and temp_air >= 29.0
+        and rad_heat_load >= 600.0
+        and (rh_air < 55.0 or vpd > 1.60)
+    )
+    hot_dry_solver_sensitive = (
+        not extreme_dew_risk
+        and temp_air < 35.0
+        and rad_heat_load >= 650.0
+        and (rh_air <= 52.0 or vpd >= 2.30)
+        and temp_out >= 24.0
+    )
+    hot_dry_ultra_solver_sensitive = (
+        hot_dry_solver_sensitive
+        and temp_air >= 34.0
+        and (vpd >= 2.80 or rh_air <= 45.0)
+    )
+    hot_dry_extreme_solver_sensitive = (
+        hot_dry_ultra_solver_sensitive
+        and (vpd >= 3.00 or rh_air <= 43.5)
+    )
+    hot_dry_raw_extreme_solver_sensitive = (
+        not extreme_dew_risk
+        and temp_air >= 33.0
+        and rad_heat_load >= 600.0
+        and temp_out >= 24.0
+        and (vpd >= 3.20 or rh_air <= 38.5)
+    )
     print(f"[Guard] T={temp_air:.1f}, RH={rh_air:.1f}, VPD={vpd:.2f} kPa, Fruit={fruit_weight:.2f}")
 
     # --- 幼苗期铁律（硬约束） ---
@@ -418,14 +930,47 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
     if high_temp_override:
         guarded[0] = 0.0
         guarded[1] = 0.0
-        guarded[2] = min(guarded[2], 0.20)
+        if hot_dry_ultra_solver_sensitive:
+            guarded[2] = min(max(guarded[2], 0.35), 0.35)
+        else:
+            guarded[2] = min(guarded[2], 0.05)
         guarded[4] = 0.0
         vent_target = 0.75 if temp_air < 35.0 else 0.90
         if temp_out < temp_air - 1.0:
             vent_target = max(vent_target, 0.95)
+        if hot_dry_extreme_solver_sensitive:
+            vent_target = max(vent_target, 0.95)
+        elif hot_dry_solver_sensitive:
+            vent_target = min(max(vent_target, 0.90), 0.90)
         guarded[3] = max(guarded[3], vent_target)
         if glob_rad > 200.0:
-            guarded[5] = max(guarded[5], 0.85)
+            if hot_dry_extreme_solver_sensitive:
+                guarded[5] = min(max(guarded[5], 0.75), 0.75)
+            elif hot_dry_solver_sensitive:
+                guarded[5] = min(max(guarded[5], 0.85), 0.85)
+            else:
+                guarded[5] = max(guarded[5], 0.85)
+        if hot_dry_raw_extreme_solver_sensitive:
+            # CVODES becomes sensitive in very dry, high-radiation heat loads;
+            # mirror the opt-in tomato v2 stability fallback without fully
+            # closing the screen or dropping shade to zero.
+            guarded[2] = min(max(guarded[2], 0.90), 1.00)
+            guarded[3] = max(guarded[3], 0.95)
+            guarded[5] = min(max(guarded[5], 0.50), 0.50)
+    elif hot_dry_preemptive:
+        guarded[0] = 0.0
+        guarded[1] = 0.0
+        guarded[4] = 0.0
+        vent_floor = 0.62
+        if temp_air >= 30.5 or rad_heat_load >= 650.0:
+            vent_floor = max(vent_floor, 0.72)
+        if temp_air >= 31.5 or rad_heat_load >= 750.0:
+            vent_floor = max(vent_floor, 0.85)
+        guarded[3] = min(max(guarded[3], vent_floor), 0.85)
+        screen_floor = 0.55 if (rh_air < 50.0 or vpd > 2.0) else 0.45
+        guarded[2] = min(max(guarded[2], screen_floor), 0.72)
+        shade_floor = 0.75 if rad_heat_load < 750.0 else 0.90
+        guarded[5] = max(guarded[5], shade_floor)
 
     # --- 基础安全约束 ---
     # 1. 低温保护
@@ -585,6 +1130,16 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         else:
             guarded[3] = max(guarded[3], 0.62)
 
+    if high_temp_override:
+        hot_vent_floor = 0.75 if temp_air < 35.0 else 0.90
+        if temp_out < temp_air - 1.0:
+            hot_vent_floor = max(hot_vent_floor, 0.95)
+        if hot_dry_solver_sensitive:
+            hot_vent_floor = max(hot_vent_floor, 0.90)
+        if hot_dry_extreme_solver_sensitive or hot_dry_raw_extreme_solver_sensitive:
+            hot_vent_floor = max(hot_vent_floor, 0.95)
+        guarded[3] = max(guarded[3], hot_vent_floor)
+
     if is_night:
         guarded[5] = 0.0 # 夜间不用遮阳网
         guarded[4] = 0.0 # 夜间不用补光（假设非光周期补光）
@@ -601,23 +1156,37 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
     # over-vented by an earlier dehumidification branch.
     dry_side_risk = (rh_air < 55.0 or vpd > 1.20) and not high_temp_override
     if dry_side_risk:
-        if temp_air >= 28.0:
+        vent_floor = 0.0
+        if hot_dry_preemptive:
+            vent_cap = 0.85
+            vent_floor = 0.62
+            if temp_air >= 30.5 or rad_heat_load >= 650.0:
+                vent_floor = max(vent_floor, 0.72)
+            if temp_air >= 31.5 or rad_heat_load >= 750.0:
+                vent_floor = max(vent_floor, 0.85)
+        elif temp_air >= 28.0:
             vent_cap = 0.35
         elif temp_air >= 24.0:
             vent_cap = 0.18
         else:
             vent_cap = 0.12
         guarded[3] = min(guarded[3], vent_cap)
+        if hot_dry_preemptive:
+            guarded[3] = max(guarded[3], vent_floor)
         if temp_air >= 12.0:
             guarded[0] = 0.0
         guarded[1] = 0.0
         guarded[4] = 0.0
-        if temp_air < 18.0:
+        if hot_dry_preemptive:
+            screen_floor = 0.55 if (rh_air < 50.0 or vpd > 2.0) else 0.45
+            guarded[2] = min(max(guarded[2], screen_floor), 0.72)
+        elif temp_air < 18.0:
             guarded[2] = max(guarded[2], 0.70)
-        if glob_rad > 250.0 or temp_air > 24.0:
+        if hot_dry_preemptive:
+            guarded[5] = max(guarded[5], 0.75 if rad_heat_load < 750.0 else 0.90)
+        elif glob_rad > 250.0 or temp_air > 24.0:
             guarded[5] = max(guarded[5], 0.50)
 
-    extreme_dew_risk = rh_air >= 94.0 or dew_margin < 0.4
     if temp_air < 12.0 and not extreme_dew_risk:
         guarded[0] = max(guarded[0], 0.90)
         guarded[2] = max(guarded[2], 0.90)
@@ -637,6 +1206,19 @@ def apply_safety_guardrails(state, target_control: np.ndarray) -> np.ndarray:
         guarded[4] = 0.0
 
     return np.clip(guarded, 0.0, 1.0)
+
+
+def _first_finite_state_attr(state, names: List[str], default: float = 0.0) -> float:
+    for name in names:
+        if not hasattr(state, name):
+            continue
+        try:
+            value = float(getattr(state, name))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            return value
+    return float(default)
 
 
 def apply_tomato_safety_v2(
@@ -659,18 +1241,90 @@ def apply_tomato_safety_v2(
     temp_air = float(getattr(state, "temp_air", 20.0))
     rh_air = float(getattr(state, "rh_air", 70.0))
     glob_rad = float(getattr(state, "glob_rad", 0.0))
-    hour_of_day = float(getattr(state, "hour_of_day", 12.0))
-    dew_margin = min(
-        float(getattr(state, "dew_margin_air", 3.0)),
-        float(getattr(state, "canopy_dew_margin", 3.0)),
+    forecast_rad_mean = _first_finite_state_attr(state, ["forecast_rad_mean_1h"], glob_rad)
+    forecast_rad_peak = _first_finite_state_attr(state, ["forecast_rad_peak_2h"], glob_rad)
+    forecast_temp_out_delta = _first_finite_state_attr(state, ["forecast_temp_out_delta_1h"], 0.0)
+    temp_rise_1h = _first_finite_state_attr(
+        state,
+        ["temp_air_delta_1h", "temp_air_rise_1h", "temp_air_trend_c_per_hour"],
+        0.0,
     )
+    temp_slope_step = _first_finite_state_attr(
+        state,
+        ["temp_air_slope_c_per_step", "temp_air_slope", "temp_trend_slope"],
+        0.0,
+    )
+    hour_of_day = float(getattr(state, "hour_of_day", 12.0))
+    air_dew_margin = float(getattr(state, "dew_margin_air", 3.0))
+    canopy_dew_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+    dew_margin = min(air_dew_margin, canopy_dew_margin)
     vpd = float(calculate_vpd_kpa(temp_air, rh_air))
     is_night = hour_of_day < 6.0 or hour_of_day > 18.0
     extreme_dew_risk = (
         rh_air >= float(getattr(cfg, "tomato_safety_v2_extreme_dew_rh", 94.0))
         or dew_margin < float(getattr(cfg, "tomato_safety_v2_extreme_dew_margin", 0.40))
     )
-    high_temp_cooling = temp_air >= 32.0
+    hot_temp_threshold = float(getattr(cfg, "tomato_safety_v2_hot_temp_threshold", 32.0))
+    hot_preempt_temp = float(getattr(cfg, "tomato_safety_v2_hot_preempt_temp_threshold", 31.0))
+    hot_rad_threshold = float(getattr(cfg, "tomato_safety_v2_hot_rad_threshold", 600.0))
+    hot_rapid_rise_threshold = float(getattr(cfg, "tomato_safety_v2_hot_rapid_rise_threshold", 0.50))
+    hot_rapid_rise_temp = float(getattr(cfg, "tomato_safety_v2_hot_rapid_rise_temp_threshold", 30.5))
+    hot_hold_temp_threshold = float(getattr(cfg, "tomato_safety_v2_hot_hold_temp_threshold", 29.0))
+    hot_hold_rad_threshold = float(getattr(cfg, "tomato_safety_v2_hot_hold_rad_threshold", 350.0))
+    pre_hot_dry_temp_threshold = float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_temp_threshold", 28.5))
+    hot_screen_floor = float(getattr(cfg, "tomato_safety_v2_hot_screen_floor", 0.20))
+    hot_screen_cap = float(getattr(cfg, "tomato_safety_v2_hot_screen_cap", 0.35))
+    hot_shade_floor = float(getattr(cfg, "tomato_safety_v2_hot_shade_floor", 0.80))
+    hot_shade_cap = float(getattr(cfg, "tomato_safety_v2_hot_shade_cap", 0.90))
+    solver_screen_floor = float(getattr(cfg, "tomato_safety_v2_hot_dry_solver_screen_floor", 0.35))
+    solver_temp_threshold = float(getattr(cfg, "tomato_safety_v2_hot_dry_solver_temp_threshold", 34.0))
+    solver_vpd_threshold = float(getattr(cfg, "tomato_safety_v2_hot_dry_solver_vpd_threshold", 2.80))
+    solver_rh_threshold = float(getattr(cfg, "tomato_safety_v2_hot_dry_solver_rh_threshold", 45.0))
+    extreme_solver_vpd_threshold = float(
+        getattr(cfg, "tomato_safety_v2_hot_dry_extreme_solver_vpd_threshold", 3.00)
+    )
+    extreme_solver_rh_threshold = float(
+        getattr(cfg, "tomato_safety_v2_hot_dry_extreme_solver_rh_threshold", 43.5)
+    )
+    extreme_solver_vent_floor = float(
+        getattr(cfg, "tomato_safety_v2_hot_dry_extreme_solver_vent_floor", 0.95)
+    )
+    extreme_solver_shade = float(
+        getattr(cfg, "tomato_safety_v2_hot_dry_extreme_solver_shade", 0.75)
+    )
+    previous_screen = _first_finite_state_attr(state, ["u_th_scr"], float(before[2]) if len(before) > 2 else 0.0)
+    previous_shade = _first_finite_state_attr(state, ["u_bl_scr"], float(before[5]) if len(before) > 5 else 0.0)
+    previous_vent = _first_finite_state_attr(state, ["u_vent"], float(before[3]) if len(before) > 3 else 0.0)
+    rad_heat_load = max(glob_rad, forecast_rad_mean, forecast_rad_peak)
+    high_temp_cooling = temp_air >= hot_temp_threshold
+    high_rad_near_hot = temp_air >= max(hot_preempt_temp, hot_temp_threshold - 1.0) and glob_rad >= hot_rad_threshold
+    rapid_temp_rise = (
+        temp_rise_1h >= hot_rapid_rise_threshold
+        or temp_slope_step >= 0.08
+        or forecast_temp_out_delta >= hot_rapid_rise_threshold
+    )
+    high_rad_fast_rise = (
+        temp_air >= hot_rapid_rise_temp
+        and rad_heat_load >= hot_rad_threshold
+        and rapid_temp_rise
+    )
+    continuing_hot_load = (
+        temp_air >= hot_hold_temp_threshold
+        and rad_heat_load >= hot_hold_rad_threshold
+        and previous_screen <= hot_screen_cap + 0.05
+        and previous_shade >= hot_shade_floor - 0.05
+        and previous_vent >= 0.60
+    )
+    hot_override_reason = ""
+    if high_temp_cooling:
+        hot_override_reason = "hot_temperature_override"
+    elif high_rad_near_hot:
+        hot_override_reason = "high_rad_near_hot_override"
+    elif high_rad_fast_rise:
+        hot_override_reason = "high_rad_rapid_rise_override"
+    elif continuing_hot_load:
+        hot_override_reason = "hot_override_hold"
+    hot_override = bool(hot_override_reason)
 
     reasons: List[str] = []
     details: Dict[str, Any] = {
@@ -681,7 +1335,28 @@ def apply_tomato_safety_v2(
         "rh_air": rh_air,
         "vpd_kpa": vpd,
         "dew_margin": dew_margin,
+        "air_dew_margin": air_dew_margin,
+        "canopy_dew_margin": canopy_dew_margin,
         "target_rh": None if target_rh is None else float(target_rh),
+        "forecast_rad_mean_1h": forecast_rad_mean,
+        "forecast_rad_peak_2h": forecast_rad_peak,
+        "forecast_temp_out_delta_1h": forecast_temp_out_delta,
+        "temp_rise_1h": temp_rise_1h,
+        "temp_slope_step": temp_slope_step,
+        "hot_rapid_rise_temp_threshold": hot_rapid_rise_temp,
+        "pre_hot_dry_temp_threshold": pre_hot_dry_temp_threshold,
+        "hot_screen_floor": hot_screen_floor,
+        "hot_screen_cap": hot_screen_cap,
+        "hot_shade_floor": hot_shade_floor,
+        "hot_shade_cap": hot_shade_cap,
+        "rapid_temp_rise": rapid_temp_rise,
+        "continuing_hot_load": continuing_hot_load,
+        "canopy_dew_relief": False,
+        "previous_screen": previous_screen,
+        "previous_shade": previous_shade,
+        "previous_vent": previous_vent,
+        "hot_override": hot_override,
+        "hot_override_reason": hot_override_reason,
         "before": before.tolist(),
     }
 
@@ -703,29 +1378,434 @@ def apply_tomato_safety_v2(
     )
 
     hot_dry_dew_block = extreme_dew_risk and rh_air >= 80.0
+    canopy_dew_relief = (
+        canopy_dew_margin < float(getattr(cfg, "tomato_safety_v2_canopy_dew_guard_margin", 1.00))
+        and rh_air > float(getattr(cfg, "tomato_safety_v2_canopy_dew_guard_rh", 61.0))
+        and temp_air >= 24.0
+    )
+    details["canopy_dew_relief"] = bool(canopy_dew_relief)
+    canopy_dew_temperate_buffer = (
+        canopy_dew_relief
+        and not extreme_dew_risk
+        and air_dew_margin >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_temperate_air_margin", 4.0))
+        and temp_air <= float(getattr(cfg, "tomato_safety_v2_canopy_dew_temperate_temp_cap", 26.5))
+        and vpd <= float(getattr(cfg, "tomato_safety_v2_canopy_dew_temperate_vpd_cap", 1.25))
+        and rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_temperate_rad", 550.0))
+    )
+    details["canopy_dew_temperate_buffer"] = bool(canopy_dew_temperate_buffer)
+    canopy_dew_buffer_candidate = (
+        not canopy_dew_relief
+        and not hot_override
+        and canopy_dew_margin < float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_margin", 2.00))
+        and canopy_dew_margin >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_min_margin", 0.50))
+        and rh_air > float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_rh", 56.5))
+        and temp_air >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_temp", 24.0))
+        and rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_rad", 300.0))
+    )
+    canopy_dew_target_preempt = (
+        target_mismatch
+        and not canopy_dew_relief
+        and not hot_override
+        and not extreme_dew_risk
+        and canopy_dew_margin < float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_margin", 2.00))
+        and rh_air > float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_rh", 61.0))
+        and air_dew_margin >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_air_margin", 3.0))
+        and temp_air >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_temp_min", 20.0))
+        and temp_air <= float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_temp_cap", 26.5))
+        and rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_rad", 300.0))
+    )
     hot_dry_cooling = (
         dry_risk
+        and not hot_override
         and not hot_dry_dew_block
-        and (temp_air >= 27.0 or (temp_air >= 25.5 and glob_rad >= 600.0))
+        and not canopy_dew_relief
+        and (temp_air >= 27.0 or (temp_air >= 25.5 and rad_heat_load >= hot_rad_threshold))
     )
+    hot_dry_ultra_solver_sensitive = (
+        hot_override
+        and dry_risk
+        and not extreme_dew_risk
+        and temp_air >= solver_temp_threshold
+        and rad_heat_load >= hot_rad_threshold
+        and (vpd >= solver_vpd_threshold or rh_air <= solver_rh_threshold)
+    )
+    hot_dry_extreme_solver_sensitive = (
+        hot_dry_ultra_solver_sensitive
+        and (vpd >= extreme_solver_vpd_threshold or rh_air <= extreme_solver_rh_threshold)
+    )
+    soft_hot_dry_override = (
+        hot_override
+        and dry_risk
+        and hot_override_reason != "hot_temperature_override"
+        and temp_air < hot_temp_threshold
+        and not hot_dry_ultra_solver_sensitive
+    )
+    hot_dry_radiation_relief = (
+        hot_dry_cooling
+        and (
+            rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_hot_dry_rad_relief_threshold", 350.0))
+            or temp_air >= hot_hold_temp_threshold
+        )
+    )
+    pre_hot_dry_heat_load = (
+        rad_heat_load >= hot_rad_threshold
+        and hard_dry_risk
+        and temp_air >= pre_hot_dry_temp_threshold
+        and (temp_air >= hot_rapid_rise_temp or rapid_temp_rise)
+    )
+    pre_hot_dry_phase = (
+        hot_dry_cooling
+        and not hot_override
+        and temp_air < hot_preempt_temp
+        and rad_heat_load >= hot_rad_threshold
+        and (temp_air >= pre_hot_dry_temp_threshold or (rapid_temp_rise and temp_air >= 25.5))
+    )
+    cooldown_dry_recovery = (
+        dry_risk
+        and not hot_override
+        and not canopy_dew_relief
+        and temp_air < float(getattr(cfg, "tomato_safety_v2_cooldown_dry_temp_threshold", 30.5))
+        and not pre_hot_dry_phase
+        and (
+            temp_air < pre_hot_dry_temp_threshold
+            or rad_heat_load < hot_rad_threshold
+            or previous_vent >= 0.50
+        )
+    )
+    severe_dry_recovery = (
+        hot_dry_cooling
+        and rh_air < float(getattr(cfg, "tomato_safety_v2_hot_dry_recovery_rh", 55.0))
+        and temp_air < float(getattr(cfg, "tomato_safety_v2_severe_dry_screen_temp_cap", 27.0))
+        and not cooldown_dry_recovery
+        and not pre_hot_dry_heat_load
+    )
+    severe_dry_canopy_reserve = (
+        severe_dry_recovery
+        and not extreme_dew_risk
+        and canopy_dew_margin < float(getattr(cfg, "tomato_safety_v2_severe_dry_canopy_reserve_margin", 4.0))
+        and rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_severe_dry_canopy_reserve_rad", 600.0))
+    )
+    cooldown_canopy_reserve_buffer = (
+        cooldown_dry_recovery
+        and hot_dry_radiation_relief
+        and not hard_dry_risk
+        and not extreme_dew_risk
+        and canopy_dew_margin < float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_margin", 3.0))
+        and rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_rad", 650.0))
+        and rh_air >= float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_rh", 58.0))
+        and vpd <= float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_vpd_cap", 1.65))
+    )
+    canopy_dew_buffer = bool(canopy_dew_buffer_candidate and (cooldown_dry_recovery or hot_dry_cooling))
+    details["canopy_dew_buffer"] = bool(canopy_dew_buffer)
+    details["hot_dry_radiation_relief"] = bool(hot_dry_radiation_relief)
+    details["pre_hot_dry_heat_load"] = bool(pre_hot_dry_heat_load)
+    details["pre_hot_dry_phase"] = bool(pre_hot_dry_phase)
+    details["cooldown_dry_recovery"] = bool(cooldown_dry_recovery)
+    details["cooldown_canopy_reserve_buffer"] = bool(cooldown_canopy_reserve_buffer)
+    details["severe_dry_recovery"] = bool(severe_dry_recovery)
+    details["severe_dry_canopy_reserve"] = bool(severe_dry_canopy_reserve)
+    details["canopy_dew_target_preempt"] = bool(canopy_dew_target_preempt)
+    details["hot_dry_ultra_solver_sensitive"] = bool(hot_dry_ultra_solver_sensitive)
+    details["hot_dry_extreme_solver_sensitive"] = bool(hot_dry_extreme_solver_sensitive)
+    details["soft_hot_dry_override"] = bool(soft_hot_dry_override)
+
+    if hot_override:
+        reasons.append(hot_override_reason)
+        if dry_risk:
+            reasons.append("dry_vpd_heat_deprioritized")
+        if hard_dry_risk:
+            reasons.append("hard_dry_vpd_risk")
+        if extreme_dew_risk:
+            reasons.append("extreme_dew_hot_override")
+        vent_floor = float(getattr(cfg, "tomato_safety_v2_hot_vent_floor", 0.85))
+        vent_cap = vent_floor
+        temp_out = float(getattr(state, "temp_out", temp_air))
+        if dry_risk and rad_heat_load >= hot_rad_threshold:
+            soft_vent_floor = float(getattr(cfg, "tomato_safety_v2_near_hot_dry_vent_floor", 0.85))
+            if hot_override_reason == "hot_override_hold" and soft_hot_dry_override:
+                soft_vent_floor = float(getattr(cfg, "tomato_safety_v2_hot_hold_dry_vent_floor", 0.72))
+            vent_floor = max(
+                vent_floor,
+                soft_vent_floor
+                if soft_hot_dry_override
+                else float(getattr(cfg, "tomato_safety_v2_hot_dry_override_vent_floor", 0.90)),
+            )
+            vent_cap = vent_floor
+        if hot_dry_extreme_solver_sensitive:
+            reasons.append("hot_dry_extreme_solver_relief")
+            vent_floor = max(vent_floor, extreme_solver_vent_floor)
+            vent_cap = vent_floor
+        extreme_hot_vent_temp = float(getattr(cfg, "tomato_safety_v2_extreme_hot_vent_temp_threshold", 35.0))
+        if temp_air >= extreme_hot_vent_temp or (
+            extreme_dew_risk
+            and rh_air >= float(getattr(cfg, "tomato_safety_v2_extreme_dew_rh", 94.0))
+        ):
+            vent_floor = max(vent_floor, float(getattr(cfg, "tomato_safety_v2_extreme_hot_vent_floor", 0.95)))
+            vent_cap = vent_floor
+        shaped[3] = min(max(float(shaped[3]), min(vent_floor, 1.0)), min(vent_cap, 1.0))
+        shaped[0] = 0.0
+        shaped[1] = 0.0
+        effective_hot_screen_floor = hot_screen_floor
+        effective_hot_screen_cap = hot_screen_cap
+        if soft_hot_dry_override:
+            effective_hot_screen_floor = max(
+                effective_hot_screen_floor,
+                float(getattr(cfg, "tomato_safety_v2_soft_hot_dry_screen_floor", 0.35)),
+            )
+            effective_hot_screen_cap = max(
+                effective_hot_screen_cap,
+                float(getattr(cfg, "tomato_safety_v2_soft_hot_dry_screen_cap", 0.60)),
+            )
+        shaped[2] = min(max(float(shaped[2]), effective_hot_screen_floor), effective_hot_screen_cap)
+        if hot_dry_ultra_solver_sensitive:
+            reasons.append("hot_dry_solver_screen_buffer")
+            shaped[2] = min(max(float(shaped[2]), solver_screen_floor), hot_screen_cap)
+        shaped[4] = 0.0
+        if rad_heat_load >= 200.0:
+            shade_floor = hot_shade_floor
+            shade_cap = hot_shade_cap
+            if dry_risk:
+                reasons.append("hot_dry_shade_limited_for_stability")
+                hot_dry_shade_floor = float(getattr(cfg, "tomato_safety_v2_hot_dry_override_shade_floor", 0.65))
+                hot_dry_shade_cap = float(getattr(cfg, "tomato_safety_v2_hot_dry_override_shade_cap", 0.75))
+                if soft_hot_dry_override:
+                    hot_dry_shade_cap = max(hot_dry_shade_cap, hot_shade_cap)
+                if rad_heat_load >= hot_rad_threshold:
+                    shade_floor = max(shade_floor, hot_dry_shade_floor)
+                    shade_cap = min(shade_cap, hot_dry_shade_cap)
+                else:
+                    shade_floor = min(shade_floor, hot_dry_shade_floor)
+                    shade_cap = min(shade_cap, hot_dry_shade_cap)
+                shade_floor = min(shade_floor, shade_cap)
+            shaped[5] = min(max(float(shaped[5]), shade_floor), shade_cap)
+            if hot_dry_extreme_solver_sensitive:
+                shaped[5] = min(max(float(shaped[5]), extreme_solver_shade), extreme_solver_shade)
+        raw_extreme_hot_dry = (
+            dry_risk
+            and temp_air >= max(hot_temp_threshold + 1.0, 33.0)
+            and rad_heat_load >= hot_rad_threshold
+            and (
+                vpd >= float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_vpd_threshold", 3.20))
+                or rh_air <= float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_rh_threshold", 38.0))
+            )
+        )
+        very_hot_dry_hold = (
+            dry_risk
+            and temp_air >= float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_hold_temp_threshold", 36.0))
+            and rad_heat_load >= hot_rad_threshold
+            and vpd >= float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_hold_vpd_threshold", 2.80))
+        )
+        extreme_hot_dry = raw_extreme_hot_dry or very_hot_dry_hold
+        if extreme_hot_dry:
+            reasons.append("extreme_hot_dry_stability_guard")
+            if very_hot_dry_hold and not raw_extreme_hot_dry:
+                reasons.append("extreme_hot_dry_temperature_hold")
+            shaped[2] = min(
+                max(
+                    float(shaped[2]),
+                    float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_screen_floor", 0.90)),
+                ),
+                float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_screen_cap", 1.00)),
+            )
+            shaped[3] = max(
+                float(shaped[3]),
+                float(getattr(cfg, "tomato_safety_v2_extreme_hot_dry_vent_floor", 0.95)),
+            )
+            extreme_shade_floor = float(
+                getattr(cfg, "tomato_safety_v2_extreme_hot_dry_shade_floor", 0.50)
+            )
+            extreme_shade_cap = float(
+                getattr(cfg, "tomato_safety_v2_extreme_hot_dry_shade_cap", 0.50)
+            )
+            extreme_shade_floor = min(extreme_shade_floor, extreme_shade_cap)
+            shaped[5] = min(max(float(shaped[5]), extreme_shade_floor), extreme_shade_cap)
+
+    if canopy_dew_relief and not hot_override:
+        reasons.append("canopy_dew_relief_guard")
+        if dry_risk:
+            reasons.append("dry_vpd_deprioritized_for_canopy_dew")
+        shaped[0] = 0.0
+        shaped[1] = 0.0
+        shaped[4] = 0.0
+        if canopy_dew_temperate_buffer:
+            reasons.append("canopy_dew_temperature_buffer")
+            screen_cap = float(getattr(cfg, "tomato_safety_v2_canopy_dew_temperate_screen_cap", 0.75))
+            vent_floor = float(getattr(cfg, "tomato_safety_v2_canopy_dew_temperate_vent_floor", 0.20))
+        else:
+            screen_cap = float(getattr(cfg, "tomato_safety_v2_canopy_dew_screen_cap", 0.35))
+            vent_floor = float(getattr(cfg, "tomato_safety_v2_canopy_dew_vent_floor", 0.42))
+        shaped[2] = min(float(shaped[2]), screen_cap)
+        shaped[3] = max(float(shaped[3]), vent_floor)
+        if glob_rad > 180.0 or temp_air > 26.0:
+            canopy_shade_floor = float(getattr(cfg, "tomato_safety_v2_canopy_dew_shade_floor", 0.50))
+            canopy_shade_cap = float(getattr(cfg, "tomato_safety_v2_canopy_dew_shade_cap", 0.50))
+            canopy_shade_floor = min(canopy_shade_floor, canopy_shade_cap)
+            shaped[5] = min(max(float(shaped[5]), canopy_shade_floor), canopy_shade_cap)
 
     if hot_dry_cooling:
         reasons.append("hot_dry_cooling_guard")
-        if hard_dry_risk or vpd > 1.8 or temp_air >= 30.0:
+        if pre_hot_dry_phase:
+            reasons.append("pre_hot_dry_heat_relief")
+            reasons.append("pre_hot_dry_vent_budget")
+        if cooldown_dry_recovery:
+            reasons.append("cooldown_dry_recovery")
+            if hot_dry_radiation_relief:
+                reasons.append("hot_dry_radiation_relief")
+        if severe_dry_recovery:
+            reasons.append("severe_dry_recovery")
+        if cooldown_dry_recovery:
+            vent_floor = 0.0
+        elif pre_hot_dry_phase:
+            vent_floor = float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_vent_floor", 0.60))
+            if temp_air >= float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_warm_vent_temp", 29.0)):
+                vent_floor = max(
+                    vent_floor,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_warm_vent_floor", 0.60)),
+                )
+            if temp_air >= float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_hot_vent_temp", 30.5)):
+                vent_floor = max(
+                    vent_floor,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_hot_vent_floor", 0.72)),
+                )
+        elif hard_dry_risk or vpd > 1.8 or temp_air >= 30.0:
             vent_floor = 0.78
         else:
             vent_floor = 0.60
-        shaped[3] = max(float(shaped[3]), vent_floor)
-        shaped[3] = min(float(shaped[3]), 1.00)
+        vent_cap = 1.0
+        if pre_hot_dry_phase:
+            vent_cap = max(
+                vent_floor,
+                float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_vent_cap", 0.82)),
+            )
+            if temp_air >= hot_rapid_rise_temp or rapid_temp_rise:
+                vent_cap = min(
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_rapid_vent_cap", 0.82)),
+                    max(vent_cap, vent_floor + 0.10),
+                )
+        elif cooldown_dry_recovery:
+            vent_cap = float(getattr(cfg, "tomato_safety_v2_cooldown_dry_vent_cap", 0.28))
+        if cooldown_dry_recovery:
+            shaped[3] = min(float(shaped[3]), vent_cap)
+        else:
+            shaped[3] = min(max(float(shaped[3]), vent_floor), vent_cap)
+            shaped[3] = min(float(shaped[3]), 1.00)
         shaped[0] = 0.0
         shaped[1] = 0.0
-        shaped[2] = max(float(shaped[2]), 1.00)
         shaped[4] = 0.0
-        shaped[5] = min(float(shaped[5]), 0.0 if hard_dry_risk else 0.15)
+        if severe_dry_recovery:
+            if severe_dry_canopy_reserve:
+                reasons.append("severe_dry_canopy_reserve")
+                reserve_screen_floor = float(
+                    getattr(cfg, "tomato_safety_v2_severe_dry_canopy_reserve_screen_floor", 0.70)
+                )
+                reserve_screen_cap = float(
+                    getattr(cfg, "tomato_safety_v2_severe_dry_canopy_reserve_screen_cap", 0.82)
+                )
+                reserve_screen_floor = min(reserve_screen_floor, reserve_screen_cap)
+                shaped[2] = min(max(float(shaped[2]), reserve_screen_floor), reserve_screen_cap)
+                reserve_shade = float(getattr(cfg, "tomato_safety_v2_severe_dry_canopy_reserve_shade", 0.50))
+                shaped[5] = min(max(float(shaped[5]), reserve_shade), reserve_shade)
+            else:
+                shaped[2] = max(float(shaped[2]), 1.00)
+                shaped[5] = min(float(shaped[5]), 0.0 if hard_dry_risk else 0.15)
+        elif cooldown_dry_recovery:
+            cooldown_screen_floor = float(getattr(cfg, "tomato_safety_v2_cooldown_dry_screen_floor", 0.82))
+            cooldown_screen_cap = float(getattr(cfg, "tomato_safety_v2_cooldown_dry_screen_cap", 0.85))
+            cooldown_screen_floor = min(cooldown_screen_floor, cooldown_screen_cap)
+            shaped[2] = min(max(float(shaped[2]), cooldown_screen_floor), cooldown_screen_cap)
+            if rad_heat_load > 180.0:
+                shaped[5] = max(
+                    float(shaped[5]),
+                    float(getattr(cfg, "tomato_safety_v2_cooldown_dry_shade_floor", 0.45)),
+                )
+            if cooldown_canopy_reserve_buffer:
+                reasons.append("cooldown_canopy_reserve_buffer")
+                shaped[2] = min(
+                    float(shaped[2]),
+                    float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_screen_cap", 0.60)),
+                )
+                shaped[3] = max(
+                    float(shaped[3]),
+                    float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_vent_floor", 0.42)),
+                )
+                reserve_shade = float(getattr(cfg, "tomato_safety_v2_cooldown_canopy_reserve_shade", 0.50))
+                shaped[5] = min(max(float(shaped[5]), reserve_shade), reserve_shade)
+        elif hot_dry_radiation_relief:
+            reasons.append("hot_dry_radiation_relief")
+            screen_floor = float(getattr(cfg, "tomato_safety_v2_hot_dry_screen_floor", 0.45))
+            screen_cap = float(getattr(cfg, "tomato_safety_v2_hot_dry_screen_cap", 0.75))
+            if rh_air < float(getattr(cfg, "tomato_safety_v2_dry_rh_hard", 50.0)):
+                screen_floor = max(screen_floor, 0.70)
+                screen_cap = max(screen_cap, 0.85)
+            elif rh_air < float(getattr(cfg, "tomato_safety_v2_dry_rh_on", 55.0)):
+                screen_floor = max(screen_floor, 0.60)
+                screen_cap = max(screen_cap, 0.80)
+            elif (
+                rh_air >= float(getattr(cfg, "tomato_safety_v2_dry_rh_on", 55.0))
+                and not pre_hot_dry_phase
+                and not pre_hot_dry_heat_load
+            ):
+                screen_cap = min(screen_cap, 0.65)
+            shade_floor = float(getattr(cfg, "tomato_safety_v2_hot_dry_shade_floor", 0.50))
+            shade_cap = 1.0
+            if pre_hot_dry_phase:
+                screen_cap = min(
+                    screen_cap,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_screen_cap", 0.82)),
+                )
+                screen_floor = max(
+                    screen_floor,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_screen_floor", 0.70)),
+                )
+                screen_floor = min(screen_floor, screen_cap)
+                shade_floor = max(
+                    shade_floor,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_shade_floor", 0.82)),
+                )
+                shade_cap = float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_shade_cap", 0.92))
+                shade_floor = min(shade_floor, shade_cap)
+            elif pre_hot_dry_heat_load:
+                screen_cap = min(
+                    screen_cap,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_screen_cap", 0.82)),
+                )
+                screen_floor = max(
+                    screen_floor,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_screen_floor", 0.70)),
+                )
+                screen_floor = min(screen_floor, screen_cap)
+                shade_floor = max(
+                    shade_floor,
+                    float(getattr(cfg, "tomato_safety_v2_pre_hot_dry_shade_floor", 0.82)),
+                )
+            shaped[2] = min(max(float(shaped[2]), screen_floor), screen_cap)
+            shaped[5] = min(max(float(shaped[5]), shade_floor), shade_cap)
+        else:
+            shaped[2] = max(float(shaped[2]), 1.00)
+            shaped[5] = min(float(shaped[5]), 0.0 if hard_dry_risk else 0.15)
         if hard_dry_risk:
             reasons.append("hard_dry_vpd_guard")
 
-    if dry_risk and not high_temp_cooling and not hot_dry_cooling:
+    if canopy_dew_buffer and not hot_override:
+        reasons.append("canopy_dew_hot_dry_conflict_buffer")
+        shaped[0] = 0.0
+        shaped[1] = 0.0
+        shaped[4] = 0.0
+        shaped[2] = min(
+            float(shaped[2]),
+            float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_screen_cap", 0.60)),
+        )
+        shaped[3] = max(
+            float(shaped[3]),
+            float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_vent_floor", 0.42)),
+        )
+        if glob_rad > 180.0 or temp_air > 26.0:
+            buffer_shade_floor = float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_shade_floor", 0.50))
+            buffer_shade_cap = float(getattr(cfg, "tomato_safety_v2_canopy_dew_buffer_shade_cap", 0.50))
+            buffer_shade_floor = min(buffer_shade_floor, buffer_shade_cap)
+            shaped[5] = min(max(float(shaped[5]), buffer_shade_floor), buffer_shade_cap)
+
+    if dry_risk and not hot_override and not hot_dry_cooling and not canopy_dew_relief and not canopy_dew_buffer:
         reasons.append("dry_vpd_guard")
         if temp_air >= 28.0:
             vent_cap = 0.24 if hard_dry_risk else 0.30
@@ -740,20 +1820,47 @@ def apply_tomato_safety_v2(
             shaped[0] = min(float(shaped[0]), 0.02 if hard_dry_risk else 0.05)
         if temp_air < 20.0:
             shaped[2] = max(float(shaped[2]), 0.80 if hard_dry_risk else 0.70)
+        elif (
+            hard_dry_risk
+            and temp_air < float(getattr(cfg, "tomato_safety_v2_warm_hard_dry_screen_temp_cap", 25.5))
+            and rad_heat_load >= float(getattr(cfg, "tomato_safety_v2_warm_hard_dry_screen_rad_threshold", 350.0))
+        ):
+            shaped[2] = max(
+                float(shaped[2]),
+                float(getattr(cfg, "tomato_safety_v2_warm_hard_dry_screen_floor", 0.75)),
+            )
         if glob_rad > 180.0 or temp_air > 24.0 or hard_dry_risk:
             shaped[5] = max(float(shaped[5]), 0.65 if hard_dry_risk else 0.50)
         if hard_dry_risk:
             reasons.append("hard_dry_vpd_guard")
 
-    if target_mismatch and not high_temp_cooling and not hot_dry_cooling:
+    if target_mismatch and not hot_override and not hot_dry_cooling and not canopy_dew_relief and not canopy_dew_buffer:
         reasons.append("target_rh_action_mismatch")
-        shaped[3] = min(float(shaped[3]), 0.14 if temp_air >= 24.0 else 0.08)
+        if canopy_dew_target_preempt:
+            reasons.append("canopy_dew_target_preempt")
+            preempt_vent_floor = float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_vent_floor", 0.18))
+            preempt_vent_cap = float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_vent_cap", 0.24))
+            preempt_vent_cap = max(preempt_vent_cap, preempt_vent_floor)
+            shaped[3] = min(max(float(shaped[3]), preempt_vent_floor), preempt_vent_cap)
+            shaped[2] = min(
+                float(shaped[2]),
+                float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_screen_cap", 0.75)),
+            )
+        else:
+            shaped[3] = min(float(shaped[3]), 0.14 if temp_air >= 24.0 else 0.08)
         shaped[1] = 0.0
         shaped[4] = 0.0
         if temp_air < 20.0:
             shaped[2] = max(float(shaped[2]), 0.70)
         if glob_rad > 200.0:
             shaped[5] = max(float(shaped[5]), 0.50)
+        if canopy_dew_target_preempt and temp_air <= float(
+            getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_shade_temp_cap", 24.5)
+        ):
+            shaped[5] = min(
+                float(shaped[5]),
+                float(getattr(cfg, "tomato_safety_v2_canopy_dew_preempt_shade_cap", 0.35)),
+            )
 
     if temp_air < float(getattr(cfg, "tomato_safety_v2_low_temp_threshold", 15.5)) and not extreme_dew_risk:
         reasons.append("cold_buffer_guard")
@@ -775,6 +1882,10 @@ def apply_tomato_safety_v2(
     details["vent_after"] = float(shaped[3]) if len(shaped) > 3 else 0.0
     details["heat_before"] = float(before[0]) if len(before) > 0 else 0.0
     details["heat_after"] = float(shaped[0]) if len(shaped) > 0 else 0.0
+    details["screen_before"] = float(before[2]) if len(before) > 2 else 0.0
+    details["screen_after"] = float(shaped[2]) if len(shaped) > 2 else 0.0
+    details["shade_before"] = float(before[5]) if len(before) > 5 else 0.0
+    details["shade_after"] = float(shaped[5]) if len(shaped) > 5 else 0.0
     return shaped, details
 
 
@@ -1088,6 +2199,59 @@ class RuleBasedLLMDirector:
         self.last_tomato_safety_v2_suppressed_replan: Dict[str, Any] = {"applied": False}
         self.tomato_safety_v2_suppressed_replan_steps: int = 0
         self.last_plan_cache_event: Dict[str, Any] = {"mode": str(getattr(self.config, "plan_cache_mode", "off"))}
+        self.last_transition_gate: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "transition_gate_enabled", False)),
+            "applied": False,
+            "bypassed": False,
+        }
+        self.last_cstcc_shadow: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "cstcc_shadow_enabled", False)),
+            "shadow_only": True,
+            "final_action_changed": False,
+            "final_action_invariant_verified": True,
+        }
+        self.last_profile_feasibility_gate: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "profile_feasibility_gate_enabled", False)),
+            "applied": False,
+            "hard_safety_veto_count": 0,
+        }
+        self.last_profile_template_patch: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "profile_template_patch_enabled", False)),
+            "applied": False,
+            "fallback_veto_applied": False,
+            "fallback_veto_no_alternative": False,
+            "recovery_anchor_enabled": bool(getattr(self.config, "recovery_anchor_enabled", False)),
+            "recovery_anchor_applied": False,
+        }
+        self.last_structured_anchor: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "structured_anchor_parser_enabled", False)),
+            "shadow_only": bool(getattr(self.config, "structured_anchor_shadow_only", True)),
+            "attempted": False,
+            "valid": False,
+            "clean_planning_evidence": False,
+            "empty": True,
+        }
+        self.last_structured_anchor_profile_bridge: Dict[str, Any] = {
+            "enabled": bool(getattr(self.config, "structured_anchor_profile_bridge_enabled", False)),
+            "shadow_only": bool(getattr(self.config, "structured_anchor_profile_bridge_shadow_only", True)),
+            "applied": False,
+            "bridgeable": False,
+        }
+        self._transition_gate_previous_action: Optional[np.ndarray] = None
+        reversal_window = max(1, int(getattr(self.config, "transition_gate_reversal_window_steps", 6) or 6))
+        self._transition_gate_sign_history: Dict[str, deque] = {
+            name: deque(maxlen=reversal_window) for name in ACTION_NAMES
+        }
+        self._transition_gate_soft_limits: Optional[Dict[str, Dict[str, float]]] = None
+        self._transition_gate_soft_limit_source: str = ""
+        self._transition_gate_soft_limit_error: str = ""
+        cstcc_history_steps = max(1, int(getattr(self.config, "cstcc_shadow_history_steps", 60) or 60))
+        self._cstcc_state_history: deque = deque(maxlen=cstcc_history_steps)
+        self._cstcc_action_history: deque = deque(maxlen=cstcc_history_steps)
+        self._cstcc_weather_history: deque = deque(maxlen=cstcc_history_steps)
+        self._cstcc_active_regime: str = "NORMAL_BALANCED"
+        self._cstcc_regime_age_steps: int = 0
+        self._cstcc_previous_plan_sequence: List[Dict[str, float]] = []
         self.last_humidity_memory_selected_step: int = -10**9
         self.last_llm_trigger_step: int = -10**9
         self.emergency_replan_cooldown_steps: int = max(6, int(self.config.control_interval // 2))
@@ -1114,6 +2278,8 @@ class RuleBasedLLMDirector:
         self.current_metrics: Optional[PerformanceMetrics] = None
         self._rh_history: deque = deque(maxlen=6)
         self._weather_history: deque = deque(maxlen=12)
+        self._canopy_margin_history: deque = deque(maxlen=8)
+        self._last_canopy_history_timestep: Optional[int] = None
         
     def _create_llm(self):
         return ChatOpenAI(
@@ -1261,7 +2427,88 @@ class RuleBasedLLMDirector:
             "llm_action_found": bool(llm_action_found),
             "buffered_action": self._control_action_record(tools_instance.buffered_action),
             "buffered_setpoints": to_jsonable(getattr(tools_instance, "buffered_setpoints", {})),
+            "structured_anchor": to_jsonable(dict(getattr(self, "last_structured_anchor", {}) or {})),
         }
+
+    def _structured_anchor_empty_record(self, *, attempted: bool = False) -> Dict[str, Any]:
+        enabled = bool(getattr(self.config, "structured_anchor_parser_enabled", False))
+        return {
+            "enabled": enabled,
+            "shadow_only": bool(getattr(self.config, "structured_anchor_shadow_only", True)),
+            "attempted": bool(attempted),
+            "valid": False,
+            "clean_planning_evidence": False,
+            "empty": True,
+            "errors": ["disabled"] if not enabled else ["not_attempted"],
+            "missing_fields": [],
+            "unexpected_fields": [],
+            "final_control_field_hits": [],
+            "final_control_field_leak_count": 0,
+            "legacy_tool_action_present": False,
+            "shadow_plan": {},
+        }
+
+    def _store_structured_anchor_record(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        stored = dict(record)
+        stored["enabled"] = bool(getattr(self.config, "structured_anchor_parser_enabled", False))
+        stored["shadow_only"] = bool(getattr(self.config, "structured_anchor_shadow_only", True))
+        self.last_structured_anchor = stored
+        return stored
+
+    def _restore_cached_structured_anchor(self, entry: Mapping[str, Any]) -> bool:
+        record = entry.get("structured_anchor", {}) if isinstance(entry, Mapping) else {}
+        if not isinstance(record, Mapping):
+            self._store_structured_anchor_record(self._structured_anchor_empty_record(attempted=False))
+            return False
+        restored = self._store_structured_anchor_record(record)
+        return bool(restored.get("valid", False))
+
+    def _parse_structured_anchor_output(
+        self,
+        llm_output: Any,
+        *,
+        attempt: int,
+        prompt_hash: str,
+        planning_horizon: int,
+        legacy_tool_action_present: bool,
+        retry_attempt: bool = False,
+        retry_source_errors: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        parsed = parse_structured_anchor(llm_output)
+        errors = list(parsed.get("errors", []) or [])
+        final_hits = list(parsed.get("final_control_field_hits", []) or [])
+        record = {
+            "enabled": bool(getattr(self.config, "structured_anchor_parser_enabled", False)),
+            "shadow_only": bool(getattr(self.config, "structured_anchor_shadow_only", True)),
+            "attempted": True,
+            "attempt": int(attempt),
+            "prompt_hash": str(prompt_hash),
+            "planning_horizon": int(planning_horizon),
+            "valid": bool(parsed.get("valid", False)),
+            "clean_planning_evidence": bool(parsed.get("clean_planning_evidence", False)),
+            "empty": bool("empty_anchor" in errors),
+            "errors": errors,
+            "missing_fields": list(parsed.get("missing_fields", []) or []),
+            "unexpected_fields": list(parsed.get("unexpected_fields", []) or []),
+            "final_control_field_hits": final_hits,
+            "final_control_field_leak_count": int(len(final_hits)),
+            "wrapper_used": bool(parsed.get("wrapper_used", False)),
+            "raw_anchor_keys": list(parsed.get("raw_anchor_keys", []) or []),
+            "legacy_tool_action_present": bool(legacy_tool_action_present),
+            "retry_provenance": {
+                "retry_attempt": bool(retry_attempt),
+                "retry_source_errors": list(retry_source_errors or []),
+                "retry_invalid_or_empty_enabled": bool(
+                    getattr(self.config, "structured_anchor_retry_invalid_or_empty_enabled", False)
+                ),
+                "retry_max_attempts": int(getattr(self.config, "structured_anchor_retry_max_attempts", 1) or 1),
+                "compact_json_prompt_enabled": bool(
+                    getattr(self.config, "structured_anchor_compact_json_prompt_enabled", False)
+                ),
+            },
+            "shadow_plan": dict(parsed.get("shadow_plan", {}) or {}),
+        }
+        return self._store_structured_anchor_record(record)
 
     def _state_plan_memory_row(self, state, plan: Optional[Dict[str, Any]]) -> Dict[str, float]:
         plan = plan or {}
@@ -1474,6 +2721,64 @@ class RuleBasedLLMDirector:
         effective_horizon = max(1, int(horizon if horizon is not None else self.active_control_interval))
         remaining_steps = effective_horizon - 1
         status_block = ""
+        if bool(getattr(self.config, "structured_anchor_parser_enabled", False)):
+            if status_brief:
+                status_block = f"status_brief:{status_brief}\n"
+            required = str(getattr(self.config, "structured_anchor_required_fields", "") or "")
+            if bool(getattr(self.config, "structured_anchor_compact_json_prompt_enabled", False)):
+                list_max = max(1, int(getattr(self.config, "structured_anchor_list_max_items", 3) or 3))
+                return (
+                    "Return exactly one minified JSON object. No markdown. No prose. No tools. "
+                    "No low-level actuator or final-control fields. "
+                    "{\"structured_planning_anchor\":{\"profile_intent\":\"<intent>\","
+                    "\"target_temp\":<number>,\"target_co2\":<number>,\"target_rh\":<number>,"
+                    "\"risk_flags\":[\"<risk>\"],\"forbidden_intents\":[\"<forbidden>\"],"
+                    "\"planning_horizon_steps\":<integer>,\"confidence\":<0_to_1>}}. "
+                    f"Required fields: {required}. "
+                    f"risk_flags max {list_max}; forbidden_intents max {list_max}. "
+                    f"Targets are average/band-center values for the next {effective_horizon} steps, "
+                    "not actuator commands. "
+                    f"mode={mode};day={state.day_of_year:.1f};hour={state.hour_of_day:.1f};"
+                    f"is_day={int(is_day)};horizon_steps={effective_horizon};remaining_steps={remaining_steps};"
+                    f"T={state.temp_air:.2f};RH={state.rh_air:.2f};CO2={state.co2_air:.2f};"
+                    f"Rad={state.glob_rad:.2f};Tout={state.temp_out:.2f};"
+                    f"Fruit={state.fruit_weight:.6f};Can24={state.canopy_temp_24h:.2f};"
+                    f"TSum={state.temperature_sum:.2f};"
+                    f"heat={state.u_boil:.2f};co2={state.u_co2:.2f};screen={state.u_th_scr:.2f};"
+                    f"vent={state.u_vent:.2f};lamp={state.u_lamp:.2f};shade={state.u_bl_scr:.2f};"
+                    f"suggestions={' | '.join(analysis.get('suggestions', [])[:3]) if analysis.get('suggestions') else 'stable'};"
+                    f"{status_block}"
+                )
+            return (
+                "You are a greenhouse high-level planner. Return exactly one JSON object and no tool calls.\n"
+                "The object must be wrapped as {\"structured_planning_anchor\": {...}}.\n"
+                f"Required fields inside structured_planning_anchor: {required}.\n"
+                "Do not output low-level actuator or final-control fields: heating, co2, screen, "
+                "ventilation, lighting, shading, blindscreen, u_boil, u_co2, u_th_scr, u_vent, "
+                "u_lamp, u_bl_scr, final_control.\n"
+                "The anchor describes scenario/intent/targets/risk only; internal controllers will "
+                "generate executable actions later.\n"
+                f"mode={mode}; day={state.day_of_year:.1f}; hour={state.hour_of_day:.1f}; "
+                f"is_day={int(is_day)}; horizon_steps={effective_horizon}; remaining_steps={remaining_steps}\n"
+                f"state: temp_air={state.temp_air:.2f}, rh_air={state.rh_air:.2f}, "
+                f"co2_air={state.co2_air:.2f}, radiation={state.glob_rad:.2f}, "
+                f"temp_out={state.temp_out:.2f}, rh_out={getattr(state, 'rh_out', 70.0):.2f}\n"
+                f"crop: fruit_weight={state.fruit_weight:.6f}, canopy_temp_24h={state.canopy_temp_24h:.2f}, "
+                f"temperature_sum={state.temperature_sum:.2f}\n"
+                f"current_control: heat={state.u_boil:.2f}, co2={state.u_co2:.2f}, "
+                f"screen={state.u_th_scr:.2f}, vent={state.u_vent:.2f}, "
+                f"lamp={state.u_lamp:.2f}, shading={state.u_bl_scr:.2f}\n"
+                f"suggestions: {' | '.join(analysis.get('suggestions', [])[:4]) if analysis.get('suggestions') else 'stable'}\n"
+                f"{status_block}"
+                "Target semantics: target_temp, target_co2, and target_rh are intended average/band-center "
+                "targets for the next planning_horizon_steps, not immediate actuator commands. "
+                "Use conservative feasible values when uncertain. Include risk_flags and forbidden_intents "
+                "for dew/canopy/RH/VPD/heat/dry/CO2-vent conflicts.\n"
+                "Example shape: {\"structured_planning_anchor\":{\"profile_intent\":\"dawn_dew_relief\","
+                "\"target_temp\":18.5,\"target_co2\":430,\"target_rh\":76,"
+                "\"risk_flags\":[\"dew_risk\"],\"forbidden_intents\":[\"co2_enrichment_high_vent\"],"
+                f"\"planning_horizon_steps\":{effective_horizon},\"confidence\":0.7}}"
+            )
         if status_brief:
             status_block = f"强制状态快照(get_status):{status_brief}\\n"
 
@@ -2058,6 +3363,312 @@ class RuleBasedLLMDirector:
 
         return np.clip(control, 0.0, 1.0).astype(np.float32)
 
+    def _rspc_hot_dry_features(self, state) -> Dict[str, Any]:
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        glob_rad = float(getattr(state, "glob_rad", 0.0))
+        forecast_rad_mean = _first_finite_state_attr(state, ["forecast_rad_mean_1h"], glob_rad)
+        forecast_rad_peak = _first_finite_state_attr(state, ["forecast_rad_peak_2h"], glob_rad)
+        rad_load = max(glob_rad, forecast_rad_mean, forecast_rad_peak)
+        vpd = float(calculate_vpd_kpa(temp_air, rh_air))
+        dew_margin = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        extreme_dew_risk = (
+            rh_air >= float(getattr(self.config, "tomato_safety_v2_extreme_dew_rh", 94.0))
+            or dew_margin < float(getattr(self.config, "tomato_safety_v2_extreme_dew_margin", 0.40))
+        )
+        enabled = bool(getattr(self.config, "rspc_hot_dry_candidates_enabled", False))
+        if bool(getattr(self.config, "rspc_hot_dry_require_tomato_v2", True)):
+            enabled = enabled and bool(getattr(self.config, "tomato_safety_v2_enabled", False))
+        dry_pressure = (
+            rh_air <= float(getattr(self.config, "rspc_hot_dry_rh_threshold", 60.0))
+            or vpd >= float(getattr(self.config, "rspc_hot_dry_vpd_threshold", 1.55))
+        )
+        hot_load = (
+            temp_air >= float(getattr(self.config, "rspc_hot_dry_temp_threshold", 28.5))
+            and rad_load >= float(getattr(self.config, "rspc_hot_dry_rad_threshold", 300.0))
+        )
+        active = bool(enabled and dry_pressure and hot_load and not extreme_dew_risk)
+        hot_danger = temp_air >= float(getattr(self.config, "tomato_safety_v2_hot_temp_threshold", 32.0))
+        pre_hot_dry = bool(active and not hot_danger and temp_air < 31.0 and rad_load >= 600.0)
+        cooldown_recovery = bool(
+            active
+            and not hot_danger
+            and temp_air < float(getattr(self.config, "tomato_safety_v2_cooldown_dry_temp_threshold", 30.5))
+            and rad_load < 600.0
+        )
+        return {
+            "active": active,
+            "enabled": bool(enabled),
+            "temp_air": float(temp_air),
+            "rh_air": float(rh_air),
+            "vpd": float(vpd),
+            "glob_rad": float(glob_rad),
+            "rad_load": float(rad_load),
+            "dew_margin": float(dew_margin),
+            "extreme_dew_risk": bool(extreme_dew_risk),
+            "dry_pressure": bool(dry_pressure),
+            "hot_load": bool(hot_load),
+            "hot_danger": bool(hot_danger),
+            "pre_hot_dry": bool(pre_hot_dry),
+            "cooldown_recovery": bool(cooldown_recovery),
+        }
+
+    def _rspc_hot_dry_vent_relief_floor(self, state, features: Optional[Dict[str, Any]] = None) -> float:
+        info = features if isinstance(features, dict) else self._rspc_hot_dry_features(state)
+        temp_air = float(info.get("temp_air", float(getattr(state, "temp_air", 20.0))))
+        rad_load = float(info.get("rad_load", float(getattr(state, "glob_rad", 0.0))))
+        floor = float(getattr(self.config, "rspc_hot_dry_vent_relief_floor", 0.45))
+        if temp_air >= 32.0:
+            floor = max(floor, 0.85)
+        elif temp_air >= 31.0:
+            floor = max(floor, float(getattr(self.config, "rspc_hot_dry_hot_vent_relief_floor", 0.62)))
+        elif rad_load >= 650.0:
+            floor = max(floor, 0.52)
+        if temp_air >= 31.5 and float(getattr(state, "temp_out", temp_air)) < temp_air - 1.0:
+            floor = min(0.85, floor + 0.10)
+        return float(np.clip(floor, 0.0, 1.0))
+
+    def _build_rspc_hot_dry_candidates(
+        self,
+        state,
+        baseline_control: np.ndarray,
+    ) -> List[Tuple[str, np.ndarray, str]]:
+        info = self._rspc_hot_dry_features(state)
+        if not info["active"]:
+            return []
+
+        temp_air = float(info["temp_air"])
+        rh_air = float(info["rh_air"])
+        vpd = float(info["vpd"])
+        rad_load = float(info["rad_load"])
+        baseline = np.clip(np.asarray(baseline_control, dtype=np.float32), 0.0, 1.0)
+        hot_danger = bool(info.get("hot_danger", False))
+        pre_hot_dry = bool(info.get("pre_hot_dry", False))
+        cooldown_recovery = bool(info.get("cooldown_recovery", False))
+        temp_severity = float(np.clip((temp_air - 28.5) / 4.0, 0.0, 1.0))
+        dry_severity = float(np.clip(max(55.0 - rh_air, vpd * 12.0 - 18.0) / 12.0, 0.0, 1.0))
+        vent_floor = self._rspc_hot_dry_vent_relief_floor(state, info)
+        shade_floor = 0.50 if rad_load < 550.0 else 0.66
+        shade_high = 0.72 if rad_load < 700.0 else 0.84
+        screen_humid_floor = 0.72 if rh_air < 52.0 else 0.62
+        screen_balanced = float(np.clip(0.62 + 0.18 * dry_severity - 0.12 * temp_severity, 0.45, 0.82))
+
+        def candidate(screen: float, vent: float, shade: float) -> np.ndarray:
+            shaped = baseline.copy()
+            shaped[0] = 0.0
+            shaped[1] = 0.0
+            shaped[2] = float(np.clip(max(float(baseline[2]), screen), 0.0, 0.85))
+            if hot_danger:
+                shaped[3] = float(np.clip(max(float(baseline[3]), vent), 0.0, 0.95))
+            else:
+                shaped[3] = float(np.clip(vent, 0.0, 0.85))
+            shaped[4] = 0.0
+            shaped[5] = float(np.clip(max(float(baseline[5]), shade), 0.0, 0.85))
+            return np.clip(shaped, 0.0, 1.0).astype(np.float32)
+
+        if cooldown_recovery:
+            balanced_vent = min(0.34, max(0.22, vent_floor))
+            preserving_vent = 0.20
+            vent_first = 0.42
+            screen_humid_floor = max(screen_humid_floor, 0.82)
+        elif pre_hot_dry:
+            balanced_vent = min(0.62, max(0.46, vent_floor + 0.08))
+            preserving_vent = min(0.48, max(0.34, vent_floor))
+            vent_first = min(0.74, max(0.60, vent_floor + 0.16))
+            screen_humid_floor = max(screen_humid_floor, 0.74)
+            shade_floor = max(shade_floor, 0.78)
+            shade_high = max(shade_high, 0.84)
+        else:
+            balanced_vent = max(vent_floor, 0.46 + 0.16 * temp_severity)
+            preserving_vent = max(0.34, min(0.52, vent_floor - 0.08))
+            vent_first = max(vent_floor + 0.12, 0.70 if temp_air >= 31.0 else 0.58)
+        return [
+            (
+                "hot_dry_humidity_preserving_cooling",
+                candidate(max(screen_humid_floor, screen_balanced), preserving_vent, shade_floor),
+                "hot-dry cooling with retained humidity buffer",
+            ),
+            (
+                "hot_dry_balanced_cooling",
+                candidate(screen_balanced, balanced_vent, max(shade_floor, 0.56)),
+                "balanced hot-dry cooling candidate",
+            ),
+            (
+                "hot_dry_shade_first_cooling",
+                candidate(max(0.55, screen_balanced - 0.08), balanced_vent, shade_high),
+                "radiation-first hot-dry cooling candidate",
+            ),
+            (
+                "hot_dry_vent_first_cooling",
+                candidate(max(0.42, screen_balanced - 0.18), vent_first, shade_high),
+                "temperature-first hot-dry cooling candidate",
+            ),
+        ]
+
+    def _rspc_hot_dry_shadow_features(self, state) -> Dict[str, Any]:
+        info = dict(self._rspc_hot_dry_features(state))
+        gate_reason = self._rspc_action_safety_gate_reason(state)
+        temp_air = float(info.get("temp_air", float(getattr(state, "temp_air", 20.0))))
+        rad_load = float(info.get("rad_load", float(getattr(state, "glob_rad", 0.0))))
+        hot_danger = temp_air >= float(getattr(self.config, "tomato_safety_v2_hot_temp_threshold", 32.0))
+        semantic_active = bool(
+            info.get("dry_pressure", False)
+            and info.get("hot_load", False)
+            and not info.get("extreme_dew_risk", False)
+        )
+        info.update(
+            {
+                "semantic_active": bool(semantic_active),
+                "shadow_active": bool(semantic_active and gate_reason == "none" and not hot_danger),
+                "shadow_gate_reason": str(gate_reason),
+                "hot_pressure": bool(info.get("hot_load", False)),
+                "strong_rad": bool(rad_load >= 600.0),
+                "extreme_dew": bool(info.get("extreme_dew_risk", False)),
+                "pre_hot_dry_shadow": bool(semantic_active and not hot_danger and temp_air < 31.0 and rad_load >= 600.0),
+                "cooldown_recovery_shadow": bool(
+                    semantic_active
+                    and not hot_danger
+                    and temp_air < float(getattr(self.config, "tomato_safety_v2_cooldown_dry_temp_threshold", 30.5))
+                    and rad_load < 600.0
+                ),
+            }
+        )
+        return info
+
+    def _build_rspc_hot_dry_shadow_candidates(
+        self,
+        state,
+        baseline_control: np.ndarray,
+    ) -> List[Tuple[str, np.ndarray, str]]:
+        info = self._rspc_hot_dry_shadow_features(state)
+        if not info.get("shadow_active", False):
+            return []
+
+        temp_air = float(info["temp_air"])
+        rh_air = float(info["rh_air"])
+        vpd = float(info["vpd"])
+        rad_load = float(info["rad_load"])
+        baseline = np.clip(np.asarray(baseline_control, dtype=np.float32), 0.0, 1.0)
+        temp_severity = float(np.clip((temp_air - 28.5) / 3.5, 0.0, 1.0))
+        dry_severity = float(np.clip(max(55.0 - rh_air, vpd * 12.0 - 18.0) / 12.0, 0.0, 1.0))
+        vent_floor = self._rspc_hot_dry_vent_relief_floor(state, info)
+        pre_hot_dry = bool(info.get("pre_hot_dry_shadow", False))
+        cooldown_recovery = bool(info.get("cooldown_recovery_shadow", False))
+
+        shade_preempt = 0.70 if rad_load < 650.0 else 0.84
+        shade_balanced = 0.58 if rad_load < 650.0 else 0.72
+        screen_cap = 0.78 if temp_air < 30.0 else 0.68 if temp_air < 31.0 else 0.58
+        screen_buffer = float(np.clip(0.58 + 0.18 * dry_severity - 0.10 * temp_severity, 0.42, screen_cap))
+        if pre_hot_dry:
+            screen_buffer = max(screen_buffer, min(screen_cap, 0.66))
+            shade_preempt = max(shade_preempt, 0.84)
+            shade_balanced = max(shade_balanced, 0.74)
+        if cooldown_recovery:
+            screen_buffer = max(screen_buffer, min(screen_cap, 0.72))
+
+        def candidate(screen: float, vent: float, shade: float) -> np.ndarray:
+            shaped = baseline.copy()
+            shaped[0] = 0.0
+            shaped[1] = 0.0
+            shaped[2] = float(np.clip(screen, 0.0, screen_cap))
+            shaped[3] = float(np.clip(vent, 0.0, 0.88))
+            shaped[4] = 0.0
+            shaped[5] = float(np.clip(max(float(baseline[5]), shade), 0.0, 0.88))
+            return np.clip(shaped, 0.0, 1.0).astype(np.float32)
+
+        preserving_vent = min(0.42, max(0.20, min(vent_floor, 0.36)))
+        balanced_vent = min(0.58, max(0.34, vent_floor))
+        shade_first_vent = min(0.52, max(0.28, vent_floor - 0.06))
+        reserve_vent = max(0.42, min(0.58, vent_floor))
+        if temp_air >= 31.0:
+            preserving_vent = max(preserving_vent, 0.42)
+            balanced_vent = max(balanced_vent, 0.56)
+            shade_first_vent = max(shade_first_vent, 0.50)
+
+        candidates: List[Tuple[str, np.ndarray, str]] = [
+            (
+                "shadow_hot_dry_humidity_retention",
+                candidate(screen_buffer, preserving_vent, shade_balanced),
+                "shadow-only hot-dry humidity retention candidate",
+            ),
+            (
+                "shadow_hot_dry_shade_preempt",
+                candidate(max(0.42, screen_buffer - 0.08), shade_first_vent, shade_preempt),
+                "shadow-only radiation preemption candidate",
+            ),
+            (
+                "shadow_hot_dry_balanced_relief",
+                candidate(max(0.42, screen_buffer - 0.04), balanced_vent, max(shade_balanced, 0.66)),
+                "shadow-only balanced humidity and cooling candidate",
+            ),
+        ]
+
+        canopy_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        if canopy_margin < 3.0 and rad_load >= 650.0 and rh_air >= 58.0 and vpd <= 1.65:
+            candidates.append(
+                (
+                    "shadow_hot_dry_canopy_reserve",
+                    candidate(min(screen_buffer, 0.55), reserve_vent, 0.50),
+                    "shadow-only canopy reserve candidate under hot-dry radiation",
+                )
+            )
+        return candidates
+
+    def _score_rspc_hot_dry_candidate(self, state, control: np.ndarray) -> Dict[str, float]:
+        info = self._rspc_hot_dry_features(state)
+        if not info["active"]:
+            return {
+                "hot_dry_heat_trap_penalty": 0.0,
+                "hot_dry_under_cooling_penalty": 0.0,
+                "hot_dry_overvent_dry_penalty": 0.0,
+                "hot_dry_mitigation_bonus": 0.0,
+            }
+        heat, co2_u, screen, vent, lamp, shade = [float(x) for x in np.clip(control[:6], 0.0, 1.0)]
+        temp_air = float(info["temp_air"])
+        rad_load = float(info["rad_load"])
+        rh_air = float(info["rh_air"])
+        vpd = float(info["vpd"])
+        heat_load = max(temp_air - 28.0, 0.0) + max(rad_load - 300.0, 0.0) / 350.0
+        heat_trap = heat_load * (
+            1.20 * screen * max(0.60 - shade, 0.0)
+            + 2.00 * max(self._rspc_hot_dry_vent_relief_floor(state, info) - vent, 0.0) ** 2
+            + 0.35 * max(screen - 0.88, 0.0) ** 2
+            + 0.40 * heat
+            + 0.25 * lamp
+        )
+        vent_floor = self._rspc_hot_dry_vent_relief_floor(state, info)
+        under_cooling = max(vent_floor - vent, 0.0) ** 2
+        if rad_load >= 450.0:
+            under_cooling += 0.75 * max(0.50 - shade, 0.0) ** 2
+        hot_danger = bool(info.get("hot_danger", False))
+        pre_hot_dry = bool(info.get("pre_hot_dry", False))
+        cooldown_recovery = bool(info.get("cooldown_recovery", False))
+        if hot_danger:
+            vent_budget = 1.0
+        elif pre_hot_dry:
+            vent_budget = float(getattr(self.config, "tomato_safety_v2_pre_hot_dry_vent_cap", 0.82))
+        elif cooldown_recovery:
+            vent_budget = float(getattr(self.config, "tomato_safety_v2_cooldown_dry_vent_cap", 0.28))
+        else:
+            vent_budget = 0.62
+        dry_severity = float(np.clip(max(55.0 - rh_air, vpd * 12.0 - 18.0) / 12.0, 0.0, 1.0))
+        overvent_dry = (1.0 + dry_severity) * max(vent - vent_budget, 0.0) ** 2
+        humidity_buffer = 0.22 * min(max(screen, 0.0), 0.85) if rh_air < 52.0 or vpd > 1.80 else 0.0
+        vent_mitigation_weight = 0.26 if hot_danger else 0.10
+        mitigation = 0.34 * min(max(shade - 0.35, 0.0), 0.45) + vent_mitigation_weight * min(max(vent - 0.30, 0.0), 0.45)
+        mitigation += humidity_buffer
+        if co2_u <= 0.01 and lamp <= 0.01 and heat <= 0.05:
+            mitigation += 0.18
+        return {
+            "hot_dry_heat_trap_penalty": float(heat_trap),
+            "hot_dry_under_cooling_penalty": float(under_cooling),
+            "hot_dry_overvent_dry_penalty": float(overvent_dry),
+            "hot_dry_mitigation_bonus": float(mitigation),
+        }
+
     def _estimate_candidate_response(self, state, control: np.ndarray) -> Dict[str, float]:
         """轻量级一阶响应估计，用于候选排序而非替代 GreenLight 物理模型。"""
         control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
@@ -2097,6 +3708,135 @@ class RuleBasedLLMDirector:
             "total_rad": float(total_rad),
         }
 
+    def _candidate_response_prediction_metadata(
+        self,
+        state,
+        control: np.ndarray,
+        response: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Shadow-only next-state risk proxy for candidate diagnostics."""
+        control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        current_control = np.clip(self._state_control_vector(state), 0.0, 1.0)
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        dew_margin_air = float(getattr(state, "dew_margin_air", 3.0))
+        canopy_dew_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        canopy_trend = self._update_canopy_proxy_history(state)
+        temp_next = float(response.get("temp_next", temp_air) or temp_air)
+        rh_next = float(response.get("rh_next", rh_air) or rh_air)
+        vpd_next = float(response.get("vpd_next", calculate_vpd_kpa(temp_next, rh_next)) or 0.0)
+
+        heat, _co2_u, screen, vent, _lamp, shade = [float(x) for x in control[:6]]
+        screen_delta = screen - float(current_control[2])
+        vent_delta = vent - float(current_control[3])
+        temp_delta = temp_next - temp_air
+        rh_rise = max(rh_next - rh_air, 0.0)
+        rh_drop = max(rh_air - rh_next, 0.0)
+
+        dew_margin_next = (
+            dew_margin_air
+            + 0.06 * temp_delta
+            + 0.012 * rh_drop
+            + 0.10 * heat
+            + 0.04 * shade
+            + 0.20 * max(vent_delta, 0.0)
+            - 0.025 * rh_rise
+            - 0.14 * max(screen_delta, 0.0)
+            - 0.10 * max(-vent_delta, 0.0)
+        )
+        canopy_margin_next = (
+            canopy_dew_margin
+            + 0.08 * temp_delta
+            + 0.010 * rh_drop
+            + 0.08 * heat
+            + 0.04 * shade
+            + 0.24 * max(vent_delta, 0.0)
+            - 0.030 * rh_rise
+            - 0.32 * max(screen_delta, 0.0)
+            - 0.20 * max(-vent_delta, 0.0)
+            - 0.05 * max(screen - 0.70, 0.0)
+        )
+        near_boundary = bool(canopy_dew_margin < 1.5 or canopy_margin_next < 1.0)
+        negative_canopy_trend = max(-float(canopy_trend.get("canopy_delta_1", 0.0) or 0.0), 0.0)
+        risk_terms = {
+            "base": 0.20,
+            "screen_delta": 0.35 * max(screen_delta, 0.0),
+            "ventilation_delta": 0.25 * max(-vent_delta, 0.0),
+            "high_screen": 0.30 if screen >= 0.75 else (0.15 if screen >= 0.55 else 0.0),
+            "low_ventilation": 0.25 if vent <= 0.25 else (0.10 if vent <= 0.35 else 0.0),
+            "rh_high": 0.15 * max(rh_air - 85.0, 0.0) / 10.0,
+            "near_boundary": 0.25 if canopy_dew_margin < 1.5 else (0.10 if canopy_margin_next < 1.5 else 0.0),
+            "negative_canopy_trend": min(0.60, 0.30 * negative_canopy_trend),
+            "low_air_dew_margin": 0.15 if dew_margin_air < 1.5 else 0.0,
+        }
+        v2_risk_buffer = float(sum(float(value) for value in risk_terms.values()))
+        canopy_margin_next_v2 = float(canopy_margin_next - v2_risk_buffer)
+        canopy_warning_v2 = bool(
+            canopy_margin_next_v2 < 0.25
+            or (
+                near_boundary
+                and screen >= 0.55
+                and vent <= 0.25
+                and (vent_delta < -0.02 or negative_canopy_trend > 0.35)
+            )
+        )
+        return {
+            "prediction_schema_version": "canopy_proxy_schema_v2",
+            "predicted_temp_next": float(temp_next),
+            "predicted_rh_next": float(rh_next),
+            "predicted_vpd_next": float(vpd_next),
+            "predicted_dew_margin_air_next": float(dew_margin_next),
+            "predicted_canopy_dew_margin_next": float(canopy_margin_next),
+            "predicted_dew_lt0": bool(dew_margin_next < 0.0),
+            "predicted_canopy_lt0": bool(canopy_margin_next < 0.0),
+            "prediction_horizon_steps": 1,
+            "prediction_model": "proxy_v1",
+            "prediction_model_v2": "proxy_v2_conservative",
+            "predicted_canopy_dew_margin_next_v2": float(canopy_margin_next_v2),
+            "predicted_canopy_lt0_v2": bool(canopy_margin_next_v2 < 0.0),
+            "predicted_canopy_warning_v2": canopy_warning_v2,
+            "canopy_proxy_v2_risk_buffer": float(v2_risk_buffer),
+            "canopy_proxy_v2_risk_terms": {key: float(value) for key, value in risk_terms.items()},
+            "canopy_proxy_history_available": bool(canopy_trend.get("history_available", False)),
+            "canopy_proxy_recent_delta_1": float(canopy_trend.get("canopy_delta_1", 0.0) or 0.0),
+            "canopy_proxy_recent_delta_3": float(canopy_trend.get("canopy_delta_3", 0.0) or 0.0),
+        }
+
+    def _update_canopy_proxy_history(self, state) -> Dict[str, Any]:
+        history = getattr(self, "_canopy_margin_history", None)
+        if history is None:
+            history = deque(maxlen=8)
+            self._canopy_margin_history = history
+            self._last_canopy_history_timestep = None
+        try:
+            timestep = int(getattr(state, "timestep", -1))
+        except Exception:
+            timestep = -1
+        if getattr(self, "_last_canopy_history_timestep", None) != timestep:
+            temp_air = float(getattr(state, "temp_air", 20.0))
+            rh_air = float(getattr(state, "rh_air", 70.0))
+            history.append(
+                {
+                    "timestep": timestep,
+                    "canopy_dew_margin": float(getattr(state, "canopy_dew_margin", 3.0)),
+                    "dew_margin_air": float(getattr(state, "dew_margin_air", 3.0)),
+                    "rh_air": rh_air,
+                    "vpd_air": float(calculate_vpd_kpa(temp_air, rh_air)),
+                }
+            )
+            self._last_canopy_history_timestep = timestep
+        items = list(history)
+        if len(items) < 2:
+            return {"history_available": False, "canopy_delta_1": 0.0, "canopy_delta_3": 0.0}
+        current = float(items[-1]["canopy_dew_margin"])
+        previous = float(items[-2]["canopy_dew_margin"])
+        older = float(items[-4]["canopy_dew_margin"]) if len(items) >= 4 else previous
+        return {
+            "history_available": True,
+            "canopy_delta_1": float(current - previous),
+            "canopy_delta_3": float((current - older) / max(1, min(3, len(items) - 1))),
+        }
+
     def _score_fallback_candidate(
         self,
         state,
@@ -2129,20 +3869,28 @@ class RuleBasedLLMDirector:
             0.85 * max(vpd_next - 1.20, 0.0) ** 2
             + 1.50 * max(vpd_next - 1.60, 0.0) ** 2
         )
-        dew_margin = min(
-            float(getattr(state, "dew_margin_air", 3.0)),
-            float(getattr(state, "canopy_dew_margin", 3.0)),
-        )
+        dew_margin_air = float(getattr(state, "dew_margin_air", 3.0))
+        canopy_dew_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        dew_margin = min(dew_margin_air, canopy_dew_margin)
         dew_penalty = max(1.2 - dew_margin, 0.0) * (1.0 + max(float(state.rh_air) - 85.0, 0.0) / 10.0)
+        canopy_dew_penalty = max(1.2 - canopy_dew_margin, 0.0) * (
+            1.0 + max(float(state.rh_air) - 85.0, 0.0) / 10.0
+        )
 
         energy_penalty = 0.70 * control[0] + 0.22 * control[1] + 1.05 * control[4] + 0.05 * control[3]
         conflict_penalty = 0.0
+        heat_vent_conflict_penalty = 0.0
+        co2_leak_penalty = 0.0
+        lamp_risk_penalty = 0.0
         if control[0] > 0.18 and control[3] > 0.22 and float(state.rh_air) < 88.0:
-            conflict_penalty += (control[0] + control[3])
+            heat_vent_conflict_penalty = float(control[0] + control[3])
+            conflict_penalty += heat_vent_conflict_penalty
         if control[1] > 0.05 and (control[3] > 0.18 or total_rad < float(self.config.fallback_co2_min_rad)):
-            conflict_penalty += 1.5 * control[1]
+            co2_leak_penalty = float(1.5 * control[1])
+            conflict_penalty += co2_leak_penalty
         if control[4] > 0.05 and (float(state.rh_air) >= 86.0 or control[3] >= 0.30):
-            conflict_penalty += 1.2 * control[4]
+            lamp_risk_penalty = float(1.2 * control[4])
+            conflict_penalty += lamp_risk_penalty
 
         smooth_penalty = 0.0
         if self.last_control is not None:
@@ -2166,31 +3914,2116 @@ class RuleBasedLLMDirector:
             if float(state.temp_air) < 18.0 and control[2] >= 0.65:
                 mitigation_bonus += 0.18
 
+        hot_dry_terms = self._score_rspc_hot_dry_candidate(state, control)
+        hot_dry_penalty = (
+            hot_dry_terms["hot_dry_heat_trap_penalty"]
+            + 18.0 * hot_dry_terms["hot_dry_under_cooling_penalty"]
+            + 9.0 * hot_dry_terms["hot_dry_overvent_dry_penalty"]
+            - 2.8 * hot_dry_terms["hot_dry_mitigation_bonus"]
+        )
+
         score = (
             self.config.fallback_temp_penalty_weight * temp_penalty
             + self.config.fallback_rh_penalty_weight * rh_penalty
-            + 1.20 * dry_penalty
-            + 1.00 * vpd_penalty
+            + float(getattr(self.config, "fallback_dry_penalty_weight", 1.20)) * dry_penalty
+            + float(getattr(self.config, "fallback_vpd_high_penalty_weight", 1.00)) * vpd_penalty
             + self.config.fallback_cost_penalty_weight * energy_penalty
             + self.config.fallback_smooth_penalty_weight * smooth_penalty
             + self.config.fallback_conflict_penalty_weight * conflict_penalty
-            + 0.65 * dew_penalty
+            + float(getattr(self.config, "fallback_dew_penalty_weight", 0.65)) * dew_penalty
+            + float(getattr(self.config, "rspc_hot_dry_score_weight", 1.15)) * hot_dry_penalty
             - mitigation_bonus
         )
         details = {
             "score": float(score),
+            "total_score": float(score),
             "temp_penalty": float(temp_penalty),
             "rh_penalty": float(rh_penalty),
             "dry_penalty": float(dry_penalty),
             "vpd_penalty": float(vpd_penalty),
+            "vpd_high_penalty": float(vpd_penalty),
+            "vpd_low_penalty": 0.0,
             "dew_penalty": float(dew_penalty),
+            "canopy_dew_penalty": float(canopy_dew_penalty),
             "energy_penalty": float(energy_penalty),
             "conflict_penalty": float(conflict_penalty),
+            "heat_vent_conflict_penalty": float(heat_vent_conflict_penalty),
+            "co2_leak_penalty": float(co2_leak_penalty),
+            "lamp_risk_penalty": float(lamp_risk_penalty),
+            "dry_vent_penalty": float(hot_dry_terms["hot_dry_overvent_dry_penalty"]),
+            "forecast_risk_penalty": 0.0,
             "smooth_penalty": float(smooth_penalty),
             "mitigation_bonus": float(mitigation_bonus),
+            "hot_dry_penalty": float(hot_dry_penalty),
+            **hot_dry_terms,
             **response,
+            **self._candidate_response_prediction_metadata(state, control, response),
         }
         return float(score), details
+
+    @staticmethod
+    def _control_terms(control: np.ndarray) -> Dict[str, float]:
+        values = np.clip(np.asarray(control, dtype=np.float32).reshape(-1), 0.0, 1.0)
+        names = ("heat", "co2", "screen", "vent", "lamp", "shade")
+        return {name: float(values[i]) if i < len(values) else 0.0 for i, name in enumerate(names)}
+
+    @staticmethod
+    def _control_from_terms(terms: Mapping[str, Any]) -> Optional[np.ndarray]:
+        if not isinstance(terms, Mapping):
+            return None
+        names = ("heat", "co2", "screen", "vent", "lamp", "shade")
+        values: List[float] = []
+        try:
+            for name in names:
+                values.append(float(terms.get(name, 0.0) or 0.0))
+        except Exception:
+            return None
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    @staticmethod
+    def _cstcc_float(value: Any, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = float(default)
+        if not np.isfinite(number):
+            number = float(default)
+        return number
+
+    @classmethod
+    def _cstcc_action_record(cls, control: Any) -> Dict[str, float]:
+        aliases = {
+            "u_heating": ("u_heating", "heating", "heat", "u_boil"),
+            "u_co2": ("u_co2", "co2"),
+            "u_screen": ("u_screen", "screen", "u_th_scr"),
+            "u_ventilation": ("u_ventilation", "ventilation", "vent", "u_vent"),
+            "u_lighting": ("u_lighting", "lighting", "lamp", "u_lamp"),
+            "u_shading": ("u_shading", "shading", "shade", "u_bl_scr"),
+        }
+        if isinstance(control, Mapping):
+            row: Dict[str, float] = {}
+            for field, names in aliases.items():
+                value = 0.0
+                for name in names:
+                    if name in control:
+                        value = cls._cstcc_float(control.get(name), 0.0)
+                        break
+                row[field] = float(np.clip(value, 0.0, 1.0))
+            return row
+        try:
+            values = np.asarray(control, dtype=np.float32).reshape(-1)
+        except Exception:
+            values = np.zeros(len(CSTCC_ACTION_FIELDS), dtype=np.float32)
+        return {
+            field: float(np.clip(values[idx] if idx < int(values.size) else 0.0, 0.0, 1.0))
+            for idx, field in enumerate(CSTCC_ACTION_FIELDS)
+        }
+
+    def _cstcc_state_record(self, state: Any) -> Dict[str, Any]:
+        temp = self._cstcc_float(getattr(state, "temp_air", 20.0), 20.0)
+        rh = self._cstcc_float(getattr(state, "rh_air", 70.0), 70.0)
+        vpd = self._cstcc_float(getattr(state, "vpd_air", None), float("nan"))
+        if not np.isfinite(vpd):
+            vpd = self._cstcc_float(calculate_vpd_kpa(temp, rh), 0.0)
+        return {
+            "timestep": int(self._cstcc_float(getattr(state, "timestep", 0), 0.0)),
+            "day_of_year": int(self._cstcc_float(getattr(state, "day_of_year", 0), 0.0)),
+            "hour_of_day": self._cstcc_float(getattr(state, "hour_of_day", 0.0), 0.0),
+            "temp_air": temp,
+            "rh_air": rh,
+            "vpd_air": vpd,
+            "co2_air": self._cstcc_float(getattr(state, "co2_air", 400.0), 400.0),
+            "pipe_temp": self._cstcc_float(
+                getattr(state, "pipe_temp", getattr(state, "t_pipe", getattr(state, "pipe_temperature", temp))),
+                temp,
+            ),
+            "canopy_dew_margin": self._cstcc_float(getattr(state, "canopy_dew_margin", 3.0), 3.0),
+            "dew_margin_air": self._cstcc_float(getattr(state, "dew_margin_air", 3.0), 3.0),
+            "glob_rad": self._cstcc_float(getattr(state, "glob_rad", getattr(state, "radiation", 0.0)), 0.0),
+        }
+
+    def _cstcc_weather_record(self, state: Any) -> Dict[str, Any]:
+        return {
+            "available": True,
+            "timestep": int(self._cstcc_float(getattr(state, "timestep", 0), 0.0)),
+            "outdoor_temp": self._cstcc_float(
+                getattr(state, "temp_out", getattr(state, "outdoor_temp", getattr(state, "t_out", 20.0))),
+                20.0,
+            ),
+            "outdoor_rh": self._cstcc_float(
+                getattr(state, "rh_out", getattr(state, "outdoor_rh", getattr(state, "rh_outside", 70.0))),
+                70.0,
+            ),
+            "radiation": self._cstcc_float(getattr(state, "glob_rad", getattr(state, "radiation", 0.0)), 0.0),
+            "co2_outdoor": self._cstcc_float(getattr(state, "co2_out", 400.0), 400.0),
+        }
+
+    def _cstcc_semantic_suggestion(
+        self,
+        state: Any,
+        final_action: Mapping[str, Any],
+    ) -> SemanticSuggestion:
+        temp = self._cstcc_float(getattr(state, "temp_air", 20.0), 20.0)
+        rh = self._cstcc_float(getattr(state, "rh_air", 70.0), 70.0)
+        vpd = self._cstcc_float(getattr(state, "vpd_air", None), float("nan"))
+        if not np.isfinite(vpd):
+            vpd = self._cstcc_float(calculate_vpd_kpa(temp, rh), 0.0)
+        co2 = self._cstcc_float(getattr(state, "co2_air", 400.0), 400.0)
+        dew_margin = min(
+            self._cstcc_float(getattr(state, "dew_margin_air", 3.0), 3.0),
+            self._cstcc_float(getattr(state, "canopy_dew_margin", 3.0), 3.0),
+        )
+        vent = self._cstcc_float(final_action.get("u_ventilation", 0.0), 0.0)
+        co2_action = self._cstcc_float(final_action.get("u_co2", 0.0), 0.0)
+
+        regime = "NORMAL_BALANCED"
+        confidence = 0.35
+        weights: Dict[str, float] = {}
+        intent = "maintain balanced greenhouse operation"
+        risks: List[str] = []
+        if temp >= 31.0 and vpd >= 2.4:
+            regime = "SOLVER_SENSITIVE_EMERGENCY"
+            confidence = 0.75
+            weights = {"solver_risk": 0.70, "action_smoothness": 0.60, "vpd_risk": 0.50}
+            intent = "avoid abrupt changes in hot dry solver-sensitive conditions"
+            risks = ["hot_dry_solver_sensitive_regime", "high_temp", "high_vpd"]
+        elif vpd >= 2.0 and rh <= 60.0:
+            regime = "HIGH_VPD_DRY_STRESS"
+            confidence = min(0.90, 0.55 + 0.12 * max(vpd - 2.0, 0.0) + 0.01 * max(60.0 - rh, 0.0))
+            weights = {"vpd_risk": 0.65, "humidity_recovery": 0.45, "action_smoothness": 0.40}
+            intent = "reduce dry stress without abrupt ventilation reversal"
+            risks = ["high_vpd", "low_rh"]
+        elif temp >= 28.5:
+            regime = "HEAT_ACCUMULATION"
+            confidence = min(0.80, 0.45 + 0.08 * (temp - 28.5))
+            weights = {"temperature_tracking": 0.60, "energy": 0.30, "action_smoothness": 0.35}
+            intent = "relieve heat accumulation smoothly"
+            risks = ["high_temp"]
+        elif rh >= 88.0 or dew_margin < 1.0:
+            regime = "HUMIDITY_EXCESS_DISEASE_RISK"
+            confidence = min(0.85, 0.50 + 0.04 * max(rh - 88.0, 0.0) + 0.10 * max(1.0 - dew_margin, 0.0))
+            weights = {"humidity_recovery": 0.65, "rewrite_pressure": 0.40, "action_smoothness": 0.35}
+            intent = "reduce humidity and dew risk smoothly"
+            risks = ["humidity_excess", "dew_margin_low"]
+        elif co2_action >= 0.35 and vent >= 0.45 and co2 <= 700.0:
+            regime = "CO2_VENTILATION_CONFLICT"
+            confidence = 0.70
+            weights = {"energy": 0.35, "action_smoothness": 0.45}
+            intent = "avoid wasting CO2 under high ventilation"
+            risks = ["co2_ventilation_conflict"]
+
+        return SemanticSuggestion(
+            regime=regime,
+            regime_confidence=confidence,
+            llm_reported_confidence=confidence,
+            priority_weight_suggestions=weights,
+            control_intent=intent,
+            risk_factors=risks,
+            uncertain_fields=[],
+            suggested_refresh_steps=12,
+            source="runtime_rule_semantic_suggestion_v81_1_no_online_llm",
+        )
+
+    def _ensure_cstcc_shadow_buffers(self) -> None:
+        history_steps = max(1, int(getattr(self.config, "cstcc_shadow_history_steps", 60) or 60))
+        if not isinstance(getattr(self, "_cstcc_state_history", None), deque):
+            self._cstcc_state_history = deque(maxlen=history_steps)
+        if not isinstance(getattr(self, "_cstcc_action_history", None), deque):
+            self._cstcc_action_history = deque(maxlen=history_steps)
+        if not isinstance(getattr(self, "_cstcc_weather_history", None), deque):
+            self._cstcc_weather_history = deque(maxlen=history_steps)
+        if not hasattr(self, "_cstcc_previous_plan_sequence"):
+            self._cstcc_previous_plan_sequence = []
+        if not hasattr(self, "_cstcc_active_regime"):
+            self._cstcc_active_regime = "NORMAL_BALANCED"
+        if not hasattr(self, "_cstcc_regime_age_steps"):
+            self._cstcc_regime_age_steps = 0
+
+    def _cstcc_episode_id(self, state: Any) -> str:
+        env_id = str(getattr(self, "env_id", "unknown_env") or "unknown_env")
+        day = int(self._cstcc_float(getattr(state, "day_of_year", 0), 0.0))
+        return f"{env_id}_day{day}"
+
+    @staticmethod
+    def _cstcc_row_json_size_kb(row: Mapping[str, Any]) -> float:
+        return float(len(json.dumps(dict(row), ensure_ascii=False, default=str).encode("utf-8")) / 1024.0)
+
+    def _cstcc_shadow_config_payload(self) -> Optional[Dict[str, Any]]:
+        config_path = str(getattr(self.config, "cstcc_shadow_config_path", "") or "")
+        if not config_path:
+            return None
+        cached_path = getattr(self, "_cstcc_shadow_loaded_config_path", None)
+        cached_payload = getattr(self, "_cstcc_shadow_loaded_config_payload", None)
+        if cached_path == config_path and isinstance(cached_payload, dict):
+            return dict(cached_payload)
+        payload = load_cstcc_config(config_path)
+        self._cstcc_shadow_loaded_config_path = config_path
+        self._cstcc_shadow_loaded_config_payload = dict(payload)
+        return dict(payload)
+
+    def _run_cstcc_shadow_runtime_hook(
+        self,
+        state: Any,
+        final_control: np.ndarray,
+        *,
+        rule_control: Optional[np.ndarray] = None,
+        anchor_control: Optional[np.ndarray] = None,
+    ) -> None:
+        if not bool(getattr(self.config, "cstcc_shadow_enabled", False)):
+            self.last_cstcc_shadow = {
+                "enabled": False,
+                "shadow_only": True,
+                "final_action_changed": False,
+                "final_action_invariant_verified": True,
+            }
+            return
+
+        self._ensure_cstcc_shadow_buffers()
+        step = int(self._cstcc_float(getattr(state, "timestep", 0), 0.0))
+        episode_id = self._cstcc_episode_id(state)
+        before_vector = np.asarray(final_control, dtype=np.float32).reshape(-1).copy()
+        before_action = self._cstcc_action_record(before_vector)
+        state_record = self._cstcc_state_record(state)
+        weather_record = self._cstcc_weather_record(state)
+        action_record = dict(before_action)
+        state_history = list(self._cstcc_state_history) + [state_record]
+        action_history = list(self._cstcc_action_history) + [action_record]
+        weather_history = list(self._cstcc_weather_history) + [weather_record]
+        semantic_suggestion = self._cstcc_semantic_suggestion(state, before_action)
+        log_path = default_audit_jsonl_path(
+            episode_id,
+            root=str(getattr(self.config, "cstcc_shadow_audit_log_root", "logs/cstcc_shadow") or "logs/cstcc_shadow"),
+        )
+
+        started = time.perf_counter()
+        audit, failure = safe_run_cstcc_shadow_step(
+            state_history=state_history,
+            action_history=action_history,
+            weather_history=weather_history,
+            current_runtime_final_action=dict(before_action),
+            active_regime=str(getattr(self, "_cstcc_active_regime", "NORMAL_BALANCED") or "NORMAL_BALANCED"),
+            regime_age_steps=int(getattr(self, "_cstcc_regime_age_steps", 0) or 0),
+            previous_plan_sequence=list(getattr(self, "_cstcc_previous_plan_sequence", []) or []),
+            ppo_action=self._cstcc_action_record(anchor_control) if anchor_control is not None else None,
+            rule_action=self._cstcc_action_record(rule_control) if rule_control is not None else None,
+            semantic_suggestion=semantic_suggestion,
+            config=self._cstcc_shadow_config_payload(),
+        )
+        latency_ms = float((time.perf_counter() - started) * 1000.0)
+
+        after_action = self._cstcc_action_record(final_control)
+        invariant_ok, invariant_diff = verify_final_action_invariant(before_action, after_action)
+        if not invariant_ok:
+            try:
+                np.asarray(final_control, dtype=np.float32).reshape(-1)[: len(before_vector)] = before_vector
+            except Exception:
+                pass
+            if failure is None:
+                failure = {
+                    "version": str(getattr(self.config, "cstcc_shadow_version", "v81") or "v81"),
+                    "audit_success": False,
+                    "failure_type": "FinalActionInvariantViolation",
+                    "failure_message": "C-STCC runtime hook changed final action before environment step",
+                    "online_llm_called": False,
+                    "predictive_rollout_executed": False,
+                    "selected_action_is_shadow_only": True,
+                }
+            failure["final_action_changed"] = True
+            failure["final_action_invariant_verified"] = False
+            failure["final_action_invariant_diff"] = invariant_diff
+
+        if audit is not None and invariant_ok:
+            row = compact_audit_record(
+                audit,
+                step=step,
+                episode_id=episode_id,
+                save_full_candidates=bool(getattr(self.config, "cstcc_shadow_save_full_candidates", False)),
+                save_raw_sequences=bool(getattr(self.config, "cstcc_shadow_save_raw_sequences", False)),
+                save_projected_sequences=bool(getattr(self.config, "cstcc_shadow_save_projected_sequences", False)),
+            )
+            row.update(
+                {
+                    "enabled": True,
+                    "shadow_only": True,
+                    "runtime_shadow_version": str(getattr(self.config, "cstcc_shadow_version", "v81") or "v81"),
+                    "audit_latency_ms": latency_ms,
+                    "final_action_invariant_diff": invariant_diff,
+                    "predictive_rollout_executed": False,
+                    "real_tomato_safety_projection": False,
+                    "audit_log_path": str(log_path),
+                }
+            )
+            row["audit_json_size_kb"] = self._cstcc_row_json_size_kb(row)
+            new_regime = str(getattr(audit, "active_regime_after", "NORMAL_BALANCED") or "NORMAL_BALANCED")
+            old_regime = str(getattr(self, "_cstcc_active_regime", "NORMAL_BALANCED") or "NORMAL_BALANCED")
+            self._cstcc_regime_age_steps = int(getattr(self, "_cstcc_regime_age_steps", 0) or 0) + 1 if new_regime == old_regime else 0
+            self._cstcc_active_regime = new_regime
+            plan_memory = getattr(audit, "plan_memory_report", {}) or {}
+            self._cstcc_previous_plan_sequence = list(plan_memory.get("remaining_sequence", []) or [])
+        else:
+            row = compact_failure_record(
+                failure
+                or {
+                    "version": str(getattr(self.config, "cstcc_shadow_version", "v81") or "v81"),
+                    "audit_success": False,
+                    "failure_type": "UnknownCSTCCShadowFailure",
+                    "failure_message": "C-STCC shadow hook returned no audit and no failure payload",
+                    "online_llm_called": False,
+                    "predictive_rollout_executed": False,
+                    "selected_action_is_shadow_only": True,
+                },
+                step=step,
+                episode_id=episode_id,
+            )
+            row.update(
+                {
+                    "enabled": True,
+                    "shadow_only": True,
+                    "runtime_shadow_version": str(getattr(self.config, "cstcc_shadow_version", "v81") or "v81"),
+                    "audit_latency_ms": latency_ms,
+                    "final_action_invariant_diff": invariant_diff,
+                    "real_tomato_safety_projection": False,
+                    "audit_log_path": str(log_path),
+                }
+            )
+            row["audit_json_size_kb"] = self._cstcc_row_json_size_kb(row)
+            self._cstcc_regime_age_steps = int(getattr(self, "_cstcc_regime_age_steps", 0) or 0) + 1
+
+        sampled = should_sample_step(step, float(getattr(self.config, "cstcc_shadow_sample_rate", 1.0) or 1.0))
+        row["audit_sampled"] = bool(sampled)
+        row["audit_write_success"] = False
+        if sampled:
+            row_to_write = dict(row)
+            row_to_write["audit_write_success"] = True
+            row_to_write["audit_json_size_kb"] = self._cstcc_row_json_size_kb(row_to_write)
+            try:
+                append_jsonl(log_path, row_to_write)
+                row.update(row_to_write)
+            except Exception as exc:
+                row["audit_write_error"] = str(exc)
+                if bool(getattr(self.config, "cstcc_shadow_fail_closed", False)):
+                    raise
+        self._cstcc_state_history.append(state_record)
+        self._cstcc_action_history.append(action_record)
+        self._cstcc_weather_history.append(weather_record)
+        self.last_cstcc_shadow = dict(row)
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            self.last_rollout_selection["cstcc_shadow"] = dict(row)
+        if (not invariant_ok) and bool(getattr(self.config, "cstcc_shadow_assert_final_action_invariant", True)) and bool(
+            getattr(self.config, "cstcc_shadow_fail_closed", False)
+        ):
+            raise RuntimeError("C-STCC v81.1 violated final-action invariant")
+
+    def _canopy_boundary_shadow_record(
+        self,
+        state,
+        before_control: Optional[np.ndarray],
+        final_control: np.ndarray,
+    ) -> Dict[str, Any]:
+        before = (
+            np.clip(np.asarray(before_control, dtype=np.float32), 0.0, 1.0)
+            if before_control is not None
+            else np.clip(self._state_control_vector(state), 0.0, 1.0)
+        )
+        final = np.clip(np.asarray(final_control, dtype=np.float32), 0.0, 1.0)
+        response = self._estimate_candidate_response(state, final)
+        prediction = self._candidate_response_prediction_metadata(state, final, response)
+        current_canopy = float(getattr(state, "canopy_dew_margin", 3.0))
+        predicted_canopy = float(prediction.get("predicted_canopy_dew_margin_next", current_canopy) or current_canopy)
+        predicted_canopy_v2 = float(
+            prediction.get("predicted_canopy_dew_margin_next_v2", predicted_canopy) or predicted_canopy
+        )
+        warning_v2 = bool(prediction.get("predicted_canopy_warning_v2", False))
+        screen_delta = float(final[2] - before[2])
+        vent_delta = float(final[3] - before[3])
+        boundary_active = bool(current_canopy < 0.5 or predicted_canopy < 0.25)
+        screen_increase = bool(boundary_active and screen_delta > 0.02)
+        ventilation_decrease = bool(boundary_active and vent_delta < -0.02)
+        high_screen = bool(boundary_active and float(final[2]) >= 0.55)
+        low_ventilation = bool(boundary_active and float(final[3]) <= 0.25)
+        screen_vent_conflict = bool((screen_increase or high_screen) and (ventilation_decrease or low_ventilation))
+        screen_vent_conflict_v2 = bool(
+            warning_v2
+            and (screen_delta > 0.02 or float(final[2]) >= 0.55)
+            and (vent_delta < -0.02 or float(final[3]) <= 0.25)
+        )
+        reason = "canopy_dew_screen_vent_conflict" if screen_vent_conflict else ""
+        reason_v2 = "canopy_dew_lead_time_screen_vent_conflict" if screen_vent_conflict_v2 else ""
+        return {
+            "enabled": True,
+            "shadow_only": True,
+            "canopy_dew_boundary_active": boundary_active,
+            "current_canopy_dew_margin": float(current_canopy),
+            "predicted_canopy_dew_margin_next": float(predicted_canopy),
+            "predicted_canopy_dew_margin_next_v2": float(predicted_canopy_v2),
+            "predicted_dew_margin_air_next": float(prediction.get("predicted_dew_margin_air_next", 0.0) or 0.0),
+            "screen_delta": float(screen_delta),
+            "ventilation_delta": float(vent_delta),
+            "screen_increase_under_canopy_risk": screen_increase,
+            "ventilation_decrease_under_canopy_risk": ventilation_decrease,
+            "high_screen_under_canopy_risk": high_screen,
+            "low_ventilation_under_canopy_risk": low_ventilation,
+            "would_reject_for_canopy_dew_boundary": screen_vent_conflict,
+            "boundary_reject_reason": reason,
+            "canopy_boundary_warning_v2": warning_v2,
+            "would_reject_for_canopy_dew_boundary_v2": screen_vent_conflict_v2,
+            "boundary_reject_reason_v2": reason_v2,
+            "final_action_predicted_canopy_lt0": bool(prediction.get("predicted_canopy_lt0", False)),
+            "final_action_predicted_canopy_lt0_v2": bool(prediction.get("predicted_canopy_lt0_v2", False)),
+            "final_action_predicted_canopy_warning_v2": warning_v2,
+            "final_action_predicted_dew_lt0": bool(prediction.get("predicted_dew_lt0", False)),
+            "final_action_would_fail_canopy_boundary": screen_vent_conflict,
+            "final_action_would_fail_canopy_boundary_v2": screen_vent_conflict_v2,
+            "final_action_screen_vent_conflict": screen_vent_conflict,
+            "final_action_screen_vent_conflict_v2": screen_vent_conflict_v2,
+            "final_action_risk_reason": reason,
+            "final_action_risk_reason_v2": reason_v2,
+            "prediction_model": str(prediction.get("prediction_model", "") or ""),
+            "prediction_model_v2": str(prediction.get("prediction_model_v2", "") or ""),
+            "canopy_proxy_v2_risk_buffer": float(prediction.get("canopy_proxy_v2_risk_buffer", 0.0) or 0.0),
+            "canopy_proxy_v2_risk_terms": dict(prediction.get("canopy_proxy_v2_risk_terms", {}) or {}),
+            "canopy_proxy_history_available": bool(prediction.get("canopy_proxy_history_available", False)),
+            "before_action": self._control_terms(before),
+            "final_action": self._control_terms(final),
+        }
+
+    def _store_post_guardrail_final_risk_shadow(
+        self,
+        state,
+        reference_control: Optional[np.ndarray],
+        final_control: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Record shadow-only canopy boundary diagnostics for the final action."""
+        boundary_shadow = self._canopy_boundary_shadow_record(
+            state,
+            reference_control,
+            np.asarray(final_control, dtype=np.float32),
+        )
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            self.last_rollout_selection["canopy_boundary_shadow"] = boundary_shadow
+            self.last_rollout_selection["post_guardrail_final_risk_shadow"] = {
+                "enabled": True,
+                "shadow_only": True,
+                "final_action_predicted_canopy_lt0": bool(
+                    boundary_shadow.get("final_action_predicted_canopy_lt0", False)
+                ),
+                "final_action_predicted_canopy_lt0_v2": bool(
+                    boundary_shadow.get("final_action_predicted_canopy_lt0_v2", False)
+                ),
+                "final_action_predicted_canopy_warning_v2": bool(
+                    boundary_shadow.get("final_action_predicted_canopy_warning_v2", False)
+                ),
+                "final_action_would_fail_canopy_boundary": bool(
+                    boundary_shadow.get("final_action_would_fail_canopy_boundary", False)
+                ),
+                "final_action_would_fail_canopy_boundary_v2": bool(
+                    boundary_shadow.get("final_action_would_fail_canopy_boundary_v2", False)
+                ),
+                "final_action_screen_vent_conflict": bool(
+                    boundary_shadow.get("final_action_screen_vent_conflict", False)
+                ),
+                "final_action_screen_vent_conflict_v2": bool(
+                    boundary_shadow.get("final_action_screen_vent_conflict_v2", False)
+                ),
+                "final_action_high_screen_under_canopy_risk": bool(
+                    boundary_shadow.get("high_screen_under_canopy_risk", False)
+                ),
+                "final_action_low_ventilation_under_canopy_risk": bool(
+                    boundary_shadow.get("low_ventilation_under_canopy_risk", False)
+                ),
+                "final_action_risk_reason": str(boundary_shadow.get("final_action_risk_reason", "") or ""),
+                "final_action_risk_reason_v2": str(boundary_shadow.get("final_action_risk_reason_v2", "") or ""),
+                "predicted_canopy_dew_margin_next": float(
+                    boundary_shadow.get("predicted_canopy_dew_margin_next", 0.0) or 0.0
+                ),
+                "predicted_canopy_dew_margin_next_v2": float(
+                    boundary_shadow.get("predicted_canopy_dew_margin_next_v2", 0.0) or 0.0
+                ),
+                "predicted_dew_margin_air_next": float(
+                    boundary_shadow.get("predicted_dew_margin_air_next", 0.0) or 0.0
+                ),
+                "screen_delta": float(boundary_shadow.get("screen_delta", 0.0) or 0.0),
+                "ventilation_delta": float(boundary_shadow.get("ventilation_delta", 0.0) or 0.0),
+                "prediction_model": str(boundary_shadow.get("prediction_model", "") or ""),
+                "prediction_model_v2": str(boundary_shadow.get("prediction_model_v2", "") or ""),
+                "canopy_proxy_v2_risk_buffer": float(
+                    boundary_shadow.get("canopy_proxy_v2_risk_buffer", 0.0) or 0.0
+                ),
+            }
+        return boundary_shadow
+
+    def _record_post_guardrail_runtime_provenance(
+        self,
+        state,
+        *,
+        hook_id: str,
+        source_function: str,
+        pre_rule_action: Sequence[float] | np.ndarray,
+        post_rule_action: Sequence[float] | np.ndarray,
+        info: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Store post-guardrail rewrite provenance as metadata only."""
+        record = build_post_guardrail_runtime_provenance_record(
+            state=state,
+            hook_id=hook_id,
+            source_function=source_function,
+            pre_rule_action=pre_rule_action,
+            post_rule_action=post_rule_action,
+            info=info,
+        )
+        if record is None:
+            return None
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            self.last_rollout_selection.setdefault("post_guardrail_runtime_provenance", []).append(record)
+        return record
+
+    @staticmethod
+    def _score_term_subset(details: Mapping[str, Any]) -> Dict[str, Any]:
+        keys = (
+            "score",
+            "total_score",
+            "temp_penalty",
+            "rh_penalty",
+            "dry_penalty",
+            "vpd_penalty",
+            "vpd_high_penalty",
+            "vpd_low_penalty",
+            "dew_penalty",
+            "canopy_dew_penalty",
+            "energy_penalty",
+            "conflict_penalty",
+            "heat_vent_conflict_penalty",
+            "co2_leak_penalty",
+            "lamp_risk_penalty",
+            "dry_vent_penalty",
+            "forecast_risk_penalty",
+            "smooth_penalty",
+            "mitigation_bonus",
+            "hot_dry_penalty",
+            "hot_dry_heat_trap_penalty",
+            "hot_dry_under_cooling_penalty",
+            "hot_dry_overvent_dry_penalty",
+            "hot_dry_mitigation_bonus",
+            "temp_next",
+            "rh_next",
+            "vpd_next",
+            "co2_next",
+            "total_rad",
+            "predicted_temp_next",
+            "predicted_rh_next",
+            "predicted_vpd_next",
+            "predicted_dew_margin_air_next",
+            "predicted_canopy_dew_margin_next",
+            "predicted_dew_lt0",
+            "predicted_canopy_lt0",
+            "prediction_horizon_steps",
+            "predicted_canopy_dew_margin_next_v2",
+            "canopy_proxy_v2_risk_buffer",
+            "canopy_proxy_recent_delta_1",
+            "canopy_proxy_recent_delta_3",
+        )
+        out: Dict[str, Any] = {}
+        for key in keys:
+            try:
+                out[key] = float(details.get(key, 0.0) or 0.0)
+            except Exception:
+                out[key] = 0.0
+        for key in (
+            "predicted_dew_lt0",
+            "predicted_canopy_lt0",
+            "predicted_canopy_lt0_v2",
+            "predicted_canopy_warning_v2",
+            "canopy_proxy_history_available",
+        ):
+            out[key] = bool(details.get(key, False))
+        out["prediction_schema_version"] = str(details.get("prediction_schema_version", "") or "")
+        out["prediction_model"] = str(details.get("prediction_model", "") or "")
+        out["prediction_model_v2"] = str(details.get("prediction_model_v2", "") or "")
+        risk_terms = details.get("canopy_proxy_v2_risk_terms", {})
+        if isinstance(risk_terms, Mapping):
+            normalized_terms: Dict[str, float] = {}
+            for key, value in risk_terms.items():
+                try:
+                    normalized_terms[str(key)] = float(value or 0.0)
+                except Exception:
+                    normalized_terms[str(key)] = 0.0
+            out["canopy_proxy_v2_risk_terms"] = normalized_terms
+        else:
+            out["canopy_proxy_v2_risk_terms"] = {}
+        return out
+
+    @staticmethod
+    def _rspc_controlled_shadow_score(details: Mapping[str, Any], weights: Mapping[str, float]) -> float:
+        def term(key: str) -> float:
+            try:
+                return float(details.get(key, 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+        return float(
+            1.20 * term("temp_penalty")
+            + 1.60 * term("rh_penalty")
+            + float(weights.get("dry", 1.20)) * term("dry_penalty")
+            + float(weights.get("vpd", 1.00)) * term("vpd_penalty")
+            + 0.45 * term("energy_penalty")
+            + 0.20 * term("smooth_penalty")
+            + 0.75 * term("conflict_penalty")
+            + 0.65 * term("dew_penalty")
+            + float(weights.get("hot_dry", 1.35)) * term("hot_dry_penalty")
+            - term("mitigation_bonus")
+        )
+
+    def _evaluate_hot_dry_action_proposer_controlled_replay_shadow(
+        self,
+        state,
+        *,
+        selected_name: str,
+        selected_post_shape_score: Optional[float],
+        selected_post_shape_control: Optional[np.ndarray],
+        selected_post_shape_details: Mapping[str, Any],
+        post_shape_rows: Sequence[Mapping[str, Any]],
+        gate_reason: str,
+    ) -> Dict[str, Any]:
+        variants = {
+            "balanced_hot_dry": {"dry": 1.80, "vpd": 1.60, "hot_dry": 2.00},
+            "dry_vpd_x2": {"dry": 2.40, "vpd": 2.00, "hot_dry": 1.35},
+        }
+        gate = str(gate_reason or "none") or "none"
+        safe_hot_dry = bool(self._profile_rspc_safe_hot_dry_state(state))
+        proposer_rows = [
+            row for row in post_shape_rows if bool(row.get("shadow_proposer", False))
+        ]
+        selected_control = (
+            np.clip(np.asarray(selected_post_shape_control, dtype=np.float32), 0.0, 1.0)
+            if selected_post_shape_control is not None
+            else None
+        )
+        base: Dict[str, Any] = {
+            "enabled": True,
+            "shadow_only": True,
+            "safe_hot_dry": safe_hot_dry,
+            "safety_gate_reason": gate,
+            "selected_name": str(selected_name),
+            "selected_score": (
+                float(selected_post_shape_score)
+                if selected_post_shape_score is not None and np.isfinite(float(selected_post_shape_score))
+                else None
+            ),
+            "selected_action": self._control_terms(selected_control) if selected_control is not None else {},
+            "selected_score_terms": self._score_term_subset(selected_post_shape_details),
+            "proposer_count": int(len(proposer_rows)),
+            "variant_count": int(len(variants)),
+            "variants": [],
+            "would_apply_shadow": False,
+            "best_candidate_name": "",
+            "best_variant": "",
+            "best_margin": 0.0,
+            "best_alignment": "neutral_hold",
+            "unsafe_conflict": False,
+            "unsafe_preferred": False,
+            "unsafe_filtered_count": 0,
+        }
+        if selected_control is None or selected_post_shape_score is None:
+            base["reason"] = "missing_selected_post_shape"
+            return base
+        if gate != "none":
+            base["reason"] = "safety_gate_active"
+        elif not safe_hot_dry:
+            base["reason"] = "not_safe_hot_dry"
+        elif not proposer_rows:
+            base["reason"] = "no_hot_dry_proposer"
+        else:
+            base["reason"] = "no_eligible_proposer"
+
+        variant_results: List[Dict[str, Any]] = []
+        best_eligible: Dict[str, Any] = {}
+        unsafe_preferred = False
+        unsafe_filtered_count = 0
+        selected_details = dict(selected_post_shape_details or {})
+        for variant_name, weights in variants.items():
+            selected_variant_score = self._rspc_controlled_shadow_score(selected_details, weights)
+            row_evals: List[Dict[str, Any]] = []
+            for row in proposer_rows:
+                row_details = row.get("details", {})
+                if not isinstance(row_details, Mapping):
+                    row_details = {}
+                row_score = self._rspc_controlled_shadow_score(row_details, weights)
+                margin = float(selected_variant_score - row_score)
+                action_delta = dict(row.get("action_delta_terms", {})) if isinstance(row.get("action_delta_terms", {}), Mapping) else {}
+                score_delta = dict(row.get("score_delta_terms", {})) if isinstance(row.get("score_delta_terms", {}), Mapping) else {}
+                row_control_terms = self._control_terms(np.asarray(row.get("control", np.zeros(6)), dtype=np.float32))
+                actuator_unsafe = (
+                    float(row_control_terms.get("heat", 0.0)) > 0.05
+                    or float(row_control_terms.get("co2", 0.0)) > 0.05
+                    or float(row_control_terms.get("lamp", 0.0)) > 0.05
+                    or float(score_delta.get("temp", 0.0)) > 1e-6
+                    or float(score_delta.get("dew", 0.0)) > 1e-6
+                )
+                if actuator_unsafe:
+                    unsafe_filtered_count += 1
+                    row_score += 1000.0
+                alignment = self._rspc_action_post_shape_alignment(
+                    state,
+                    gate_reason=gate,
+                    margin=margin,
+                    action_delta_terms=action_delta,
+                    score_delta_terms=score_delta,
+                )
+                if margin > 0.05 and actuator_unsafe:
+                    alignment = "unsafe_conflict"
+                if actuator_unsafe:
+                    margin = float(selected_variant_score - row_score)
+                row_evals.append(
+                    {
+                        "name": str(row.get("name", "") or ""),
+                        "row": row,
+                        "score": float(row_score),
+                        "margin": float(margin),
+                        "alignment": alignment,
+                        "unsafe": bool(actuator_unsafe or (margin > 0.05 and alignment == "unsafe_conflict")),
+                        "safety_penalty": bool(actuator_unsafe),
+                        "eligible": bool(gate == "none" and safe_hot_dry and margin > 0.05 and alignment == "dry_benefit"),
+                    }
+                )
+            raw_best = min(row_evals, key=lambda item: float(item["score"])) if row_evals else {}
+            if (
+                raw_best
+                and bool(raw_best.get("unsafe", False))
+                and float(raw_best.get("margin", 0.0) or 0.0) > 0.05
+            ):
+                unsafe_preferred = True
+            eligible_rows = [item for item in row_evals if bool(item.get("eligible", False))]
+            eligible_best = max(
+                eligible_rows,
+                key=lambda item: float(item.get("margin", 0.0) or 0.0),
+            ) if eligible_rows else {}
+            if eligible_best and float(eligible_best.get("margin", 0.0) or 0.0) > float(best_eligible.get("margin", 0.0) or 0.0):
+                best_eligible = {**eligible_best, "variant": variant_name}
+            variant_results.append(
+                {
+                    "variant": variant_name,
+                    "selected_score": float(selected_variant_score),
+                    "raw_best_name": str(raw_best.get("name", "") or "") if raw_best else "",
+                    "raw_margin": float(raw_best.get("margin", 0.0) or 0.0) if raw_best else 0.0,
+                    "raw_alignment": str(raw_best.get("alignment", "neutral_hold") or "neutral_hold") if raw_best else "neutral_hold",
+                    "raw_unsafe_conflict": bool(raw_best.get("unsafe", False) and float(raw_best.get("margin", 0.0) or 0.0) > 0.05) if raw_best else False,
+                    "raw_safety_penalty": bool(raw_best.get("safety_penalty", False)) if raw_best else False,
+                    "eligible_best_name": str(eligible_best.get("name", "") or "") if eligible_best else "",
+                    "eligible_margin": float(eligible_best.get("margin", 0.0) or 0.0) if eligible_best else 0.0,
+                    "eligible_alignment": str(eligible_best.get("alignment", "neutral_hold") or "neutral_hold") if eligible_best else "neutral_hold",
+                    "would_apply_shadow": bool(eligible_best),
+                }
+            )
+
+        base["variants"] = variant_results
+        base["unsafe_preferred"] = bool(unsafe_preferred)
+        base["unsafe_filtered_count"] = int(unsafe_filtered_count)
+        if unsafe_preferred:
+            base["reason"] = "unsafe_preferred_proposer"
+        if best_eligible:
+            best_row = best_eligible.get("row", {})
+            best_control = np.asarray(best_row.get("control", np.zeros(6)), dtype=np.float32)
+            best_details = best_row.get("details", {})
+            if not isinstance(best_details, Mapping):
+                best_details = {}
+            base.update(
+                {
+                    "reason": "controlled_shadow_replay_candidate",
+                    "would_apply_shadow": bool(not unsafe_preferred),
+                    "best_candidate_name": str(best_eligible.get("name", "") or ""),
+                    "best_variant": str(best_eligible.get("variant", "") or ""),
+                    "best_score": float(best_eligible.get("score", 0.0) or 0.0),
+                    "best_margin": float(best_eligible.get("margin", 0.0) or 0.0),
+                    "best_alignment": str(best_eligible.get("alignment", "neutral_hold") or "neutral_hold"),
+                    "best_action": self._control_terms(best_control),
+                    "best_score_terms": self._score_term_subset(best_details),
+                    "best_action_delta": dict(best_row.get("action_delta_terms", {})) if isinstance(best_row.get("action_delta_terms", {}), Mapping) else {},
+                    "best_score_delta": dict(best_row.get("score_delta_terms", {})) if isinstance(best_row.get("score_delta_terms", {}), Mapping) else {},
+                }
+            )
+        base["unsafe_conflict"] = bool(base.get("would_apply_shadow", False) and base.get("best_alignment") == "unsafe_conflict")
+        return base
+
+    def _apply_hot_dry_proposer_control_access(
+        self,
+        state,
+        control: np.ndarray,
+        rspc_action_scoring: Mapping[str, Any],
+    ) -> np.ndarray:
+        before = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        enabled = bool(getattr(self.config, "rspc_hot_dry_proposer_control_enabled", False))
+        strict_enabled = bool(getattr(self.config, "rspc_hot_dry_proposer_control_strict_enabled", False))
+        min_margin = float(
+            getattr(
+                self.config,
+                "rspc_hot_dry_proposer_control_strict_min_margin"
+                if strict_enabled
+                else "rspc_hot_dry_proposer_control_min_margin",
+                0.20 if strict_enabled else 0.05,
+            )
+        )
+        replay = (
+            rspc_action_scoring.get("hot_dry_action_proposer_controlled_replay", {})
+            if isinstance(rspc_action_scoring, Mapping)
+            else {}
+        )
+        if not isinstance(replay, Mapping):
+            replay = {}
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        try:
+            vpd_air = float(getattr(state, "vpd_air"))
+        except Exception:
+            vpd_air = float(calculate_vpd_kpa(temp_air, rh_air))
+        canopy_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        strict_rh_max = float(getattr(self.config, "rspc_hot_dry_proposer_control_strict_rh_max", 45.0))
+        strict_vpd_min = float(getattr(self.config, "rspc_hot_dry_proposer_control_strict_vpd_min", 2.25))
+        strict_temp_max = float(getattr(self.config, "rspc_hot_dry_proposer_control_strict_temp_max", 30.5))
+        strict_canopy_min = float(
+            getattr(self.config, "rspc_hot_dry_proposer_control_strict_canopy_margin_min", 3.0)
+        )
+        strict_candidate = str(
+            getattr(
+                self.config,
+                "rspc_hot_dry_proposer_control_strict_candidate",
+                "shadow_hot_dry_humidity_retention",
+            )
+            or "shadow_hot_dry_humidity_retention"
+        )
+        candidate = str(replay.get("best_candidate_name", "") or "")
+        info: Dict[str, Any] = {
+            "enabled": enabled,
+            "strict_enabled": strict_enabled,
+            "applied": False,
+            "reason": "disabled" if not enabled else "not_evaluated",
+            "min_margin": float(min_margin),
+            "before_action": self._control_terms(before),
+            "after_action": self._control_terms(before),
+            "candidate": candidate,
+            "variant": str(replay.get("best_variant", "") or ""),
+            "margin": float(replay.get("best_margin", 0.0) or 0.0),
+            "safe_hot_dry": bool(replay.get("safe_hot_dry", False)),
+            "safety_gate_reason": str(replay.get("safety_gate_reason", "none") or "none"),
+            "temp_air": float(temp_air),
+            "rh_air": float(rh_air),
+            "vpd_air": float(vpd_air),
+            "canopy_dew_margin": float(canopy_margin),
+            "strict_rh_max": float(strict_rh_max),
+            "strict_vpd_min": float(strict_vpd_min),
+            "strict_temp_max": float(strict_temp_max),
+            "strict_canopy_margin_min": float(strict_canopy_min),
+            "strict_candidate": strict_candidate,
+        }
+        if not enabled:
+            if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                self.last_rollout_selection["hot_dry_proposer_control"] = info
+            return before
+
+        gate = str(replay.get("safety_gate_reason", "none") or "none")
+        checks = [
+            ("missing_replay_metadata", bool(replay)),
+            ("not_safe_hot_dry", bool(replay.get("safe_hot_dry", False))),
+            ("safety_gate_active", gate == "none"),
+            ("shadow_not_eligible", bool(replay.get("would_apply_shadow", False))),
+            ("alignment_not_dry_benefit", str(replay.get("best_alignment", "") or "") == "dry_benefit"),
+            ("unsafe_preferred", not bool(replay.get("unsafe_preferred", False))),
+            ("unsafe_conflict", not bool(replay.get("unsafe_conflict", False))),
+        ]
+        for reason, passed in checks:
+            if not passed:
+                info["reason"] = reason
+                if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                    self.last_rollout_selection["hot_dry_proposer_control"] = info
+                return before
+        if float(replay.get("best_margin", 0.0) or 0.0) < min_margin:
+            info["reason"] = "margin_below_strict_min" if strict_enabled else "margin_below_threshold"
+            if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                self.last_rollout_selection["hot_dry_proposer_control"] = info
+            return before
+        if strict_enabled:
+            if candidate != strict_candidate:
+                info["reason"] = "candidate_not_allowed"
+                if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                    self.last_rollout_selection["hot_dry_proposer_control"] = info
+                return before
+            if not (rh_air <= strict_rh_max and vpd_air >= strict_vpd_min):
+                info["reason"] = "not_severe_dry"
+                if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                    self.last_rollout_selection["hot_dry_proposer_control"] = info
+                return before
+            if temp_air > strict_temp_max:
+                info["reason"] = "temp_headroom_low"
+                if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                    self.last_rollout_selection["hot_dry_proposer_control"] = info
+                return before
+            if canopy_margin < strict_canopy_min:
+                info["reason"] = "canopy_reserve_low"
+                if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                    self.last_rollout_selection["hot_dry_proposer_control"] = info
+                return before
+
+        best_action_terms = replay.get("best_action", {})
+        if not isinstance(best_action_terms, Mapping) or not best_action_terms:
+            info["reason"] = "missing_best_action"
+            if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                self.last_rollout_selection["hot_dry_proposer_control"] = info
+            return before
+
+        after = self._control_from_terms(best_action_terms)
+        if after is None:
+            info["reason"] = "missing_best_action"
+            if isinstance(getattr(self, "last_rollout_selection", None), dict):
+                self.last_rollout_selection["hot_dry_proposer_control"] = info
+            return before
+
+        info.update(
+            {
+                "applied": True,
+                "reason": "strict_eligible_applied" if strict_enabled else "applied",
+                "after_action": self._control_terms(after),
+                "delta_action": self._profile_action_delta_terms(before, after),
+                "score_delta": (
+                    dict(replay.get("best_score_delta", {}))
+                    if isinstance(replay.get("best_score_delta", {}), Mapping)
+                    else {}
+                ),
+            }
+        )
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            self.last_rollout_selection["hot_dry_proposer_control"] = info
+        return np.asarray(after, dtype=np.float32)
+
+    def _profile_feasibility_gate_record(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        applied: bool = False,
+        corrections: Optional[Sequence[str]] = None,
+        mode: Optional[Mapping[str, Any]] = None,
+        original_targets: Optional[Mapping[str, Any]] = None,
+        repaired_targets: Optional[Mapping[str, Any]] = None,
+        hard_safety_veto_count: int = 0,
+        source: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "enabled": bool(getattr(self.config, "profile_feasibility_gate_enabled", False) if enabled is None else enabled),
+            "applied": bool(applied),
+            "corrections": list(corrections or []),
+            "mode": dict(mode or {}),
+            "original_targets": dict(original_targets or {}),
+            "repaired_targets": dict(repaired_targets or {}),
+            "hard_safety_veto_enabled": bool(getattr(self.config, "profile_feasibility_gate_hard_safety_veto", True)),
+            "hard_safety_veto_count": int(hard_safety_veto_count),
+            "source": str(source or ""),
+        }
+
+    def _profile_feasibility_gate_mode(
+        self,
+        state,
+        target_control: np.ndarray,
+        target_temp: Optional[float],
+        target_co2: Optional[float],
+        target_rh: Optional[float],
+    ) -> Dict[str, Any]:
+        control = np.clip(np.asarray(target_control, dtype=np.float32).reshape(-1), 0.0, 1.0)
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        glob_rad = float(getattr(state, "glob_rad", 0.0))
+        vpd_air = float(calculate_vpd_kpa(temp_air, rh_air))
+        dew_margin = float(getattr(state, "dew_margin_air", 3.0))
+        canopy_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        min_dew_margin = min(dew_margin, canopy_margin)
+        vent_level = float(control[3]) if int(control.size) > 3 else 0.0
+        tomato = getattr(self, "last_tomato_safety_v2", {}) if isinstance(getattr(self, "last_tomato_safety_v2", {}), dict) else {}
+        tomato_reasons = " ".join(str(x) for x in tomato.get("reasons", []) or []).lower()
+        tomato_vent_raise = (
+            bool(tomato.get("applied", False))
+            and isinstance(tomato.get("before_action", {}), Mapping)
+            and isinstance(tomato.get("after_action", {}), Mapping)
+            and float(tomato.get("after_action", {}).get("ventilation", tomato.get("after_action", {}).get("vent", 0.0)) or 0.0)
+            > float(tomato.get("before_action", {}).get("ventilation", tomato.get("before_action", {}).get("vent", 0.0)) or 0.0) + 0.05
+        )
+
+        high_temp_pressure = (
+            temp_air >= 32.0
+            or float(getattr(state, "temp_violation", 0.0)) > 0.0
+            or "hot_temperature" in tomato_reasons
+            or "temp" in tomato_reasons and "high" in tomato_reasons
+        )
+        dew_canopy_pressure = (
+            min_dew_margin < 1.0
+            or "dew" in tomato_reasons
+            or "canopy" in tomato_reasons
+        )
+        rh_hard_pressure = (
+            rh_air >= float(getattr(self.config, "rh_control_limit", 90.0))
+            or "rh_high" in tomato_reasons
+            or "humidity" in tomato_reasons and "hard" in tomato_reasons
+        )
+        safety_vent_reason = bool(
+            tomato_vent_raise
+            and any(token in tomato_reasons for token in ("hard", "dew", "canopy", "extreme", "hot_temperature", "rh_high"))
+        )
+        vent_required = bool(high_temp_pressure or dew_canopy_pressure or rh_hard_pressure or safety_vent_reason)
+        dry_side = bool(
+            rh_air < float(getattr(self.config, "dry_rh_on", 55.0))
+            or vpd_air > float(getattr(self.config, "dry_vpd_on", 1.20))
+        )
+        co2_allowed = bool(
+            not vent_required
+            and vent_level <= float(getattr(self.config, "fallback_co2_max_vent", 0.20))
+            and glob_rad >= float(getattr(self.config, "fallback_co2_min_rad", 120.0))
+        )
+        humidity_allowed = bool(not vent_required and not dew_canopy_pressure and not rh_hard_pressure)
+        return {
+            "vent_required_by_safety": bool(vent_required),
+            "humidity_retention_allowed": bool(humidity_allowed),
+            "co2_enrichment_allowed": bool(co2_allowed),
+            "high_temp_pressure": bool(high_temp_pressure),
+            "dew_canopy_pressure": bool(dew_canopy_pressure),
+            "rh_hard_pressure": bool(rh_hard_pressure),
+            "safety_vent_reason": bool(safety_vent_reason),
+            "dry_side": bool(dry_side),
+            "target_ventilation": float(vent_level),
+            "rh_air": float(rh_air),
+            "temp_air": float(temp_air),
+            "vpd_air": float(vpd_air),
+            "dew_margin": float(min_dew_margin),
+            "glob_rad": float(glob_rad),
+        }
+
+    def _apply_profile_feasibility_gate_targets(
+        self,
+        state,
+        target_control: np.ndarray,
+        target_temp: Optional[float],
+        target_co2: Optional[float],
+        target_rh: Optional[float],
+        *,
+        source: str,
+        update_last: bool = True,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Dict[str, Any]]:
+        enabled = bool(getattr(self.config, "profile_feasibility_gate_enabled", False))
+        original = {
+            "target_temp": None if target_temp is None else float(target_temp),
+            "target_co2": None if target_co2 is None else float(target_co2),
+            "target_rh": None if target_rh is None else float(target_rh),
+        }
+        mode = self._profile_feasibility_gate_mode(state, target_control, target_temp, target_co2, target_rh)
+        if not enabled:
+            record = self._profile_feasibility_gate_record(
+                enabled=False,
+                applied=False,
+                mode=mode,
+                original_targets=original,
+                repaired_targets=original,
+                source=source,
+            )
+            if update_last:
+                self.last_profile_feasibility_gate = record
+            return target_temp, target_co2, target_rh, record
+
+        repaired_temp = float(target_temp) if target_temp is not None else None
+        repaired_co2 = float(target_co2) if target_co2 is not None else None
+        repaired_rh = float(target_rh) if target_rh is not None else None
+        corrections: List[str] = []
+
+        if repaired_rh is not None:
+            if mode["dew_canopy_pressure"] or mode["rh_hard_pressure"]:
+                cap = float(getattr(self.config, "rh_target_extreme_cap", 72.0))
+            elif mode["vent_required_by_safety"]:
+                cap = float(getattr(self.config, "rh_target_high_cap", 76.0))
+            elif float(mode["rh_air"]) >= float(getattr(self.config, "rh_preemptive_threshold", 86.0)):
+                cap = float(getattr(self.config, "rh_target_preemptive_cap", 80.0))
+            else:
+                cap = 88.0
+            if repaired_rh > cap:
+                repaired_rh = cap
+                corrections.append("target_rh:safety_cap")
+            if mode["vent_required_by_safety"] and repaired_rh >= 75.0:
+                repaired_rh = min(repaired_rh, float(getattr(self.config, "rh_target_high_cap", 76.0)) - 1.0)
+                corrections.append("target_rh:high_vent_compatibility_cap")
+            if mode["dry_side"] and not mode["vent_required_by_safety"]:
+                floor = float(getattr(self.config, "dry_target_rh_floor", 70.0))
+                if repaired_rh < floor:
+                    repaired_rh = min(88.0, floor)
+                    corrections.append("target_rh:dry_recovery_floor")
+
+        if repaired_temp is not None and mode["dry_side"] and not mode["vent_required_by_safety"]:
+            cap = float(getattr(self.config, "dry_temp_target_cap", 20.0))
+            if repaired_temp > cap:
+                repaired_temp = cap
+                corrections.append("target_temp:dry_recovery_cap")
+
+        if repaired_co2 is not None and not mode["co2_enrichment_allowed"] and repaired_co2 > 430.0:
+            repaired_co2 = 430.0
+            corrections.append("target_co2:vent_or_radiation_cap")
+
+        repaired = {
+            "target_temp": repaired_temp,
+            "target_co2": repaired_co2,
+            "target_rh": repaired_rh,
+        }
+        unique_corrections = sorted(set(corrections))
+        record = self._profile_feasibility_gate_record(
+            enabled=True,
+            applied=bool(unique_corrections),
+            corrections=unique_corrections,
+            mode=mode,
+            original_targets=original,
+            repaired_targets=repaired,
+            source=source,
+        )
+        if update_last:
+            self.last_profile_feasibility_gate = record
+        return repaired_temp, repaired_co2, repaired_rh, record
+
+    def _profile_template_patch_record(
+        self,
+        *,
+        enabled: bool,
+        applied: bool,
+        corrections: Optional[Sequence[str]] = None,
+        forbidden_combinations: Optional[Sequence[str]] = None,
+        mode: Optional[Mapping[str, Any]] = None,
+        original_targets: Optional[Mapping[str, Any]] = None,
+        repaired_targets: Optional[Mapping[str, Any]] = None,
+        source: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "enabled": bool(enabled),
+            "applied": bool(applied),
+            "corrections": list(corrections or []),
+            "forbidden_combinations": list(forbidden_combinations or []),
+            "mode": dict(mode or {}),
+            "original_targets": dict(original_targets or {}),
+            "repaired_targets": dict(repaired_targets or {}),
+            "source": str(source or ""),
+            "fallback_veto_enabled": bool(getattr(self.config, "fallback_post_selection_veto_enabled", False)),
+            "fallback_veto_applied": False,
+            "fallback_veto_no_alternative": False,
+            "fallback_veto_reason": "",
+            "recovery_anchor_enabled": bool(getattr(self.config, "recovery_anchor_enabled", False)),
+            "recovery_anchor_applied": False,
+            "recovery_anchor_source": str(getattr(self.config, "recovery_anchor_source", "") or ""),
+            "recovery_anchor_reason": "",
+        }
+
+    def _store_profile_template_patch_record(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        stored = dict(record)
+        existing = dict(getattr(self, "last_profile_template_patch", {}) or {})
+        for key in (
+            "fallback_veto_applied",
+            "fallback_veto_no_alternative",
+            "fallback_veto_reason",
+            "fallback_veto_selected_before",
+            "fallback_veto_selected_after",
+            "fallback_veto_safety_reasons",
+            "fallback_veto_rewrite_fields",
+            "recovery_anchor_enabled",
+            "recovery_anchor_applied",
+            "recovery_anchor_source",
+            "recovery_anchor_reason",
+            "recovery_anchor_action",
+            "recovery_anchor_prediction",
+            "recovery_anchor_no_compatible_existing_candidate",
+            "recovery_anchor_selected_before",
+            "recovery_anchor_selected_after",
+            "recovery_anchor_safety_reasons",
+            "recovery_anchor_rewrite_fields",
+        ):
+            if key in existing and key not in stored:
+                stored[key] = existing[key]
+            elif key.startswith("recovery_anchor_") and key in existing:
+                existing_value = existing.get(key)
+                stored_value = stored.get(key)
+                if isinstance(existing_value, bool):
+                    if existing_value and not bool(stored_value):
+                        stored[key] = existing_value
+                elif existing_value not in (None, "", [], {}):
+                    if stored_value in (None, "", [], {}, False):
+                        stored[key] = existing_value
+        self.last_profile_template_patch = stored
+        return stored
+
+    def _apply_profile_template_patch_targets(
+        self,
+        state,
+        target_control: np.ndarray,
+        target_temp: Optional[float],
+        target_co2: Optional[float],
+        target_rh: Optional[float],
+        *,
+        source: str,
+        update_last: bool = True,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Dict[str, Any]]:
+        enabled = bool(getattr(self.config, "profile_template_patch_enabled", False))
+        original = {
+            "target_temp": None if target_temp is None else float(target_temp),
+            "target_co2": None if target_co2 is None else float(target_co2),
+            "target_rh": None if target_rh is None else float(target_rh),
+        }
+        mode = self._profile_feasibility_gate_mode(state, target_control, target_temp, target_co2, target_rh)
+        if not enabled:
+            record = self._profile_template_patch_record(
+                enabled=False,
+                applied=False,
+                mode=mode,
+                original_targets=original,
+                repaired_targets=original,
+                source=source,
+            )
+            if update_last:
+                record = self._store_profile_template_patch_record(record)
+            return target_temp, target_co2, target_rh, record
+
+        repaired_temp = float(target_temp) if target_temp is not None else None
+        repaired_co2 = float(target_co2) if target_co2 is not None else None
+        repaired_rh = float(target_rh) if target_rh is not None else None
+        corrections: List[str] = []
+        forbidden: List[str] = []
+
+        if repaired_rh is not None:
+            if mode["dew_canopy_pressure"] or mode["rh_hard_pressure"]:
+                cap = float(getattr(self.config, "rh_target_extreme_cap", 72.0))
+            elif mode["vent_required_by_safety"]:
+                cap = float(getattr(self.config, "rh_target_high_cap", 76.0))
+            elif float(mode["rh_air"]) >= float(getattr(self.config, "rh_preemptive_threshold", 86.0)):
+                cap = float(getattr(self.config, "rh_target_preemptive_cap", 80.0))
+            else:
+                cap = 88.0
+            if repaired_rh > cap:
+                repaired_rh = cap
+                corrections.append("target_rh:safety_cap")
+            if mode["vent_required_by_safety"] and repaired_rh >= 75.0:
+                repaired_rh = min(repaired_rh, float(getattr(self.config, "rh_target_high_cap", 76.0)) - 1.0)
+                corrections.append("target_rh:high_vent_compatibility_cap")
+                forbidden.append("safety_vent_blocks_high_rh")
+            if mode["dry_side"] and not mode["vent_required_by_safety"]:
+                floor = float(getattr(self.config, "dry_target_rh_floor", 70.0))
+                if repaired_rh < floor:
+                    repaired_rh = min(88.0, floor)
+                    corrections.append("target_rh:dry_recovery_floor")
+
+        if repaired_temp is not None and mode["dry_side"] and not mode["vent_required_by_safety"]:
+            cap = float(getattr(self.config, "dry_temp_target_cap", 20.0))
+            if repaired_temp > cap:
+                repaired_temp = cap
+                corrections.append("target_temp:dry_recovery_cap")
+
+        if repaired_co2 is not None and not mode["co2_enrichment_allowed"] and repaired_co2 > 430.0:
+            repaired_co2 = 430.0
+            corrections.append("target_co2:vent_or_radiation_cap")
+            if mode["vent_required_by_safety"]:
+                forbidden.append("safety_vent_blocks_high_co2")
+
+        if mode["vent_required_by_safety"]:
+            if original.get("target_rh") is not None and float(original["target_rh"]) >= 75.0:
+                if original.get("target_co2") is not None and float(original["target_co2"]) >= 800.0:
+                    forbidden.append("safety_vent_blocks_high_rh_high_co2")
+            if not mode.get("humidity_retention_allowed", True):
+                forbidden.append("rh_dew_canopy_pressure_blocks_humidity_retention")
+        if mode["dry_side"] and mode["vent_required_by_safety"]:
+            forbidden.append("dry_high_vent_penalty_suppressed_by_safety_vent")
+
+        repaired = {
+            "target_temp": repaired_temp,
+            "target_co2": repaired_co2,
+            "target_rh": repaired_rh,
+        }
+        record = self._profile_template_patch_record(
+            enabled=True,
+            applied=bool(corrections or forbidden),
+            corrections=sorted(set(corrections)),
+            forbidden_combinations=sorted(set(forbidden)),
+            mode=mode,
+            original_targets=original,
+            repaired_targets=repaired,
+            source=source,
+        )
+        if update_last:
+            record = self._store_profile_template_patch_record(record)
+        return repaired_temp, repaired_co2, repaired_rh, record
+
+    def _profile_feasibility_candidate_adjustment(
+        self,
+        state,
+        control: np.ndarray,
+        plan: Mapping[str, Any],
+    ) -> Tuple[float, Dict[str, Any]]:
+        if not bool(getattr(self.config, "profile_feasibility_gate_enabled", False)):
+            return 0.0, {"enabled": False}
+        clipped = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        target_temp = self._get_plan_target(dict(plan), "target_temp", state)
+        target_co2 = self._get_plan_target(dict(plan), "target_co2", state)
+        target_rh = self._get_plan_target(dict(plan), "target_rh", state)
+        repaired_temp, repaired_co2, repaired_rh, gate_record = self._apply_profile_feasibility_gate_targets(
+            state,
+            clipped,
+            target_temp,
+            target_co2,
+            target_rh,
+            source="candidate_scoring",
+            update_last=False,
+        )
+        mode = gate_record.get("mode", {}) if isinstance(gate_record.get("mode", {}), Mapping) else {}
+        conflicts: List[str] = []
+        vent = float(clipped[3]) if int(clipped.size) > 3 else 0.0
+        heat = float(clipped[0]) if int(clipped.size) > 0 else 0.0
+        if repaired_rh is not None and float(repaired_rh) >= 75.0 and vent >= 0.70:
+            conflicts.append("target_rh_vs_high_vent")
+        if repaired_co2 is not None and float(repaired_co2) >= 800.0 and vent >= 0.30:
+            conflicts.append("co2_target_vs_vent")
+        if repaired_temp is not None:
+            temp_air = float(getattr(state, "temp_air", 20.0))
+            if float(repaired_temp) <= temp_air - 1.0 and heat >= 0.10:
+                conflicts.append("cooling_target_vs_heat")
+            if float(repaired_temp) >= temp_air + 1.0 and vent >= 0.50:
+                conflicts.append("heating_target_vs_vent")
+        dry_high_vent = bool(mode.get("dry_side", False) and not mode.get("vent_required_by_safety", False) and vent >= 0.50)
+        if dry_high_vent:
+            conflicts.append("dry_risk_vs_high_vent")
+
+        safety_control, safety_info = apply_tomato_safety_v2(
+            state,
+            clipped,
+            config=self.config,
+            target_rh=repaired_rh,
+        )
+        reason_text = " ".join(str(x) for x in safety_info.get("reasons", []) or []).lower()
+        hard_safety_rewrite = bool(
+            safety_info.get("applied", False)
+            and any(token in reason_text for token in ("hard", "dew", "canopy", "extreme", "hot_temperature"))
+        )
+        rewrite_delta = float(np.sum(np.abs(np.asarray(safety_control, dtype=np.float32) - clipped)))
+        hard_safety_vetoed = bool(
+            hard_safety_rewrite and bool(getattr(self.config, "profile_feasibility_gate_hard_safety_veto", True))
+        )
+        adjustment = (
+            1.25 * len(conflicts)
+            + 1.50 * int(dry_high_vent)
+            + 0.75 * int(rewrite_delta >= 0.50 or hard_safety_rewrite)
+            + (1000.0 if hard_safety_vetoed else 0.0)
+        )
+        details = {
+            "enabled": True,
+            "adjustment": float(adjustment),
+            "profile_action_conflicts": list(sorted(set(conflicts))),
+            "profile_action_conflict_count": int(len(set(conflicts))),
+            "dry_risk_high_vent_conflict": int(dry_high_vent),
+            "major_or_hard_rewrite_predicted": bool(rewrite_delta >= 0.50 or hard_safety_rewrite),
+            "hard_safety_rewrite_predicted": bool(hard_safety_rewrite),
+            "hard_safety_vetoed": bool(hard_safety_vetoed),
+            "safety_rewrite_delta_abs_sum": float(rewrite_delta),
+            "safety_reasons": list(safety_info.get("reasons", []) or []),
+            "gate_record": gate_record,
+        }
+        return float(adjustment), details
+
+    def _apply_rspc_post_score_shadow_shape(
+        self,
+        state,
+        control: np.ndarray,
+        plan: Mapping[str, Any],
+        *,
+        rh_debt: float,
+        dehumidify_mode: str,
+        lamp_budget_remaining: float,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        shaped = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        events: Dict[str, Any] = {
+            "target_tracking_applied": False,
+            "dry_recovery_applied": False,
+            "tomato_safety_applied": False,
+            "dehumidify_mode": str(dehumidify_mode or "normal"),
+        }
+        target_temp = self._get_plan_target(dict(plan), "target_temp", state)
+        target_co2 = self._get_plan_target(dict(plan), "target_co2", state)
+        target_rh = self._get_plan_target(dict(plan), "target_rh", state)
+        target_temp, target_co2, target_rh, gate_record = self._apply_profile_feasibility_gate_targets(
+            state,
+            shaped,
+            target_temp,
+            target_co2,
+            target_rh,
+            source="rspc_post_score_shadow_shape",
+            update_last=False,
+        )
+        events["profile_feasibility_gate"] = gate_record
+        events["profile_feasibility_gate_applied"] = bool(gate_record.get("applied", False))
+        events["profile_feasibility_gate_corrections"] = list(gate_record.get("corrections", []) or [])
+        tracked = self._apply_profile_target_tracking_proxy(
+            state,
+            shaped,
+            target_temp=target_temp,
+            target_co2=target_co2,
+            target_rh=target_rh,
+        )
+        events["target_tracking_applied"] = bool(float(np.max(np.abs(tracked - shaped))) > 1e-6)
+        shaped = np.asarray(tracked, dtype=np.float32)
+
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        vpd_now = float(calculate_vpd_kpa(temp_air, rh_air))
+        dew_margin = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        low_vpd_humidity_risk = (
+            (rh_air >= 82.0 and vpd_now < 0.42)
+            or (rh_air >= 78.0 and vpd_now < 0.25)
+        )
+        rh_risk_active = (
+            rh_air >= float(self.config.rh_preemptive_threshold)
+            or low_vpd_humidity_risk
+            or dew_margin < 1.1
+            or float(rh_debt) > 2.0
+        )
+        if rh_risk_active:
+            before = shaped.copy()
+            severity = max(rh_air - float(self.config.rh_preemptive_threshold), 0.0)
+            if low_vpd_humidity_risk:
+                severity = max(severity, max(0.42 - vpd_now, 0.0) * 6.0)
+            severity = max(severity, max(1.1 - dew_margin, 0.0) * 2.0)
+            debt_vent = min(0.22, float(self.config.rh_debt_vent_gain) * float(rh_debt))
+            debt_screen = min(0.28, float(self.config.rh_debt_screen_gain) * float(rh_debt))
+            vent_floor = min(0.68, 0.30 + 0.035 * severity + debt_vent)
+            screen_cap = max(0.25, 0.72 - 0.035 * severity - debt_screen)
+            shaped[3] = max(shaped[3], vent_floor)
+            shaped[2] = min(shaped[2], screen_cap)
+            shaped[1] = 0.0
+            shaped[4] = 0.0
+            events["rh_risk_shape_applied"] = bool(float(np.max(np.abs(shaped - before))) > 1e-6)
+            events["rh_risk_vent_floor"] = float(vent_floor)
+            events["rh_risk_screen_cap"] = float(screen_cap)
+        else:
+            events["rh_risk_shape_applied"] = False
+
+        if float(lamp_budget_remaining) <= 0.0:
+            shaped[4] = 0.0
+        elif float(lamp_budget_remaining) < 0.8:
+            shaped[4] = min(shaped[4], float(self.config.lamp_budget_soft_cap))
+        if rh_air >= float(self.config.lamp_forbidden_rh) or shaped[3] >= float(self.config.lamp_forbidden_vent):
+            shaped[4] = 0.0
+        if str(dehumidify_mode or "normal") != "normal":
+            shaped[4] = 0.0
+            shaped[1] = 0.0
+        elif rh_air >= 88.0:
+            shaped[1] = 0.0
+        if shaped[3] >= float(self.config.co2_forbidden_vent) or float(getattr(state, "glob_rad", 0.0)) < float(self.config.fallback_co2_min_rad):
+            shaped[1] = 0.0
+
+        hour = float(getattr(state, "hour_of_day", 12.0))
+        if (
+            float(self.config.dawn_predehumid_start_hour) <= hour < float(self.config.dawn_predehumid_end_hour)
+            and rh_air > 82.0
+        ):
+            shaped[3] = max(shaped[3], 0.32)
+            shaped[2] = min(shaped[2], 0.65)
+            shaped[1] = 0.0
+            shaped[4] = 0.0
+            events["dawn_predehumid_shape_applied"] = True
+        else:
+            events["dawn_predehumid_shape_applied"] = False
+
+        if str(dehumidify_mode or "normal") == "mild":
+            shaped[3] = max(shaped[3], 0.40)
+            shaped[2] = min(shaped[2], 0.65)
+            shaped[1] = 0.0
+            shaped[4] = 0.0
+        elif str(dehumidify_mode or "normal") == "strong":
+            shaped[3] = max(shaped[3], float(self.config.rh_pulse_vent_floor))
+            shaped[2] = min(shaped[2], float(self.config.rh_pulse_screen_cap))
+            shaped[1] = 0.0
+            shaped[4] = 0.0
+
+        dry_side_risk = (
+            rh_air <= float(self.config.dry_rh_on)
+            or vpd_now >= float(self.config.dry_vpd_on)
+        )
+        if dry_side_risk:
+            before = shaped.copy()
+            hot_dry_features = self._rspc_hot_dry_features(state)
+            if temp_air >= 28.0:
+                vent_cap = float(self.config.dry_hot_vent_cap)
+            elif temp_air >= 24.0:
+                vent_cap = float(self.config.dry_warm_vent_cap)
+            else:
+                vent_cap = float(self.config.dry_vent_cap)
+            if hot_dry_features["active"]:
+                vent_cap = max(vent_cap, self._rspc_hot_dry_vent_relief_floor(state, hot_dry_features))
+            shaped[3] = min(shaped[3], vent_cap)
+            shaped[1] = 0.0
+            shaped[4] = 0.0
+            if temp_air < 12.5:
+                shaped[0] = max(shaped[0], 0.75)
+                shaped[2] = max(shaped[2], 0.90)
+                shaped[3] = min(shaped[3], float(self.config.cold_dehumidify_vent_cap))
+            elif temp_air < 15.0:
+                shaped[0] = min(max(shaped[0], 0.10), 0.25)
+                shaped[2] = max(shaped[2], 0.75)
+            else:
+                shaped[0] = min(shaped[0], 0.05)
+                if temp_air < 18.0:
+                    shaped[2] = max(shaped[2], 0.70)
+            if float(getattr(state, "glob_rad", 0.0)) > 250.0 or temp_air > 24.0:
+                shaped[5] = max(shaped[5], 0.50)
+            events["dry_recovery_applied"] = True
+            events["dry_recovery_vent_cap"] = float(vent_cap)
+            events["dry_recovery_hot_dry_vent_relief"] = bool(hot_dry_features["active"])
+            events["dry_recovery_delta_l1"] = float(np.sum(np.abs(shaped - before)))
+        else:
+            events["dry_recovery_applied"] = False
+
+        safety_control, safety_info = apply_tomato_safety_v2(
+            state,
+            shaped,
+            config=self.config,
+            target_rh=target_rh,
+        )
+        events["tomato_safety_applied"] = bool(safety_info.get("applied", False))
+        events["tomato_safety_reasons"] = list(safety_info.get("reasons", [])) if isinstance(safety_info.get("reasons", []), list) else []
+        shaped = np.asarray(safety_control, dtype=np.float32)
+        return np.clip(shaped, 0.0, 1.0).astype(np.float32), events
+
+    def _rspc_action_candidate_record(
+        self,
+        *,
+        name: str,
+        control: np.ndarray,
+        score: float,
+        rule_weight: float,
+        details: Mapping[str, Any],
+        selected: bool,
+        post_shape_control: Optional[np.ndarray] = None,
+        post_shape_score: Optional[float] = None,
+        post_shape_details: Optional[Mapping[str, Any]] = None,
+        post_shape_events: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "name": str(name),
+            "score": float(score) if np.isfinite(score) else None,
+            "rule_weight": float(rule_weight),
+            "selected": bool(selected),
+            "action": self._control_terms(control),
+            "score_terms": self._score_term_subset(details),
+            "humidity_memory_rejected": bool(
+                isinstance(details.get("humidity_memory_horizon_filter"), dict)
+                and details["humidity_memory_horizon_filter"].get("rejected", False)
+            ),
+            "humidity_memory_reject_reason": (
+                details.get("humidity_memory_horizon_filter", {}).get("reject_reason", "")
+                if isinstance(details.get("humidity_memory_horizon_filter"), dict)
+                else ""
+            ),
+        }
+        if post_shape_control is not None and post_shape_details is not None:
+            record["post_shape_action"] = self._control_terms(post_shape_control)
+            record["post_shape_score"] = (
+                float(post_shape_score)
+                if post_shape_score is not None and np.isfinite(float(post_shape_score))
+                else None
+            )
+            record["post_shape_score_terms"] = self._score_term_subset(post_shape_details)
+            record["post_shape_events"] = dict(post_shape_events or {})
+        return record
+
+    @staticmethod
+    def _rspc_action_safety_gate_reason(state) -> str:
+        temp_air = float(getattr(state, "temp_air", 20.0))
+        rh_air = float(getattr(state, "rh_air", 70.0))
+        dew_air = float(getattr(state, "dew_margin_air", 3.0))
+        canopy_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        if temp_air >= 32.0 or float(getattr(state, "temp_violation", 0.0)) > 0.0:
+            return "temp_high_gate"
+        if canopy_margin < 1.0:
+            return "canopy_gate"
+        if dew_air < 1.0:
+            return "dew_gate"
+        if rh_air >= 90.0 or float(getattr(state, "rh_high_violation", 0.0)) > 0.0:
+            return "rh_high_gate"
+        return "none"
+
+    def _rspc_action_post_shape_alignment(
+        self,
+        state,
+        *,
+        gate_reason: str,
+        margin: float,
+        action_delta_terms: Mapping[str, float],
+        score_delta_terms: Mapping[str, float],
+    ) -> str:
+        if float(margin) <= 0.05:
+            return "neutral_hold"
+        gate = str(gate_reason or "none")
+        if gate != "none":
+            if self._profile_rspc_gate_risk_worsened(gate, score_delta_terms):
+                return "unsafe_conflict"
+            if self._profile_rspc_action_conflicts(gate, action_delta_terms):
+                return "unsafe_conflict"
+            return "safe_relief"
+        if self._profile_rspc_safe_hot_dry_state(state):
+            dry_improved = (
+                float(score_delta_terms.get("dry", 0.0)) < -1e-6
+                or float(score_delta_terms.get("vpd", 0.0)) < -1e-6
+                or float(score_delta_terms.get("hot_dry", 0.0)) < -1e-6
+            )
+            safety_not_worse = (
+                float(score_delta_terms.get("temp", 0.0)) <= 1e-6
+                and float(score_delta_terms.get("dew", 0.0)) <= 1e-6
+                and float(action_delta_terms.get("heat", 0.0)) <= 0.02
+                and float(action_delta_terms.get("co2", 0.0)) <= 0.02
+                and float(action_delta_terms.get("lamp", 0.0)) <= 0.02
+            )
+            if dry_improved and safety_not_worse:
+                return "dry_benefit"
+        return "neutral_hold"
+
+    @staticmethod
+    def _rspc_tt_calibration_safe_hot_dry_state(state) -> bool:
+        temp = float(getattr(state, "temp_air", 20.0))
+        rh = float(getattr(state, "rh_air", 70.0))
+        vpd = float(calculate_vpd_kpa(temp, rh))
+        dew_margin_air = float(getattr(state, "dew_margin_air", 3.0))
+        canopy_dew_margin = float(getattr(state, "canopy_dew_margin", 3.0))
+        dry_pressure = (
+            rh <= 55.0
+            or vpd >= 1.60
+            or float(getattr(state, "rh_low_violation", 0.0)) > 0.0
+            or float(getattr(state, "vpd_high_excess", 0.0)) > 0.0
+        )
+        safety_clear = (
+            temp < 32.0
+            and float(getattr(state, "temp_violation", 0.0)) <= 0.0
+            and float(getattr(state, "rh_high_violation", 0.0)) <= 0.0
+            and rh < 90.0
+            and dew_margin_air >= 1.0
+            and canopy_dew_margin >= 1.0
+        )
+        return bool(dry_pressure and safety_clear)
+
+    @staticmethod
+    def _rspc_tt_calibration_alignment(
+        *,
+        improvement_margin: float,
+        action_delta_terms: Mapping[str, float],
+        score_delta_terms: Mapping[str, float],
+    ) -> str:
+        if float(improvement_margin) <= 1e-6:
+            return "neutral_hold"
+        safety_worse = (
+            float(score_delta_terms.get("temp", 0.0)) > 1e-6
+            or float(score_delta_terms.get("dew", 0.0)) > 1e-6
+            or float(action_delta_terms.get("heat", 0.0)) > 0.02
+            or float(action_delta_terms.get("co2", 0.0)) > 0.02
+            or float(action_delta_terms.get("lamp", 0.0)) > 0.02
+        )
+        if safety_worse:
+            return "unsafe_conflict"
+        dry_improved = (
+            float(score_delta_terms.get("dry", 0.0)) < -1e-6
+            or float(score_delta_terms.get("vpd", 0.0)) < -1e-6
+            or float(score_delta_terms.get("hot_dry", 0.0)) < -1e-6
+        )
+        return "dry_benefit" if dry_improved else "neutral_hold"
+
+    def _evaluate_target_tracking_calibration_shadow(
+        self,
+        state,
+        before_control: np.ndarray,
+        current_control: Optional[np.ndarray],
+        current_score: Optional[float],
+        current_details: Mapping[str, Any],
+        *,
+        gate_reason: str,
+    ) -> Dict[str, Any]:
+        base = np.clip(np.asarray(before_control, dtype=np.float32), 0.0, 1.0)
+        if current_control is None or current_score is None:
+            return {
+                "enabled": True,
+                "shadow_only": True,
+                "triggered": False,
+                "reason": "missing_current_target_tracking",
+                "safety_gate_reason": str(gate_reason or "none"),
+                "variants": [],
+            }
+        current = np.clip(np.asarray(current_control, dtype=np.float32), 0.0, 1.0)
+        gate = str(gate_reason or "none") or "none"
+        delta = self._profile_action_delta_terms(base, current)
+        safe_hot_dry = self._rspc_tt_calibration_safe_hot_dry_state(state)
+        reason = "target_tracking_vent_only_dry_push"
+        if gate != "none":
+            reason = "safety_gate_active"
+        elif not safe_hot_dry:
+            reason = "not_safe_hot_dry"
+        elif not (
+            float(delta.get("vent", 0.0)) > 0.10
+            and float(delta.get("screen", 0.0)) < 0.10
+            and float(delta.get("shade", 0.0)) < 0.10
+        ):
+            reason = "no_vent_only_dry_push"
+
+        variants: List[Dict[str, Any]] = []
+        triggered = reason == "target_tracking_vent_only_dry_push"
+        if triggered:
+            variant_controls = []
+            vent_cap = current.copy()
+            vent_cap[3] = min(float(vent_cap[3]), float(base[3]) + 0.08)
+            variant_controls.append(("vent_cap", np.clip(vent_cap, 0.0, 1.0)))
+
+            shade_buffer = current.copy()
+            shade_buffer[5] = max(float(shade_buffer[5]), min(1.0, float(base[5]) + 0.15))
+            variant_controls.append(("shade_buffer", np.clip(shade_buffer, 0.0, 1.0)))
+
+            current_terms = self._score_term_subset(current_details)
+            for name, variant_control in variant_controls:
+                score, details = self._score_fallback_candidate(state, variant_control)
+                score_terms = self._score_term_subset(details)
+                action_delta = self._profile_action_delta_terms(current, variant_control)
+                score_delta = self._profile_score_delta_terms(current_terms, score_terms)
+                margin = float(current_score) - float(score)
+                alignment = self._rspc_tt_calibration_alignment(
+                    improvement_margin=margin,
+                    action_delta_terms=action_delta,
+                    score_delta_terms=score_delta,
+                )
+                variants.append(
+                    {
+                        "name": str(name),
+                        "action": self._control_terms(variant_control),
+                        "score": float(score),
+                        "score_terms": score_terms,
+                        "improvement_margin": float(margin),
+                        "action_delta": action_delta,
+                        "score_delta": score_delta,
+                        "alignment": alignment,
+                        "unsafe_conflict": bool(alignment == "unsafe_conflict"),
+                    }
+                )
+
+        eligible_variants = [item for item in variants if not bool(item.get("unsafe_conflict", False))]
+        best_variant = max(
+            eligible_variants or variants,
+            key=lambda item: float(item.get("improvement_margin", 0.0) or 0.0),
+        ) if variants else {}
+        best_margin = float(best_variant.get("improvement_margin", 0.0) or 0.0) if best_variant else 0.0
+        unsafe_variant_count = int(sum(bool(item.get("unsafe_conflict", False)) for item in variants))
+        best_unsafe_conflict = bool(best_variant.get("unsafe_conflict", False)) if best_variant else False
+        return {
+            "enabled": True,
+            "shadow_only": True,
+            "triggered": bool(triggered),
+            "reason": reason,
+            "safety_gate_reason": gate,
+            "safe_hot_dry": bool(safe_hot_dry),
+            "before_action": self._control_terms(base),
+            "current_action": self._control_terms(current),
+            "current_score": float(current_score),
+            "current_score_terms": self._score_term_subset(current_details),
+            "target_tracking_delta": delta,
+            "variants": variants,
+            "variant_count": int(len(variants)),
+            "best_variant_name": str(best_variant.get("name", "") or ""),
+            "best_variant_score": (
+                float(best_variant.get("score", 0.0) or 0.0)
+                if best_variant
+                else None
+            ),
+            "best_improvement_margin": float(best_margin),
+            "best_alignment": str(best_variant.get("alignment", "neutral_hold") or "neutral_hold") if best_variant else "neutral_hold",
+            "best_action": best_variant.get("action", {}) if best_variant else {},
+            "best_action_delta": best_variant.get("action_delta", {}) if best_variant else {},
+            "best_score_delta": best_variant.get("score_delta", {}) if best_variant else {},
+            "has_unsafe_variant": bool(unsafe_variant_count > 0),
+            "unsafe_variant_count": unsafe_variant_count,
+            "unsafe_conflict": best_unsafe_conflict,
+            "would_improve": bool(best_variant and best_margin > 0.05 and not bool(best_variant.get("unsafe_conflict", False))),
+        }
+
+    def _rspc_action_scoring_diagnostics(
+        self,
+        state,
+        scored_candidates: List[Tuple[float, str, np.ndarray, float, Mapping[str, Any]]],
+        *,
+        plan: Mapping[str, Any],
+        rh_debt: float,
+        dehumidify_mode: str,
+        lamp_budget_remaining: float,
+        selected_name: str,
+        selected_control: np.ndarray,
+        selected_score: float,
+    ) -> Dict[str, Any]:
+        hot_dry_features = self._rspc_hot_dry_features(state)
+        hot_dry_shadow_features = self._rspc_hot_dry_shadow_features(state)
+        selected_action = self._control_terms(selected_control)
+        selected_terms: Mapping[str, Any] = {}
+        candidate_records: List[Dict[str, Any]] = []
+        selected_post_shape_score = None
+        selected_post_shape_control: Optional[np.ndarray] = None
+        selected_post_shape_details: Mapping[str, Any] = {}
+        post_shape_rows: List[Dict[str, Any]] = []
+        actual_candidate_count = int(len(scored_candidates))
+        for score, name, control_item, rule_weight, details in scored_candidates:
+            is_selected = str(name) == str(selected_name)
+            if is_selected:
+                selected_terms = details
+            post_control, post_events = self._apply_rspc_post_score_shadow_shape(
+                state,
+                np.asarray(control_item, dtype=np.float32),
+                plan,
+                rh_debt=float(rh_debt),
+                dehumidify_mode=str(dehumidify_mode or "normal"),
+                lamp_budget_remaining=float(lamp_budget_remaining),
+            )
+            post_score, post_details = self._score_fallback_candidate(state, post_control)
+            if is_selected:
+                selected_post_shape_score = float(post_score)
+                selected_post_shape_control = np.asarray(post_control, dtype=np.float32)
+                selected_post_shape_details = post_details
+            post_shape_rows.append(
+                {
+                    "name": str(name),
+                    "score": float(post_score),
+                    "control": np.asarray(post_control, dtype=np.float32),
+                    "details": post_details,
+                    "events": dict(post_events or {}),
+                    "shadow_proposer": False,
+                }
+            )
+            record = self._rspc_action_candidate_record(
+                name=str(name),
+                control=np.asarray(control_item, dtype=np.float32),
+                score=float(score),
+                rule_weight=float(rule_weight),
+                details=details,
+                selected=is_selected,
+                post_shape_control=post_control,
+                post_shape_score=float(post_score),
+                post_shape_details=post_details,
+                post_shape_events=post_events,
+            )
+            record["candidate_source"] = "actual"
+            record["shadow_proposer"] = False
+            candidate_records.append(record)
+
+        hot_dry_shadow_candidates = self._build_rspc_hot_dry_shadow_candidates(state, selected_control)
+        for name, control_item, rationale in hot_dry_shadow_candidates:
+            raw_score, raw_details = self._score_fallback_candidate(state, control_item)
+            post_control, post_events = self._apply_rspc_post_score_shadow_shape(
+                state,
+                np.asarray(control_item, dtype=np.float32),
+                plan,
+                rh_debt=float(rh_debt),
+                dehumidify_mode=str(dehumidify_mode or "normal"),
+                lamp_budget_remaining=float(lamp_budget_remaining),
+            )
+            post_score, post_details = self._score_fallback_candidate(state, post_control)
+            post_shape_rows.append(
+                {
+                    "name": str(name),
+                    "score": float(post_score),
+                    "control": np.asarray(post_control, dtype=np.float32),
+                    "details": post_details,
+                    "events": dict(post_events or {}),
+                    "shadow_proposer": True,
+                    "reason": str(rationale),
+                }
+            )
+            record = self._rspc_action_candidate_record(
+                name=str(name),
+                control=np.asarray(control_item, dtype=np.float32),
+                score=float(raw_score),
+                rule_weight=0.0,
+                details=raw_details,
+                selected=False,
+                post_shape_control=post_control,
+                post_shape_score=float(post_score),
+                post_shape_details=post_details,
+                post_shape_events=post_events,
+            )
+            record["candidate_source"] = "hot_dry_action_proposer_shadow"
+            record["shadow_proposer"] = True
+            record["reason"] = str(rationale)
+            candidate_records.append(record)
+
+        hot_dry_count = sum(1 for item in candidate_records if str(item.get("name", "")).startswith("hot_dry_"))
+        hot_dry_shadow_count = sum(1 for item in candidate_records if bool(item.get("shadow_proposer", False)))
+        selected_score_terms = self._score_term_subset(selected_terms)
+        post_shape_candidates = [
+            item for item in candidate_records if item.get("post_shape_score") is not None
+        ]
+        post_shape_selected_action: Dict[str, float] = {}
+        post_shape_selected_score_terms: Dict[str, float] = self._score_term_subset(selected_post_shape_details)
+        if selected_post_shape_control is not None:
+            post_shape_selected_action = self._control_terms(selected_post_shape_control)
+        post_shape_gate_reason = self._rspc_action_safety_gate_reason(state)
+        target_tracking_calibration = self._evaluate_target_tracking_calibration_shadow(
+            state,
+            selected_control,
+            selected_post_shape_control,
+            selected_post_shape_score,
+            selected_post_shape_details,
+            gate_reason=post_shape_gate_reason,
+        )
+
+        post_shape_rows_by_name: Dict[str, Dict[str, Any]] = {}
+        for row in post_shape_rows:
+            row_score = float(row.get("score", 0.0) or 0.0)
+            row_margin = (
+                float(selected_post_shape_score) - row_score
+                if selected_post_shape_score is not None
+                else 0.0
+            )
+            row_action_delta: Dict[str, float] = {}
+            row_score_delta: Dict[str, float] = {}
+            if selected_post_shape_control is not None:
+                row_action_delta = self._profile_action_delta_terms(
+                    selected_post_shape_control,
+                    np.asarray(row.get("control", np.zeros(6)), dtype=np.float32),
+                )
+            if isinstance(selected_post_shape_details, Mapping) and isinstance(row.get("details", {}), Mapping):
+                row_score_delta = self._profile_score_delta_terms(selected_post_shape_details, row.get("details", {}))
+            row_alignment = self._rspc_action_post_shape_alignment(
+                state,
+                gate_reason=post_shape_gate_reason,
+                margin=row_margin,
+                action_delta_terms=row_action_delta,
+                score_delta_terms=row_score_delta,
+            )
+            row["margin"] = float(row_margin)
+            row["action_delta_terms"] = row_action_delta
+            row["score_delta_terms"] = row_score_delta
+            row["alignment"] = row_alignment
+            row["eligible"] = bool(not (row_margin > 0.05 and row_alignment == "unsafe_conflict"))
+            post_shape_rows_by_name[str(row.get("name", "") or "")] = row
+
+        for record in candidate_records:
+            row = post_shape_rows_by_name.get(str(record.get("name", "") or ""))
+            if row:
+                record["post_shape_margin"] = float(row.get("margin", 0.0) or 0.0)
+                record["post_shape_alignment"] = str(row.get("alignment", "neutral_hold") or "neutral_hold")
+                record["post_shape_eligible"] = bool(row.get("eligible", False))
+                record["post_shape_action_delta_terms"] = dict(row.get("action_delta_terms", {}))
+                record["post_shape_score_delta_terms"] = dict(row.get("score_delta_terms", {}))
+
+        raw_post_shape_best_row = min(
+            post_shape_rows,
+            key=lambda item: float(item.get("score", 0.0) or 0.0),
+        ) if post_shape_rows else {}
+        eligible_post_shape_rows = [row for row in post_shape_rows if bool(row.get("eligible", False))]
+        post_shape_best_row = min(
+            eligible_post_shape_rows,
+            key=lambda item: float(item.get("score", 0.0) or 0.0),
+        ) if eligible_post_shape_rows else {}
+        post_shape_best_name = str(post_shape_best_row.get("name", "") or "")
+        post_shape_best = next(
+            (
+                item for item in post_shape_candidates
+                if str(item.get("name", "") or "") == post_shape_best_name
+            ),
+            {},
+        )
+        post_shape_best_score = (
+            float(post_shape_best_row.get("score", 0.0) or 0.0)
+            if post_shape_best_row
+            else None
+        )
+        post_shape_margin = (
+            float(post_shape_best_row.get("margin", 0.0) or 0.0)
+            if post_shape_best_row
+            else 0.0
+        )
+        post_shape_action_delta_terms: Dict[str, float] = dict(post_shape_best_row.get("action_delta_terms", {})) if post_shape_best_row else {}
+        post_shape_score_delta_terms: Dict[str, float] = dict(post_shape_best_row.get("score_delta_terms", {})) if post_shape_best_row else {}
+        post_shape_alignment = str(post_shape_best_row.get("alignment", "neutral_hold") or "neutral_hold") if post_shape_best_row else "neutral_hold"
+        best_details = post_shape_best_row.get("details", {}) if post_shape_best_row else {}
+        post_shape_best_score_terms = self._score_term_subset(best_details) if isinstance(best_details, Mapping) else {}
+        raw_post_shape_margin = float(raw_post_shape_best_row.get("margin", 0.0) or 0.0) if raw_post_shape_best_row else 0.0
+        raw_post_shape_alignment = str(raw_post_shape_best_row.get("alignment", "neutral_hold") or "neutral_hold") if raw_post_shape_best_row else "neutral_hold"
+        raw_post_shape_would_switch = bool(
+            raw_post_shape_best_row
+            and str(raw_post_shape_best_row.get("name", "") or "") != str(selected_name)
+            and raw_post_shape_margin > 0.05
+        )
+        post_shape_would_switch = bool(
+            post_shape_best
+            and str(post_shape_best.get("name", "") or "") != str(selected_name)
+            and post_shape_margin > 0.05
+        )
+        controlled_replay = self._evaluate_hot_dry_action_proposer_controlled_replay_shadow(
+            state,
+            selected_name=str(selected_name),
+            selected_post_shape_score=selected_post_shape_score,
+            selected_post_shape_control=selected_post_shape_control,
+            selected_post_shape_details=selected_post_shape_details,
+            post_shape_rows=post_shape_rows,
+            gate_reason=post_shape_gate_reason,
+        )
+        return {
+            "enabled": True,
+            "shadow_only": True,
+            "actual_candidate_count": int(actual_candidate_count),
+            "candidate_count": int(len(candidate_records)),
+            "selected_name": str(selected_name),
+            "selected_score": float(selected_score) if np.isfinite(selected_score) else None,
+            "selected_action": selected_action,
+            "selected_score_terms": selected_score_terms,
+            "candidates": candidate_records,
+            "post_shape_enabled": True,
+            "post_shape_selected_score": selected_post_shape_score,
+            "post_shape_best_name": str(post_shape_best.get("name", "") or ""),
+            "post_shape_best_score": post_shape_best_score,
+            "post_shape_selected_action": post_shape_selected_action,
+            "post_shape_selected_score_terms": post_shape_selected_score_terms,
+            "post_shape_best_action": post_shape_best.get("post_shape_action", {}),
+            "post_shape_best_score_terms": post_shape_best_score_terms,
+            "post_shape_best_events": post_shape_best.get("post_shape_events", {}),
+            "post_shape_best_eligible": bool(post_shape_best_row.get("eligible", False)) if post_shape_best_row else False,
+            "post_shape_best_is_proposer": bool(str(post_shape_best.get("name", "") or "").startswith("shadow_hot_dry_")),
+            "post_shape_raw_best_name": str(raw_post_shape_best_row.get("name", "") or ""),
+            "post_shape_raw_best_score": (
+                float(raw_post_shape_best_row.get("score", 0.0) or 0.0)
+                if raw_post_shape_best_row
+                else None
+            ),
+            "post_shape_raw_best_is_proposer": bool(
+                str(raw_post_shape_best_row.get("name", "") or "").startswith("shadow_hot_dry_")
+            ),
+            "post_shape_raw_best_alignment": raw_post_shape_alignment,
+            "post_shape_raw_best_margin": raw_post_shape_margin,
+            "post_shape_raw_would_switch": raw_post_shape_would_switch,
+            "post_shape_raw_unsafe_conflict": bool(raw_post_shape_would_switch and raw_post_shape_alignment == "unsafe_conflict"),
+            "post_shape_action_delta_terms": post_shape_action_delta_terms,
+            "post_shape_score_delta_terms": post_shape_score_delta_terms,
+            "post_shape_safety_gate_reason": post_shape_gate_reason,
+            "post_shape_alignment": post_shape_alignment,
+            "post_shape_margin": float(post_shape_margin),
+            "post_shape_would_switch": post_shape_would_switch,
+            "post_shape_unsafe_conflict": bool(post_shape_would_switch and post_shape_alignment == "unsafe_conflict"),
+            "post_shape_dry_benefit": bool(post_shape_would_switch and post_shape_alignment == "dry_benefit"),
+            "post_shape_safe_relief": bool(post_shape_would_switch and post_shape_alignment == "safe_relief"),
+            "target_tracking_calibration": target_tracking_calibration,
+            "hot_dry_action_proposer_controlled_replay": controlled_replay,
+            "hot_dry_features": {
+                "active": bool(hot_dry_features.get("active", False)),
+                "semantic_active": bool(hot_dry_shadow_features.get("semantic_active", False)),
+                "shadow_active": bool(hot_dry_shadow_features.get("shadow_active", False)),
+                "shadow_gate_reason": str(hot_dry_shadow_features.get("shadow_gate_reason", "none") or "none"),
+                "dry_pressure": bool(hot_dry_features.get("dry_pressure", False)),
+                "hot_pressure": bool(hot_dry_shadow_features.get("hot_pressure", False)),
+                "strong_rad": bool(hot_dry_shadow_features.get("strong_rad", False)),
+                "extreme_dew": bool(hot_dry_shadow_features.get("extreme_dew", False)),
+                "enabled": bool(hot_dry_features.get("enabled", False)),
+            },
+            "hot_dry_candidates_enabled": bool(
+                getattr(self.config, "rspc_hot_dry_candidates_enabled", False)
+            ),
+            "hot_dry_candidate_count": int(hot_dry_count),
+            "hot_dry_proposer_enabled": True,
+            "hot_dry_proposer_active": bool(hot_dry_shadow_features.get("shadow_active", False)),
+            "hot_dry_proposer_candidate_count": int(hot_dry_shadow_count),
+            "hot_dry_proposer_gate_reason": str(hot_dry_shadow_features.get("shadow_gate_reason", "none") or "none"),
+        }
 
     @staticmethod
     def _candidate_energy_proxy(control: np.ndarray) -> float:
@@ -2766,6 +6599,9 @@ class RuleBasedLLMDirector:
             cooling[4] = 0.0
             candidates.append(FallbackCandidate("heat_relief", cooling, rationale="高温降温保护"))
 
+        for name, control, rationale in self._build_rspc_hot_dry_candidates(state, env_control):
+            candidates.append(FallbackCandidate(name, control, rationale=rationale))
+
         if rh <= float(self.config.dry_rh_on) or vpd >= float(self.config.dry_vpd_on):
             dry = np.clip(env_control.copy(), 0.0, 1.0)
             dry[1] = 0.0
@@ -2802,6 +6638,351 @@ class RuleBasedLLMDirector:
             scored.append(candidate)
         return sorted(scored, key=lambda item: item.score)
 
+    def _fallback_candidate_safety_prediction(
+        self,
+        state,
+        control: np.ndarray,
+    ) -> Dict[str, Any]:
+        target_temp: Optional[float] = None
+        target_co2: Optional[float] = None
+        target_rh: Optional[float] = None
+        if isinstance(getattr(self, "current_plan", None), dict):
+            try:
+                target_temp = self._get_plan_target(self.current_plan, "target_temp", state)
+                target_co2 = self._get_plan_target(self.current_plan, "target_co2", state)
+                target_rh = self._get_plan_target(self.current_plan, "target_rh", state)
+            except Exception:
+                target_temp = None
+                target_co2 = None
+                target_rh = None
+        _, _, target_rh, template_record = self._apply_profile_template_patch_targets(
+            state,
+            np.asarray(control, dtype=np.float32),
+            target_temp,
+            target_co2,
+            target_rh,
+            source="fallback_post_selection_veto_prediction",
+            update_last=False,
+        )
+        shaped, info = apply_tomato_safety_v2(
+            state,
+            np.asarray(control, dtype=np.float32),
+            config=self.config,
+            target_rh=target_rh,
+        )
+        reason_text = " ".join(str(x) for x in info.get("reasons", []) or []).lower()
+        hard_safety = bool(
+            info.get("applied", False)
+            and any(token in reason_text for token in ("hard", "dew", "canopy", "extreme", "hot_temperature"))
+        )
+        before = np.asarray(control, dtype=np.float32)
+        after = np.asarray(shaped, dtype=np.float32)
+        rewrite_fields = [
+            name
+            for idx, name in enumerate(("heat", "co2", "screen", "vent", "lamp", "shade"))
+            if idx < int(after.size) and idx < int(before.size) and abs(float(after[idx]) - float(before[idx])) > 1e-6
+        ]
+        return {
+            "hard_safety_rewrite": bool(hard_safety),
+            "tomato_safety_applied": bool(info.get("applied", False)),
+            "safety_reasons": list(info.get("reasons", []) or []),
+            "rewrite_fields": rewrite_fields,
+            "delta_abs_sum": float(np.sum(np.abs(after - before))),
+            "template_patch": template_record,
+            "before": [float(x) for x in before.tolist()],
+            "after": [float(x) for x in after.tolist()],
+        }
+
+    def _recovery_anchor_is_enabled(self) -> bool:
+        return bool(
+            getattr(self.config, "profile_template_patch_enabled", False)
+            and getattr(self.config, "fallback_post_selection_veto_enabled", False)
+            and getattr(self.config, "recovery_anchor_enabled", False)
+            and str(getattr(self.config, "recovery_anchor_source", "") or "")
+            == "tomato_safety_projected_anchor"
+        )
+
+    def _recovery_anchor_record_base(self) -> Dict[str, Any]:
+        enabled = self._recovery_anchor_is_enabled()
+        return {
+            "recovery_anchor_enabled": bool(enabled),
+            "recovery_anchor_applied": False,
+            "recovery_anchor_source": str(getattr(self.config, "recovery_anchor_source", "") or ""),
+            "recovery_anchor_reason": "disabled" if not enabled else "",
+            "recovery_anchor_action": {},
+            "recovery_anchor_prediction": {},
+            "recovery_anchor_no_compatible_existing_candidate": False,
+            "recovery_anchor_selected_before": "",
+            "recovery_anchor_selected_after": "",
+            "recovery_anchor_safety_reasons": [],
+            "recovery_anchor_rewrite_fields": [],
+        }
+
+    def _build_recovery_anchor_candidate(
+        self,
+        state,
+        selected: FallbackCandidate,
+        selected_prediction: Mapping[str, Any],
+    ) -> Tuple[Optional[FallbackCandidate], Dict[str, Any]]:
+        record = self._recovery_anchor_record_base()
+        if not record["recovery_anchor_enabled"]:
+            return None, record
+        if not bool(selected_prediction.get("hard_safety_rewrite", False)):
+            record["recovery_anchor_reason"] = "selected_candidate_compatible"
+            return None, record
+
+        projected_values = selected_prediction.get("after")
+        if not isinstance(projected_values, (list, tuple, np.ndarray)):
+            record["recovery_anchor_reason"] = "projected_action_missing"
+            return None, record
+        projected = np.clip(np.asarray(projected_values, dtype=np.float32), 0.0, 1.0)
+        if projected.size < 6:
+            record["recovery_anchor_reason"] = "projected_action_missing"
+            return None, record
+
+        recovery_prediction = self._fallback_candidate_safety_prediction(state, projected)
+        record.update(
+            {
+                "recovery_anchor_no_compatible_existing_candidate": True,
+                "recovery_anchor_selected_before": selected.name,
+                "recovery_anchor_selected_after": "tomato_safety_projected_anchor",
+                "recovery_anchor_action": self._control_terms(projected),
+                "recovery_anchor_prediction": {
+                    "hard_safety_rewrite": bool(recovery_prediction.get("hard_safety_rewrite", False)),
+                    "tomato_safety_applied": bool(recovery_prediction.get("tomato_safety_applied", False)),
+                    "safety_reasons": list(recovery_prediction.get("safety_reasons", []) or []),
+                    "rewrite_fields": list(recovery_prediction.get("rewrite_fields", []) or []),
+                },
+                "recovery_anchor_safety_reasons": list(recovery_prediction.get("safety_reasons", []) or []),
+                "recovery_anchor_rewrite_fields": list(recovery_prediction.get("rewrite_fields", []) or []),
+            }
+        )
+        if bool(recovery_prediction.get("hard_safety_rewrite", False)):
+            record["recovery_anchor_reason"] = "recovery_anchor_still_hard_safety_rewrite"
+            return None, record
+
+        recovery = FallbackCandidate(
+            "tomato_safety_projected_anchor",
+            projected.astype(np.float32),
+            score=float(selected.score),
+            details={
+                "source": "recovery_anchor",
+                "selected_before": selected.name,
+                "no_compatible_existing_candidate": True,
+            },
+            rationale="Tomato Safety projected action exposed as an explicit recovery anchor",
+        )
+        record.update(
+            {
+                "recovery_anchor_applied": True,
+                "recovery_anchor_reason": "fallback_veto_no_alternative_projected_anchor",
+            }
+        )
+        return recovery, record
+
+    def _apply_recovery_anchor_to_selected_control(
+        self,
+        state,
+        *,
+        source_name: str,
+        control: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        base_control = np.clip(np.asarray(control, dtype=np.float32), 0.0, 1.0)
+        record: Dict[str, Any] = {
+            "enabled": bool(
+                getattr(self.config, "profile_template_patch_enabled", False)
+                and getattr(self.config, "fallback_post_selection_veto_enabled", False)
+            ),
+            "applied": False,
+            "selected_before": str(source_name or "selected_control"),
+            "selected_after": str(source_name or "selected_control"),
+            "reason": "selected_candidate_compatible",
+            "no_alternative": False,
+            "candidate_predictions": [],
+        }
+        record.update(self._recovery_anchor_record_base())
+        if state is None or not self._recovery_anchor_is_enabled():
+            return base_control, record
+
+        selected = FallbackCandidate(
+            str(source_name or "selected_control"),
+            base_control,
+            score=0.0,
+            details={"source": "direct_post_selection_contract"},
+            rationale="direct selected fallback source",
+        )
+        prediction = self._fallback_candidate_safety_prediction(state, selected.control)
+        record.update(
+            {
+                "candidate_predictions": [
+                    {
+                        "name": selected.name,
+                        "score": 0.0,
+                        "hard_safety_rewrite": bool(prediction.get("hard_safety_rewrite", False)),
+                        "tomato_safety_applied": bool(prediction.get("tomato_safety_applied", False)),
+                        "safety_reasons": list(prediction.get("safety_reasons", []) or []),
+                        "rewrite_fields": list(prediction.get("rewrite_fields", []) or []),
+                    }
+                ],
+                "selected_before_hard_safety_rewrite": bool(prediction.get("hard_safety_rewrite", False)),
+                "selected_before_safety_reasons": list(prediction.get("safety_reasons", []) or []),
+                "selected_before_rewrite_fields": list(prediction.get("rewrite_fields", []) or []),
+            }
+        )
+        if not bool(prediction.get("hard_safety_rewrite", False)):
+            return selected.control, record
+
+        record.update({"reason": "fallback_veto_no_alternative", "no_alternative": True})
+        recovery, recovery_record = self._build_recovery_anchor_candidate(state, selected, prediction)
+        record.update(recovery_record)
+        if recovery is None:
+            return selected.control, record
+        recovery_prediction = dict(recovery_record.get("recovery_anchor_prediction", {}) or {})
+        record.update(
+            {
+                "applied": True,
+                "reason": "fallback_post_selection_recovery_anchor",
+                "no_alternative": False,
+                "selected_after": recovery.name,
+                "selected_after_hard_safety_rewrite": bool(recovery_prediction.get("hard_safety_rewrite", False)),
+                "selected_after_safety_reasons": list(recovery_prediction.get("safety_reasons", []) or []),
+                "selected_after_rewrite_fields": list(recovery_prediction.get("rewrite_fields", []) or []),
+            }
+        )
+        return recovery.control, record
+
+    def _record_fallback_contract_provenance(self, veto_record: Mapping[str, Any]) -> None:
+        if not bool(getattr(self.config, "profile_template_patch_record_provenance", True)):
+            return
+        existing = dict(getattr(self, "last_profile_template_patch", {}) or {})
+        existing.update(
+            {
+                "enabled": bool(getattr(self.config, "profile_template_patch_enabled", False)),
+                "fallback_veto_enabled": bool(getattr(self.config, "fallback_post_selection_veto_enabled", False)),
+                "fallback_veto_applied": bool(veto_record.get("applied", False)),
+                "fallback_veto_no_alternative": bool(veto_record.get("no_alternative", False)),
+                "fallback_veto_reason": str(veto_record.get("reason", "")),
+                "fallback_veto_selected_before": str(veto_record.get("selected_before", "")),
+                "fallback_veto_selected_after": str(veto_record.get("selected_after", "")),
+                "fallback_veto_safety_reasons": list(veto_record.get("selected_before_safety_reasons", []) or []),
+                "fallback_veto_rewrite_fields": list(veto_record.get("selected_before_rewrite_fields", []) or []),
+                "recovery_anchor_enabled": bool(veto_record.get("recovery_anchor_enabled", False)),
+                "recovery_anchor_applied": bool(veto_record.get("recovery_anchor_applied", False)),
+                "recovery_anchor_source": str(veto_record.get("recovery_anchor_source", "")),
+                "recovery_anchor_reason": str(veto_record.get("recovery_anchor_reason", "")),
+                "recovery_anchor_action": dict(veto_record.get("recovery_anchor_action", {}) or {}),
+                "recovery_anchor_prediction": dict(veto_record.get("recovery_anchor_prediction", {}) or {}),
+                "recovery_anchor_no_compatible_existing_candidate": bool(
+                    veto_record.get("recovery_anchor_no_compatible_existing_candidate", False)
+                ),
+                "recovery_anchor_selected_before": str(veto_record.get("recovery_anchor_selected_before", "")),
+                "recovery_anchor_selected_after": str(veto_record.get("recovery_anchor_selected_after", "")),
+                "recovery_anchor_safety_reasons": list(veto_record.get("recovery_anchor_safety_reasons", []) or []),
+                "recovery_anchor_rewrite_fields": list(veto_record.get("recovery_anchor_rewrite_fields", []) or []),
+            }
+        )
+        self.last_profile_template_patch = existing
+
+    def _apply_fallback_post_selection_veto(
+        self,
+        state,
+        candidates: Sequence[FallbackCandidate],
+    ) -> Tuple[FallbackCandidate, Dict[str, Any]]:
+        enabled = bool(
+            getattr(self.config, "profile_template_patch_enabled", False)
+            and getattr(self.config, "fallback_post_selection_veto_enabled", False)
+        )
+        if not candidates:
+            raise ValueError("fallback post-selection veto requires at least one candidate")
+        best = candidates[0]
+        record: Dict[str, Any] = {
+            "enabled": enabled,
+            "applied": False,
+            "selected_before": best.name,
+            "selected_after": best.name,
+            "reason": "disabled" if not enabled else "selected_candidate_compatible",
+            "no_alternative": False,
+            "candidate_predictions": [],
+        }
+        record.update(self._recovery_anchor_record_base())
+        if not enabled or state is None:
+            return best, record
+
+        predictions: List[Tuple[FallbackCandidate, Dict[str, Any]]] = []
+        for candidate in candidates:
+            prediction = self._fallback_candidate_safety_prediction(state, candidate.control)
+            predictions.append((candidate, prediction))
+            record["candidate_predictions"].append(
+                {
+                    "name": candidate.name,
+                    "score": float(candidate.score),
+                    "hard_safety_rewrite": bool(prediction.get("hard_safety_rewrite", False)),
+                    "tomato_safety_applied": bool(prediction.get("tomato_safety_applied", False)),
+                    "safety_reasons": list(prediction.get("safety_reasons", []) or []),
+                    "rewrite_fields": list(prediction.get("rewrite_fields", []) or []),
+                }
+            )
+
+        best_prediction = predictions[0][1]
+        record["selected_before_hard_safety_rewrite"] = bool(best_prediction.get("hard_safety_rewrite", False))
+        record["selected_before_safety_reasons"] = list(best_prediction.get("safety_reasons", []) or [])
+        record["selected_before_rewrite_fields"] = list(best_prediction.get("rewrite_fields", []) or [])
+        if not bool(best_prediction.get("hard_safety_rewrite", False)):
+            return best, record
+
+        compatible = next(
+            (
+                (candidate, prediction)
+                for candidate, prediction in predictions[1:]
+                if not bool(prediction.get("hard_safety_rewrite", False))
+            ),
+            None,
+        )
+        if compatible is None:
+            record.update(
+                {
+                    "reason": "fallback_veto_no_alternative",
+                    "no_alternative": True,
+                    "selected_after": best.name,
+                }
+            )
+            recovery, recovery_record = self._build_recovery_anchor_candidate(state, best, best_prediction)
+            record.update(recovery_record)
+            if recovery is not None:
+                recovery_prediction = dict(recovery_record.get("recovery_anchor_prediction", {}) or {})
+                record.update(
+                    {
+                        "applied": True,
+                        "reason": "fallback_post_selection_recovery_anchor",
+                        "no_alternative": False,
+                        "selected_after": recovery.name,
+                        "selected_after_hard_safety_rewrite": bool(
+                            recovery_prediction.get("hard_safety_rewrite", False)
+                        ),
+                        "selected_after_safety_reasons": list(
+                            recovery_prediction.get("safety_reasons", []) or []
+                        ),
+                        "selected_after_rewrite_fields": list(
+                            recovery_prediction.get("rewrite_fields", []) or []
+                        ),
+                    }
+                )
+                return recovery, record
+            return best, record
+
+        selected, selected_prediction = compatible
+        record.update(
+            {
+                "applied": True,
+                "reason": "fallback_post_selection_hard_safety_rewrite",
+                "selected_after": selected.name,
+                "selected_after_hard_safety_rewrite": bool(selected_prediction.get("hard_safety_rewrite", False)),
+                "selected_after_safety_reasons": list(selected_prediction.get("safety_reasons", []) or []),
+                "selected_after_rewrite_fields": list(selected_prediction.get("rewrite_fields", []) or []),
+            }
+        )
+        return selected, record
+
     def _select_fallback_control(self, state=None, analysis: Optional[Dict[str, Any]] = None) -> np.ndarray:
         env = self.interface.env
         env_control = np.asarray(getattr(env, "u", np.zeros(getattr(env, "nu", 6))), dtype=np.float32)
@@ -2809,32 +6990,76 @@ class RuleBasedLLMDirector:
 
         rule_control = self._predict_rule_control()
         if strategy == "rule" and rule_control is not None:
-            self.last_fallback_selection = {"source": "rule_controller", "score": None, "candidates": []}
-            return np.asarray(rule_control, dtype=np.float32).copy()
+            control, veto_record = self._apply_recovery_anchor_to_selected_control(
+                state,
+                source_name="rule_controller",
+                control=np.asarray(rule_control, dtype=np.float32),
+            )
+            self.last_fallback_selection = {
+                "source": str(veto_record.get("selected_after", "rule_controller")),
+                "score": None,
+                "candidates": [],
+                "fallback_candidate_scores": [],
+                "selected_fallback_candidate": str(veto_record.get("selected_after", "rule_controller")),
+                "selected_fallback_score_breakdown": {},
+                "profile_template_patch_fallback_veto": veto_record,
+            }
+            self._record_fallback_contract_provenance(veto_record)
+            return np.asarray(control, dtype=np.float32).copy()
 
         if strategy == "recent" and self.config.fallback_use_last_control and self.last_control is not None:
-            self.last_fallback_selection = {"source": "recent_anchor", "score": None, "candidates": []}
-            return np.asarray(self.last_control, dtype=np.float32).copy()
+            control, veto_record = self._apply_recovery_anchor_to_selected_control(
+                state,
+                source_name="recent_anchor",
+                control=np.asarray(self.last_control, dtype=np.float32),
+            )
+            self.last_fallback_selection = {
+                "source": str(veto_record.get("selected_after", "recent_anchor")),
+                "score": None,
+                "candidates": [],
+                "fallback_candidate_scores": [],
+                "selected_fallback_candidate": str(veto_record.get("selected_after", "recent_anchor")),
+                "selected_fallback_score_breakdown": {},
+                "profile_template_patch_fallback_veto": veto_record,
+            }
+            self._record_fallback_contract_provenance(veto_record)
+            return np.asarray(control, dtype=np.float32).copy()
 
         if state is not None and bool(getattr(self.config, "fallback_candidate_scoring", True)):
             candidates = self._build_fallback_candidates(state, analysis=analysis)
             if candidates:
-                best = candidates[0]
+                best, veto_record = self._apply_fallback_post_selection_veto(state, candidates)
+                candidate_scores = [
+                    {
+                        "name": item.name,
+                        "score": float(item.score),
+                        "rationale": item.rationale,
+                        "action": self._control_terms(item.control),
+                        "score_breakdown": self._score_term_subset(item.details),
+                    }
+                    for item in candidates
+                ]
                 self.last_fallback_selection = {
                     "source": best.name,
                     "score": float(best.score),
                     "rationale": best.rationale,
                     "details": best.details,
+                    "selected_fallback_candidate": best.name,
+                    "selected_fallback_score_breakdown": self._score_term_subset(best.details),
+                    "fallback_candidate_scores": candidate_scores,
                     "candidates": [
                         {
                             "name": item.name,
                             "score": float(item.score),
                             "rationale": item.rationale,
                             "details": item.details,
+                            "score_breakdown": self._score_term_subset(item.details),
                         }
                         for item in candidates[:5]
                     ],
+                    "profile_template_patch_fallback_veto": veto_record,
                 }
+                self._record_fallback_contract_provenance(veto_record)
                 return np.clip(best.control, 0.0, 1.0).astype(np.float32)
 
         if state is not None:
@@ -2843,18 +7068,74 @@ class RuleBasedLLMDirector:
             if self.config.fallback_use_last_control and self.last_control is not None:
                 blend = float(np.clip(self.config.fallback_recent_blend, 0.0, 1.0))
                 adaptive_control = (1.0 - blend) * adaptive_control + blend * np.asarray(self.last_control, dtype=np.float32)
-            self.last_fallback_selection = {"source": "adaptive_legacy", "score": None, "candidates": []}
-            return np.clip(adaptive_control, 0.0, 1.0).astype(np.float32)
+            self.last_fallback_selection = {
+                "source": "adaptive_legacy",
+                "score": None,
+                "candidates": [],
+                "fallback_candidate_scores": [],
+                "selected_fallback_candidate": "adaptive_legacy",
+                "selected_fallback_score_breakdown": {},
+            }
+            adaptive_control = np.clip(adaptive_control, 0.0, 1.0).astype(np.float32)
+            control, veto_record = self._apply_recovery_anchor_to_selected_control(
+                state,
+                source_name="adaptive_legacy",
+                control=adaptive_control,
+            )
+            self.last_fallback_selection.update(
+                {
+                    "source": str(veto_record.get("selected_after", "adaptive_legacy")),
+                    "selected_fallback_candidate": str(veto_record.get("selected_after", "adaptive_legacy")),
+                    "profile_template_patch_fallback_veto": veto_record,
+                }
+            )
+            self._record_fallback_contract_provenance(veto_record)
+            return np.asarray(control, dtype=np.float32).copy()
 
         if rule_control is not None:
-            self.last_fallback_selection = {"source": "rule_controller", "score": None, "candidates": []}
-            return np.asarray(rule_control, dtype=np.float32).copy()
+            control, veto_record = self._apply_recovery_anchor_to_selected_control(
+                state,
+                source_name="rule_controller",
+                control=np.asarray(rule_control, dtype=np.float32),
+            )
+            self.last_fallback_selection = {
+                "source": str(veto_record.get("selected_after", "rule_controller")),
+                "score": None,
+                "candidates": [],
+                "fallback_candidate_scores": [],
+                "selected_fallback_candidate": str(veto_record.get("selected_after", "rule_controller")),
+                "selected_fallback_score_breakdown": {},
+                "profile_template_patch_fallback_veto": veto_record,
+            }
+            self._record_fallback_contract_provenance(veto_record)
+            return np.asarray(control, dtype=np.float32).copy()
 
         if self.config.fallback_use_last_control and self.last_control is not None:
-            self.last_fallback_selection = {"source": "recent_anchor", "score": None, "candidates": []}
-            return np.asarray(self.last_control, dtype=np.float32).copy()
+            control, veto_record = self._apply_recovery_anchor_to_selected_control(
+                state,
+                source_name="recent_anchor",
+                control=np.asarray(self.last_control, dtype=np.float32),
+            )
+            self.last_fallback_selection = {
+                "source": str(veto_record.get("selected_after", "recent_anchor")),
+                "score": None,
+                "candidates": [],
+                "fallback_candidate_scores": [],
+                "selected_fallback_candidate": str(veto_record.get("selected_after", "recent_anchor")),
+                "selected_fallback_score_breakdown": {},
+                "profile_template_patch_fallback_veto": veto_record,
+            }
+            self._record_fallback_contract_provenance(veto_record)
+            return np.asarray(control, dtype=np.float32).copy()
 
-        self.last_fallback_selection = {"source": "hold_current", "score": None, "candidates": []}
+        self.last_fallback_selection = {
+            "source": "hold_current",
+            "score": None,
+            "candidates": [],
+            "fallback_candidate_scores": [],
+            "selected_fallback_candidate": "hold_current",
+            "selected_fallback_score_breakdown": {},
+        }
         return env_control.copy()
 
     def _buffer_control(self, control: np.ndarray) -> np.ndarray:
@@ -2947,9 +7228,45 @@ class RuleBasedLLMDirector:
         """将缓存控制量统一过护栏并清空缓存。"""
         if self.pending_control is None:
             self.pending_control = self._select_fallback_control(state=state)
-        final_control = apply_safety_guardrails(state, self.pending_control)
+        pre_guardrail_control = np.asarray(self.pending_control, dtype=np.float32)
+        final_control = apply_safety_guardrails(state, pre_guardrail_control)
+        self._record_post_guardrail_runtime_provenance(
+            state,
+            hook_id="apply_safety_guardrails",
+            source_function="apply_safety_guardrails",
+            pre_rule_action=pre_guardrail_control,
+            post_rule_action=final_control,
+        )
+        pre_humidity_memory_control = np.asarray(final_control, dtype=np.float32)
         final_control = self._apply_humidity_memory_final_shape(state, final_control)
+        humidity_memory_info = {}
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            humidity_memory_info = dict(
+                self.last_rollout_selection.get("humidity_memory_post_guardrail_shape", {}) or {}
+            )
+        self._record_post_guardrail_runtime_provenance(
+            state,
+            hook_id="humidity_memory_final_shape",
+            source_function="_apply_humidity_memory_final_shape",
+            pre_rule_action=pre_humidity_memory_control,
+            post_rule_action=final_control,
+            info=humidity_memory_info,
+        )
+        pre_tomato_safety_control = np.asarray(final_control, dtype=np.float32)
         final_control = self._apply_tomato_safety_v2(state, final_control)
+        self._record_post_guardrail_runtime_provenance(
+            state,
+            hook_id="tomato_safety_v2_wrapper",
+            source_function="_apply_tomato_safety_v2",
+            pre_rule_action=pre_tomato_safety_control,
+            post_rule_action=final_control,
+            info=getattr(self, "last_tomato_safety_v2", {}) or {},
+        )
+        self._store_post_guardrail_final_risk_shadow(
+            state,
+            np.asarray(self.pending_control, dtype=np.float32),
+            np.asarray(final_control, dtype=np.float32),
+        )
         self.pending_control = None
         return np.asarray(final_control, dtype=np.float32)
 
@@ -2959,11 +7276,38 @@ class RuleBasedLLMDirector:
         control: np.ndarray,
         target_rh: Optional[float] = None,
     ) -> np.ndarray:
-        if target_rh is None and isinstance(getattr(self, "current_plan", None), dict):
+        target_temp: Optional[float] = None
+        target_co2: Optional[float] = None
+        if isinstance(getattr(self, "current_plan", None), dict):
             try:
-                target_rh = self._get_plan_target(self.current_plan, "target_rh", state)
+                if target_rh is None:
+                    target_rh = self._get_plan_target(self.current_plan, "target_rh", state)
+                target_temp = self._get_plan_target(self.current_plan, "target_temp", state)
+                target_co2 = self._get_plan_target(self.current_plan, "target_co2", state)
             except Exception:
-                target_rh = None
+                target_temp = None
+                target_co2 = None
+                target_rh = target_rh
+        if bool(getattr(self.config, "profile_feasibility_gate_enabled", False)):
+            target_temp, target_co2, target_rh, gate_record = self._apply_profile_feasibility_gate_targets(
+                state,
+                np.asarray(control, dtype=np.float32),
+                target_temp,
+                target_co2,
+                target_rh,
+                source="tomato_safety_v2_target",
+                update_last=True,
+            )
+        if bool(getattr(self.config, "profile_template_patch_enabled", False)):
+            target_temp, target_co2, target_rh, _template_record = self._apply_profile_template_patch_targets(
+                state,
+                np.asarray(control, dtype=np.float32),
+                target_temp,
+                target_co2,
+                target_rh,
+                source="tomato_safety_v2_target",
+                update_last=True,
+            )
         shaped, info = apply_tomato_safety_v2(
             state,
             np.asarray(control, dtype=np.float32),
@@ -2986,6 +7330,63 @@ class RuleBasedLLMDirector:
             and str(getattr(self.config, "plan_cache_key_policy", "prompt")) == "scenario_timestep"
             and bool(getattr(self.config, "plan_cache_strict", False))
         )
+
+    def _should_suppress_strict_replay_emergency_replan(self) -> bool:
+        return (
+            bool(getattr(self.config, "strict_replay_suppress_uncached_emergency_replans", True))
+            and str(getattr(self.config, "plan_cache_mode", "off")) == "replay"
+            and str(getattr(self.config, "plan_cache_key_policy", "prompt")) == "scenario_timestep"
+            and bool(getattr(self.config, "plan_cache_strict", False))
+        )
+
+    def _strict_replay_plan_key_for_step(self, state) -> Optional[str]:
+        plan_cache = getattr(self, "plan_cache", None)
+        if plan_cache is None:
+            return None
+        try:
+            cache_key = plan_cache.make_key(
+                env_id=str(getattr(self, "env_id", "")),
+                state_summary={"timestep": int(getattr(state, "timestep", 0))},
+                reason="frozen_replan",
+                planning_horizon=0,
+                config_hash=stable_hash(config_fingerprint(self.config)),
+                prompt_hash="scenario_timestep",
+                attempt=1,
+            )
+            return cache_key if plan_cache.get(cache_key) is not None else None
+        except Exception:
+            return None
+
+    def _tomato_v2_replay_plan_key_for_step(self, state) -> Optional[str]:
+        return self._strict_replay_plan_key_for_step(state)
+
+    def _has_strict_replay_plan_for_step(self, state) -> bool:
+        return self._strict_replay_plan_key_for_step(state) is not None
+
+    def _has_tomato_v2_replay_plan_for_step(self, state) -> bool:
+        return self._tomato_v2_replay_plan_key_for_step(state) is not None
+
+    def _should_follow_strict_replay_frozen_replan_step(self, state) -> bool:
+        if not self._should_suppress_strict_replay_emergency_replan():
+            return False
+        cache_key = self._strict_replay_plan_key_for_step(state)
+        if cache_key is None:
+            return False
+        plan = self.current_plan if isinstance(getattr(self, "current_plan", None), dict) else {}
+        event = plan.get("plan_cache_event", {}) if isinstance(plan, dict) else {}
+        current_key = str(event.get("key", "")) if isinstance(event, dict) else ""
+        return current_key != str(cache_key)
+
+    def _should_follow_tomato_v2_frozen_replan_step(self, state) -> bool:
+        if not self._should_suppress_tomato_v2_replay_emergency_replan():
+            return False
+        cache_key = self._tomato_v2_replay_plan_key_for_step(state)
+        if cache_key is None:
+            return False
+        plan = self.current_plan if isinstance(getattr(self, "current_plan", None), dict) else {}
+        event = plan.get("plan_cache_event", {}) if isinstance(plan, dict) else {}
+        current_key = str(event.get("key", "")) if isinstance(event, dict) else ""
+        return current_key != str(cache_key)
 
     def _enforce_setpoint_contract(
         self,
@@ -3197,6 +7598,14 @@ class RuleBasedLLMDirector:
         cache_key = None
         cache_prompt_hash = ""
         cache_config_hash = stable_hash(config_fingerprint(self.config))
+        structured_anchor_mode = bool(getattr(self.config, "structured_anchor_parser_enabled", False))
+        self._store_structured_anchor_record(self._structured_anchor_empty_record(attempted=False))
+        self.last_structured_anchor_profile_bridge = {
+            "enabled": bool(getattr(self.config, "structured_anchor_profile_bridge_enabled", False)),
+            "shadow_only": bool(getattr(self.config, "structured_anchor_profile_bridge_shadow_only", True)),
+            "applied": False,
+            "bridgeable": False,
+        }
         self.last_plan_cache_event = {
             "enabled": bool(plan_cache is not None),
             "mode": cache_mode,
@@ -3213,6 +7622,7 @@ class RuleBasedLLMDirector:
             if tools_instance is None:
                 raise RuntimeError("无法获取 LLM 工具实例 (tools_instance 为 None)")
 
+            previous_structured_anchor_errors: List[str] = []
             for llm_attempts in range(1, max(1, self.config.max_iterations) + 1):
                 tools_instance.reset_buffer()
 
@@ -3228,7 +7638,27 @@ class RuleBasedLLMDirector:
                     status_brief=status_brief,
                     horizon=planning_horizon,
                 )
-                if llm_attempts > 1:
+                if structured_anchor_mode and llm_attempts > 1:
+                    if bool(getattr(self.config, "structured_anchor_compact_json_prompt_enabled", False)):
+                        retry_hint = (
+                            "\nRETRY_JSON_ONLY: previous structured anchor was invalid or empty "
+                            f"({','.join(previous_structured_anchor_errors) if previous_structured_anchor_errors else 'unknown'}). "
+                            "Return exactly one minified JSON object: "
+                            "{\"structured_planning_anchor\":{\"profile_intent\":\"<intent>\","
+                            "\"target_temp\":<number>,\"target_co2\":<number>,\"target_rh\":<number>,"
+                            "\"risk_flags\":[\"<risk>\"],\"forbidden_intents\":[\"<forbidden>\"],"
+                            "\"planning_horizon_steps\":<integer>,\"confidence\":<0_to_1>}}. "
+                            "No markdown, no prose, no tools, no actuator fields."
+                        )
+                    else:
+                        retry_hint = (
+                            "\nRetry requirement: return one valid structured_planning_anchor JSON object. "
+                            "Do not call set_all_controls or output final-control/actuator fields. "
+                            "All required fields must be present and confidence must be in [0, 1]."
+                        )
+                    prompt_text = f"{prompt_text}{retry_hint}"
+                    print(f"[Director] LLM iteration {llm_attempts} using structured-anchor retry prompt")
+                elif llm_attempts > 1:
                     retry_hint = (
                         "\n【纠错重试要求】上一轮没有产出可执行锚点。"
                         "本轮必须且仅调用一次 set_all_controls，"
@@ -3278,9 +7708,16 @@ class RuleBasedLLMDirector:
                     }
                     if cache_entry is not None and cache_mode in {"record", "replay"}:
                         llm_output = str(cache_entry.get("raw_response", ""))
-                        llm_action_found = self._restore_cached_action(tools_instance, cache_entry)
                         llm_duration = 0.0
                         print(f"[Director] LLM plan cache hit: mode={cache_mode}, key={cache_key}")
+                        if structured_anchor_mode:
+                            structured_valid = self._restore_cached_structured_anchor(cache_entry)
+                            if structured_valid:
+                                self.last_plan_cache_event.update({"status": "hit_structured_anchor"})
+                                break
+                            print(f"[Director] Cached iteration {llm_attempts} has no valid structured anchor, retrying...")
+                            continue
+                        llm_action_found = self._restore_cached_action(tools_instance, cache_entry)
                         if llm_action_found:
                             break
                         print(f"[Director] Cached iteration {llm_attempts} has no planning anchor, retrying...")
@@ -3290,10 +7727,21 @@ class RuleBasedLLMDirector:
 
                 start_time = time.time()
                 config = {"max_execution_time": self.config.max_execution_time or 60.0}
-                result_state = self.agent_graph.invoke(
-                    {"messages": [HumanMessage(content=prompt_text)]},
-                    config=config,
-                )
+                if structured_anchor_mode:
+                    structured_system = (
+                        "Return JSON only. Do not call tools. Do not emit actuator/final-control fields. "
+                        "Your sole output is a structured_planning_anchor object for shadow parsing."
+                    )
+                    direct_response = self.llm.invoke(
+                        [SystemMessage(content=structured_system), HumanMessage(content=prompt_text)],
+                        config=config,
+                    )
+                    result_state = {"messages": [direct_response]}
+                else:
+                    result_state = self.agent_graph.invoke(
+                        {"messages": [HumanMessage(content=prompt_text)]},
+                        config=config,
+                    )
                 llm_duration = time.time() - start_time
 
                 messages = result_state.get("messages", [])
@@ -3301,6 +7749,68 @@ class RuleBasedLLMDirector:
                     llm_output = messages[-1].content
                 if plan_cache is not None and cache_key is not None and cache_mode == "replay" and cache_entry is None:
                     self.last_plan_cache_event.update({"hit": False, "status": "miss_fallback"})
+
+                if structured_anchor_mode:
+                    structured_record = self._parse_structured_anchor_output(
+                        llm_output,
+                        attempt=llm_attempts,
+                        prompt_hash=cache_prompt_hash,
+                        planning_horizon=planning_horizon,
+                        legacy_tool_action_present=not tools_instance.buffered_action.is_empty(),
+                        retry_attempt=bool(llm_attempts > 1),
+                        retry_source_errors=previous_structured_anchor_errors,
+                    )
+                    if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                        plan_cache.put(
+                            cache_key,
+                            self._make_plan_cache_entry(
+                                key=cache_key,
+                                state=state,
+                                reason=reason,
+                                planning_horizon=planning_horizon,
+                                attempt=llm_attempts,
+                                prompt_text=prompt_text,
+                                status_brief=status_brief,
+                                llm_output=llm_output,
+                                llm_duration=llm_duration,
+                                llm_action_found=False,
+                                tools_instance=tools_instance,
+                            ),
+                        )
+                    if bool(structured_record.get("valid", False)):
+                        if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                            self.last_plan_cache_event.update({"hit": False, "status": "written_structured_anchor"})
+                        print(f"[Director] LLM iteration {llm_attempts} produced valid structured planning anchor")
+                        llm_action_found = False
+                        break
+                    if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                        self.last_plan_cache_event.update({"hit": False, "status": "written_structured_anchor_invalid"})
+                    elif plan_cache is not None and cache_key is not None and cache_mode == "replay":
+                        self.last_plan_cache_event.update({"hit": False, "status": "miss_fallback"})
+                    errors = [str(item) for item in structured_record.get("errors", []) or []]
+                    previous_structured_anchor_errors = errors
+                    retry_enabled = bool(getattr(self.config, "structured_anchor_retry_invalid_or_empty_enabled", False))
+                    retry_max = max(0, int(getattr(self.config, "structured_anchor_retry_max_attempts", 1) or 1))
+                    invalid_or_empty = bool(
+                        "invalid_json_anchor" in errors
+                        or "empty_anchor" in errors
+                        or structured_record.get("empty", False)
+                    )
+                    if retry_enabled:
+                        retry_allowed = bool(
+                            invalid_or_empty
+                            and llm_attempts <= retry_max
+                            and llm_attempts < max(1, self.config.max_iterations)
+                        )
+                    else:
+                        retry_allowed = bool(llm_attempts < max(1, self.config.max_iterations))
+                    if retry_allowed:
+                        print(f"[Director] LLM iteration {llm_attempts} structured anchor invalid, retrying...")
+                        continue
+                    if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
+                        self.last_plan_cache_event.update({"hit": False, "status": "written_structured_anchor_invalid_final"})
+                    print(f"[Director] LLM iteration {llm_attempts} structured anchor invalid, using fallback path")
+                    break
 
                 if not tools_instance.buffered_action.is_empty():
                     llm_action_found = True
@@ -3359,9 +7869,12 @@ class RuleBasedLLMDirector:
 
             target_control = apply_safety_guardrails(state, target_control)
 
-            target_temp = tools_instance.buffered_setpoints.get("target_temp")
-            target_co2 = tools_instance.buffered_setpoints.get("target_co2")
-            target_rh = tools_instance.buffered_setpoints.get("target_rh")
+            raw_setpoints = {}
+            if not structured_anchor_mode:
+                raw_setpoints = getattr(tools_instance, "buffered_setpoints", {}) or {}
+            target_temp = raw_setpoints.get("target_temp")
+            target_co2 = raw_setpoints.get("target_co2")
+            target_rh = raw_setpoints.get("target_rh")
             try:
                 target_temp = None if target_temp is None else float(target_temp)
             except Exception:
@@ -3399,7 +7912,7 @@ class RuleBasedLLMDirector:
                 )
 
             target_profile, profile_contract = self._build_target_profiles(
-                tools_instance.buffered_setpoints,
+                raw_setpoints,
                 target_temp,
                 target_co2,
                 target_rh,
@@ -3427,7 +7940,62 @@ class RuleBasedLLMDirector:
                 "llm_action_found": llm_action_found,
                 "plan_interval": planning_horizon,
                 "plan_cache_event": dict(getattr(self, "last_plan_cache_event", {})),
+                "structured_anchor": dict(getattr(self, "last_structured_anchor", {}) or {}),
             }
+            intent_contract = intent_contract_from_setpoint_plan(state, plan)
+            plan["intent_contract"] = intent_contract.to_dict()
+            plan["intent_contract_diagnostics"] = {
+                "schema_version": "intent_contract_mvp_v1",
+                "source": "setpoint_adapter",
+                "fallback": False,
+            }
+            try:
+                profile_candidates, profile_diagnostics = build_profile_generator_shadow_payload(
+                    intent_contract,
+                    state,
+                    current_plan=plan,
+                    horizon_steps=planning_horizon,
+                )
+                plan["profile_candidates"] = profile_candidates
+                plan["profile_generator_diagnostics"] = profile_diagnostics
+            except Exception as exc:
+                plan["profile_candidates"] = []
+                plan["profile_generator_diagnostics"] = {
+                    "schema_version": "profile_generator_v1",
+                    "shadow_only": True,
+                    "error": str(exc),
+                }
+
+            if bool(getattr(self.config, "structured_anchor_profile_bridge_enabled", False)):
+                try:
+                    bridge_record, bridge_candidates = build_structured_anchor_profile_bridge_shadow_payload(
+                        dict(getattr(self, "last_structured_anchor", {}) or {}),
+                        state,
+                        current_plan=plan,
+                        model_name=str(getattr(self.config, "model_name", "")),
+                        enabled=True,
+                        shadow_only=bool(getattr(self.config, "structured_anchor_profile_bridge_shadow_only", True)),
+                    )
+                except Exception as exc:
+                    bridge_record = {
+                        "enabled": True,
+                        "shadow_only": bool(getattr(self.config, "structured_anchor_profile_bridge_shadow_only", True)),
+                        "source": "structured_anchor_profile_bridge_v64",
+                        "attempted": bool(getattr(self, "last_structured_anchor", {}).get("attempted", False)),
+                        "valid_structured_anchor": bool(getattr(self, "last_structured_anchor", {}).get("valid", False)),
+                        "bridgeable": False,
+                        "applied": False,
+                        "failure_reason": "runtime_bridge_exception",
+                        "error": str(exc),
+                        "final_control_change": False,
+                        "current_plan_modified": False,
+                        "low_level_action_generated": False,
+                    }
+                    bridge_candidates = []
+                self.last_structured_anchor_profile_bridge = bridge_record
+                if bool(getattr(self.config, "structured_anchor_profile_bridge_record_provenance", True)):
+                    plan["structured_anchor_profile_bridge"] = bridge_record
+                    plan["structured_anchor_profile_bridge_candidates"] = bridge_candidates
 
             if plan_cache is not None and cache_key is not None and cache_mode in {"record", "refresh"}:
                 plan_cache.update(
@@ -3445,6 +8013,9 @@ class RuleBasedLLMDirector:
                         },
                         "fallback_info": plan.get("fallback_selection", {}),
                         "anchor_source": anchor_source,
+                        "structured_anchor": plan.get("structured_anchor", {}),
+                        "structured_anchor_profile_bridge": plan.get("structured_anchor_profile_bridge", {}),
+                        "structured_anchor_profile_bridge_candidates": plan.get("structured_anchor_profile_bridge_candidates", []),
                     },
                 )
 
@@ -3492,6 +8063,808 @@ class RuleBasedLLMDirector:
             except Exception:
                 pass
         return plan.get(target_key)
+
+    @staticmethod
+    def _profile_shadow_target_value(
+        profile: Mapping[str, Any],
+        target_key: str,
+        *,
+        created_timestep: int,
+        timestep: int,
+        default: Optional[float],
+    ) -> Optional[float]:
+        values = profile.get(target_key) if isinstance(profile, Mapping) else None
+        if isinstance(values, (list, tuple, np.ndarray)) and len(values) > 0:
+            idx = int(np.clip(int(timestep) - int(created_timestep), 0, len(values) - 1))
+            try:
+                return float(values[idx])
+            except Exception:
+                return default
+        return default
+
+    @staticmethod
+    def _apply_profile_target_tracking_proxy(
+        state,
+        control: np.ndarray,
+        *,
+        target_temp: Optional[float],
+        target_co2: Optional[float],
+        target_rh: Optional[float],
+    ) -> np.ndarray:
+        shaped = np.asarray(control, dtype=np.float32).copy()
+        if target_temp is not None:
+            temp_err = float(target_temp) - float(state.temp_air)
+            if temp_err > 0.25:
+                shaped[0] = np.clip(shaped[0] + 0.10 * temp_err, 0.0, 1.0)
+                shaped[3] = np.clip(shaped[3] - 0.06 * temp_err, 0.0, 1.0)
+            elif temp_err < -0.25:
+                cool_err = -temp_err
+                shaped[3] = np.clip(shaped[3] + 0.08 * cool_err, 0.0, 1.0)
+                shaped[0] = np.clip(shaped[0] - 0.08 * cool_err, 0.0, 1.0)
+
+        if target_co2 is not None:
+            co2_err = float(target_co2) - float(state.co2_air)
+            is_day = 6 <= float(state.hour_of_day) <= 18
+            if is_day and co2_err > 20 and shaped[3] <= 0.30:
+                shaped[1] = np.clip(shaped[1] + 0.0015 * co2_err, 0.0, 1.0)
+            elif co2_err < -20:
+                shaped[1] = np.clip(shaped[1] - 0.0015 * (-co2_err), 0.0, 1.0)
+
+        if target_rh is not None:
+            rh_err = float(target_rh) - float(state.rh_air)
+            if rh_err < -5.0:
+                shaped[3] = np.clip(shaped[3] + 0.06 * (-rh_err) / 10.0, 0.0, 1.0)
+                if float(state.temp_air) < 15.5:
+                    shaped[0] = np.clip(shaped[0] + 0.01 * (-rh_err) / 10.0, 0.0, 1.0)
+            elif rh_err > 10.0:
+                shaped[3] = np.clip(shaped[3] - 0.05 * rh_err / 10.0, 0.0, 1.0)
+        return np.clip(shaped, 0.0, 1.0)
+
+    @staticmethod
+    def _profile_rspc_shadow_eligibility(candidate_name: str, gate_reason: str) -> Tuple[bool, str]:
+        name = str(candidate_name or "").strip()
+        gate = str(gate_reason or "none").strip() or "none"
+        if gate == "none":
+            return True, ""
+        banned = {"hot_dry_protect", "co2_day_boost", "lighting_assist"}
+        if name in banned:
+            return False, f"{gate}:profile_forbidden"
+        if gate == "temp_high_gate":
+            allowed = {"shade_cooling", "constant_hold", "strict_dehumidify_then_relax"}
+            return (name in allowed), ("" if name in allowed else f"{gate}:not_cooling_profile")
+        if gate in {"rh_high_gate", "dew_gate", "canopy_gate"}:
+            allowed = {
+                "strict_dehumidify_then_relax",
+                "dawn_predehumidify",
+                "cold_humid_recovery",
+                "constant_hold",
+            }
+            return (name in allowed), ("" if name in allowed else f"{gate}:not_dehumidify_profile")
+        return True, ""
+
+    @staticmethod
+    def _profile_score_delta_terms(
+        baseline_details: Mapping[str, Any],
+        candidate_details: Mapping[str, Any],
+    ) -> Dict[str, float]:
+        key_map = {
+            "temp": "temp_penalty",
+            "rh": "rh_penalty",
+            "dry": "dry_penalty",
+            "vpd": "vpd_penalty",
+            "dew": "dew_penalty",
+            "hot_dry": "hot_dry_penalty",
+            "energy": "energy_penalty",
+        }
+        out: Dict[str, float] = {}
+        for label, key in key_map.items():
+            try:
+                out[label] = float(candidate_details.get(key, 0.0)) - float(baseline_details.get(key, 0.0))
+            except Exception:
+                out[label] = 0.0
+        return out
+
+    @staticmethod
+    def _profile_action_delta_terms(baseline_control: np.ndarray, candidate_control: np.ndarray) -> Dict[str, float]:
+        base = np.asarray(baseline_control, dtype=np.float32)
+        cand = np.asarray(candidate_control, dtype=np.float32)
+        names = ("heat", "co2", "screen", "vent", "lamp", "shade")
+        return {name: float(cand[idx] - base[idx]) for idx, name in enumerate(names)}
+
+    @staticmethod
+    def _profile_rspc_gate_risk_worsened(gate_reason: str, score_delta_terms: Mapping[str, float]) -> bool:
+        gate = str(gate_reason or "none")
+        eps = 1e-6
+        if gate == "temp_high_gate":
+            return float(score_delta_terms.get("temp", 0.0)) > eps
+        if gate == "rh_high_gate":
+            return float(score_delta_terms.get("rh", 0.0)) > eps
+        if gate in {"dew_gate", "canopy_gate"}:
+            return (
+                float(score_delta_terms.get("dew", 0.0)) > eps
+                or float(score_delta_terms.get("rh", 0.0)) > eps
+            )
+        return False
+
+    @staticmethod
+    def _profile_rspc_action_conflicts(gate_reason: str, action_delta_terms: Mapping[str, float]) -> bool:
+        gate = str(gate_reason or "none")
+        if gate == "temp_high_gate":
+            return (
+                float(action_delta_terms.get("heat", 0.0)) > 0.02
+                or float(action_delta_terms.get("lamp", 0.0)) > 0.02
+                or (
+                    float(action_delta_terms.get("vent", 0.0)) < -0.02
+                    and float(action_delta_terms.get("shade", 0.0)) < 0.02
+                )
+            )
+        if gate in {"rh_high_gate", "dew_gate", "canopy_gate"}:
+            return (
+                float(action_delta_terms.get("vent", 0.0)) < -0.02
+                or float(action_delta_terms.get("screen", 0.0)) > 0.02
+                or float(action_delta_terms.get("co2", 0.0)) > 0.02
+                or float(action_delta_terms.get("lamp", 0.0)) > 0.02
+            )
+        return False
+
+    @staticmethod
+    def _profile_rspc_safe_hot_dry_state(state) -> bool:
+        temp = float(getattr(state, "temp_air", 20.0))
+        rh = float(getattr(state, "rh_air", 70.0))
+        vpd = float(calculate_vpd_kpa(temp, rh))
+        dew_margin = min(
+            float(getattr(state, "dew_margin_air", 3.0)),
+            float(getattr(state, "canopy_dew_margin", 3.0)),
+        )
+        safety = (
+            temp >= 32.0
+            or float(getattr(state, "temp_violation", 0.0)) > 0.0
+            or rh >= 90.0
+            or dew_margin < 1.0
+        )
+        dry = (
+            rh < 62.0
+            or vpd > 1.60
+            or float(getattr(state, "rh_low_violation", 0.0)) > 0.0
+            or float(getattr(state, "vpd_high_excess", 0.0)) > 0.0
+        )
+        return bool(dry and not safety)
+
+    def _profile_rspc_shadow_alignment(
+        self,
+        state,
+        *,
+        gate_reason: str,
+        candidate_name: str,
+        eligible: bool,
+        margin: float,
+        action_delta_terms: Mapping[str, float],
+        score_delta_terms: Mapping[str, float],
+    ) -> str:
+        if float(margin) <= 1e-6:
+            return "neutral_hold"
+        gate = str(gate_reason or "none")
+        name = str(candidate_name or "")
+        if gate != "none":
+            if not eligible:
+                return "unsafe_conflict"
+            if self._profile_rspc_gate_risk_worsened(gate, score_delta_terms):
+                return "unsafe_conflict"
+            if self._profile_rspc_action_conflicts(gate, action_delta_terms):
+                return "unsafe_conflict"
+            return "neutral_hold" if name == "constant_hold" else "safe_relief"
+        if self._profile_rspc_safe_hot_dry_state(state) and name == "hot_dry_protect":
+            return "dry_benefit"
+        return "neutral_hold"
+
+    def _evaluate_profile_rspc_shadow(
+        self,
+        state,
+        plan: Mapping[str, Any],
+        baseline_control: np.ndarray,
+    ) -> Dict[str, Any]:
+        candidates = plan.get("profile_candidates", []) if isinstance(plan, Mapping) else []
+        if not isinstance(candidates, list) or not candidates:
+            return {
+                "enabled": False,
+                "reason": "missing_profile_candidates",
+                "candidate_count": 0,
+                "shadow_only": True,
+            }
+
+        created_timestep = int(plan.get("created_timestep", int(getattr(state, "timestep", 0))) or 0)
+        timestep = int(getattr(state, "timestep", created_timestep))
+        baseline = np.clip(np.asarray(baseline_control, dtype=np.float32).copy(), 0.0, 1.0)
+        target_temp = self._get_plan_target(dict(plan), "target_temp", state)
+        target_co2 = self._get_plan_target(dict(plan), "target_co2", state)
+        target_rh = self._get_plan_target(dict(plan), "target_rh", state)
+        baseline_raw_score, baseline_raw_details = self._score_fallback_candidate(state, baseline)
+        baseline_safety_control, baseline_safety_info = apply_tomato_safety_v2(
+            state,
+            baseline,
+            config=self.config,
+            target_rh=target_rh,
+        )
+        baseline_safety_score, baseline_safety_details = self._score_fallback_candidate(state, baseline_safety_control)
+
+        scorer_diagnostics: Dict[str, Any] = {}
+        try:
+            _scores, refreshed = score_profile_candidate_payloads(
+                candidates,
+                plan.get("intent_contract", {}) if isinstance(plan, Mapping) else {},
+                state,
+                current_plan=plan,
+                horizon_steps=int(
+                    (plan.get("profile_generator_diagnostics", {}) or {}).get("horizon_steps", 12)
+                    if isinstance(plan.get("profile_generator_diagnostics", {}), Mapping)
+                    else 12
+                ),
+            )
+            scorer_diagnostics = dict(refreshed)
+        except Exception as exc:
+            scorer_diagnostics = {"score_refresh_error": str(exc)}
+        gate_reason = str(scorer_diagnostics.get("score_safety_gate_reason") or "none")
+        if gate_reason not in {"none", "temp_high_gate", "dew_gate", "canopy_gate", "rh_high_gate"}:
+            gate_reason = "none"
+        scorer_selected = str(scorer_diagnostics.get("score_selected_shadow_profile_name") or "")
+
+        rows: List[Dict[str, Any]] = []
+        for item in candidates:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "").strip()
+            profile = item.get("target_profile", {})
+            if not name or not isinstance(profile, Mapping):
+                continue
+            cand_temp = self._profile_shadow_target_value(
+                profile,
+                "target_temp",
+                created_timestep=created_timestep,
+                timestep=timestep,
+                default=target_temp,
+            )
+            cand_co2 = self._profile_shadow_target_value(
+                profile,
+                "target_co2",
+                created_timestep=created_timestep,
+                timestep=timestep,
+                default=target_co2,
+            )
+            cand_rh = self._profile_shadow_target_value(
+                profile,
+                "target_rh",
+                created_timestep=created_timestep,
+                timestep=timestep,
+                default=target_rh,
+            )
+            raw_control = self._apply_profile_target_tracking_proxy(
+                state,
+                baseline,
+                target_temp=cand_temp,
+                target_co2=cand_co2,
+                target_rh=cand_rh,
+            )
+            raw_score, raw_details = self._score_fallback_candidate(state, raw_control)
+            safety_control, safety_info = apply_tomato_safety_v2(
+                state,
+                raw_control,
+                config=self.config,
+                target_rh=cand_rh,
+            )
+            safety_score, safety_details = self._score_fallback_candidate(state, safety_control)
+            eligible, ineligible_reason = self._profile_rspc_shadow_eligibility(name, gate_reason)
+            action_delta_terms = self._profile_action_delta_terms(baseline_safety_control, safety_control)
+            score_delta_terms = self._profile_score_delta_terms(baseline_safety_details, safety_details)
+            if eligible and gate_reason != "none" and self._profile_rspc_gate_risk_worsened(gate_reason, score_delta_terms):
+                eligible = False
+                ineligible_reason = f"{gate_reason}:gate_risk_worsened"
+            if eligible and gate_reason != "none" and self._profile_rspc_action_conflicts(gate_reason, action_delta_terms):
+                eligible = False
+                ineligible_reason = f"{gate_reason}:action_conflict"
+            rows.append(
+                {
+                    "name": name,
+                    "intent": str(item.get("regime") or item.get("intent") or name),
+                    "priority": item.get("priority", {}) if isinstance(item.get("priority", {}), Mapping) else {},
+                    "constraints": item.get("constraints", {}) if isinstance(item.get("constraints", {}), Mapping) else {},
+                    "reason": str(item.get("reason") or ""),
+                    "eligible": bool(eligible),
+                    "ineligible_reason": str(ineligible_reason),
+                    "raw_score": float(raw_score),
+                    "safety_score": float(safety_score),
+                    "selection_score": float(safety_score),
+                    "target_temp": None if cand_temp is None else float(cand_temp),
+                    "target_co2": None if cand_co2 is None else float(cand_co2),
+                    "target_rh": None if cand_rh is None else float(cand_rh),
+                    "raw_control": np.asarray(raw_control, dtype=np.float32).tolist(),
+                    "safety_control": np.asarray(safety_control, dtype=np.float32).tolist(),
+                    "action_delta_terms": action_delta_terms,
+                    "score_delta_terms": score_delta_terms,
+                    "raw_details": {key: float(value) for key, value in raw_details.items() if isinstance(value, (int, float))},
+                    "safety_details": {
+                        key: float(value) for key, value in safety_details.items() if isinstance(value, (int, float))
+                    },
+                    "tomato_safety_v2_applied": bool(safety_info.get("applied", False)),
+                    "tomato_safety_v2_reasons": list(safety_info.get("reasons", []))
+                    if isinstance(safety_info.get("reasons", []), list)
+                    else [],
+                }
+            )
+
+        raw_rows = sorted(rows, key=lambda row: (float(row.get("safety_score", 0.0)), str(row.get("name", ""))))
+        eligible_rows = [row for row in raw_rows if bool(row.get("eligible", False))]
+        raw_best = raw_rows[0] if raw_rows else {}
+        best = eligible_rows[0] if eligible_rows else {}
+        rows = sorted(rows, key=lambda row: (not bool(row.get("eligible", False)), float(row.get("safety_score", 0.0)), str(row.get("name", ""))))
+        margin = float(baseline_safety_score) - float(best.get("safety_score", baseline_safety_score)) if best else 0.0
+        raw_margin = float(baseline_safety_score) - float(raw_best.get("safety_score", baseline_safety_score))
+        best_alignment = self._profile_rspc_shadow_alignment(
+            state,
+            gate_reason=gate_reason,
+            candidate_name=str(best.get("name", "")),
+            eligible=bool(best.get("eligible", False)),
+            margin=margin,
+            action_delta_terms=best.get("action_delta_terms", {}),
+            score_delta_terms=best.get("score_delta_terms", {}),
+        )
+        raw_alignment = self._profile_rspc_shadow_alignment(
+            state,
+            gate_reason=gate_reason,
+            candidate_name=str(raw_best.get("name", "")),
+            eligible=bool(raw_best.get("eligible", False)),
+            margin=raw_margin,
+            action_delta_terms=raw_best.get("action_delta_terms", {}),
+            score_delta_terms=raw_best.get("score_delta_terms", {}),
+        )
+        return {
+            "enabled": True,
+            "shadow_only": True,
+            "candidate_count": len(rows),
+            "eligible_candidate_count": int(len(eligible_rows)),
+            "baseline_raw_score": float(baseline_raw_score),
+            "baseline_score": float(baseline_safety_score),
+            "baseline_control": baseline.tolist(),
+            "baseline_safety_control": np.asarray(baseline_safety_control, dtype=np.float32).tolist(),
+            "baseline_target_temp": None if target_temp is None else float(target_temp),
+            "baseline_target_co2": None if target_co2 is None else float(target_co2),
+            "baseline_target_rh": None if target_rh is None else float(target_rh),
+            "baseline_raw_details": {
+                key: float(value) for key, value in baseline_raw_details.items() if isinstance(value, (int, float))
+            },
+            "baseline_safety_details": {
+                key: float(value) for key, value in baseline_safety_details.items() if isinstance(value, (int, float))
+            },
+            "baseline_tomato_safety_v2_applied": bool(baseline_safety_info.get("applied", False)),
+            "best_profile": str(best.get("name", "")),
+            "best_score": float(best.get("safety_score", baseline_safety_score)),
+            "best_raw_score": float(best.get("raw_score", baseline_raw_score)),
+            "best_safety_score": float(best.get("safety_score", baseline_safety_score)),
+            "best_eligible": bool(best.get("eligible", False)),
+            "best_ineligible_reason": str(best.get("ineligible_reason", "no_eligible_candidate" if not best else "")),
+            "best_action_delta_terms": dict(best.get("action_delta_terms", {})),
+            "best_score_delta_terms": dict(best.get("score_delta_terms", {})),
+            "margin": float(margin),
+            "would_improve": bool(best and margin > 1e-6),
+            "raw_best_profile": str(raw_best.get("name", "")),
+            "raw_best_score": float(raw_best.get("safety_score", baseline_safety_score)),
+            "raw_best_raw_score": float(raw_best.get("raw_score", baseline_raw_score)),
+            "raw_best_safety_score": float(raw_best.get("safety_score", baseline_safety_score)),
+            "raw_best_eligible": bool(raw_best.get("eligible", False)),
+            "raw_best_ineligible_reason": str(raw_best.get("ineligible_reason", "")),
+            "raw_best_action_delta_terms": dict(raw_best.get("action_delta_terms", {})),
+            "raw_best_score_delta_terms": dict(raw_best.get("score_delta_terms", {})),
+            "raw_best_margin": float(raw_margin),
+            "raw_best_would_improve": bool(raw_rows and raw_margin > 1e-6),
+            "safety_gate_reason": gate_reason,
+            "safety_alignment": best_alignment,
+            "raw_best_safety_alignment": raw_alignment,
+            "scorer_selected_profile": scorer_selected,
+            "best_agrees_with_scorer": bool(scorer_selected and str(best.get("name", "")) == scorer_selected),
+            "scorer_diagnostics": scorer_diagnostics,
+            "top_candidates": rows[:5],
+            "raw_top_candidates": raw_rows[:5],
+        }
+
+    @staticmethod
+    def _profile_action_candidate_control_terms(control: Any) -> Optional[Dict[str, float]]:
+        names = ("heat", "co2", "screen", "vent", "lamp", "shade")
+        try:
+            arr = np.asarray(control, dtype=np.float32).reshape(-1)
+        except Exception:
+            return None
+        if arr.size < len(names):
+            return None
+        arr = arr[: len(names)]
+        if not bool(np.all(np.isfinite(arr))):
+            return None
+        return {name: float(arr[idx]) for idx, name in enumerate(names)}
+
+    @staticmethod
+    def _profile_action_candidate_shadow_score_terms(row: Mapping[str, Any]) -> Dict[str, Any]:
+        def _num(value: Any, default: float = 0.0) -> float:
+            try:
+                if value is None:
+                    return float(default)
+                return float(value)
+            except Exception:
+                return float(default)
+
+        action_delta = row.get("action_delta_terms", {})
+        if not isinstance(action_delta, Mapping):
+            action_delta = {}
+        safety_details = row.get("safety_details", {})
+        if not isinstance(safety_details, Mapping):
+            safety_details = {}
+        safety_penalty_keys = ("temp_penalty", "rh_penalty", "dry_penalty", "vpd_penalty", "dew_penalty")
+        profile_target_error = sum(abs(_num(safety_details.get(key))) for key in safety_penalty_keys)
+        action_delta_penalty = sum(
+            abs(_num(action_delta.get(key))) for key in ("heat", "co2", "screen", "vent", "lamp", "shade")
+        )
+        tomato_applied = bool(row.get("tomato_safety_v2_applied", False))
+        eligible = bool(row.get("eligible", False))
+        return {
+            "raw_score": _num(row.get("raw_score")),
+            "post_tomato_score": _num(row.get("safety_score")),
+            "selection_score": _num(row.get("selection_score", row.get("safety_score"))),
+            "profile_target_error": float(profile_target_error),
+            "action_delta_penalty": float(action_delta_penalty),
+            "tomato_safety_penalty": 1.0 if tomato_applied else 0.0,
+            "compatibility_penalty": 0.0 if eligible else 1.0,
+            "hard_safety_rewrite_predicted": bool(tomato_applied),
+        }
+
+    def _profile_action_candidate_shadow_from_row(self, row: Mapping[str, Any]) -> Dict[str, Any]:
+        profile_name = str(row.get("name") or "").strip() or "unknown_profile"
+        raw_action = self._profile_action_candidate_control_terms(row.get("raw_control"))
+        post_tomato_action = self._profile_action_candidate_control_terms(row.get("safety_control"))
+        missing_action = raw_action is None or post_tomato_action is None
+        row_eligible = bool(row.get("eligible", False))
+        eligible = bool(row_eligible and not missing_action)
+        if missing_action:
+            rejection_reason = "missing_action_provenance"
+        elif eligible:
+            rejection_reason = ""
+        else:
+            rejection_reason = str(
+                row.get("ineligible_reason")
+                or row.get("rejection_reason")
+                or "ineligible_profile_candidate"
+            )
+        reasons = row.get("tomato_safety_v2_reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        candidate: Dict[str, Any] = {
+            "name": f"profile_action:{profile_name}",
+            "profile_name": profile_name,
+            "candidate_source": "normal_path_profile_candidate",
+            "raw_action": raw_action or {},
+            "post_tomato_action": post_tomato_action or {},
+            "score_terms": self._profile_action_candidate_shadow_score_terms(row),
+            "tomato_safety_v2_applied": bool(row.get("tomato_safety_v2_applied", False)),
+            "tomato_safety_v2_reasons": [str(item) for item in reasons],
+            "eligible": bool(eligible),
+            "rejection_reason": str(rejection_reason),
+        }
+        for key in ("target_temp", "target_co2", "target_rh"):
+            value = row.get(key)
+            candidate[key] = None if value is None else float(value)
+        return candidate
+
+    @staticmethod
+    def _profile_action_envelope_num(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _profile_action_envelope_direction(delta: float, *, eps: float = 1e-6) -> str:
+        if delta > eps:
+            return "increase"
+        if delta < -eps:
+            return "decrease"
+        return "hold"
+
+    def _profile_action_envelope_action_bounds(
+        self,
+        baseline_action: Mapping[str, Any],
+        raw_action: Mapping[str, Any],
+        post_tomato_action: Mapping[str, Any],
+    ) -> Dict[str, Dict[str, float]]:
+        bounds: Dict[str, Dict[str, float]] = {}
+        for field in ("heat", "co2", "screen", "vent", "lamp", "shade"):
+            values = [
+                self._profile_action_envelope_num(baseline_action.get(field)),
+                self._profile_action_envelope_num(raw_action.get(field)),
+                self._profile_action_envelope_num(post_tomato_action.get(field)),
+            ]
+            bounds[field] = {
+                "min": float(np.clip(min(values), 0.0, 1.0)),
+                "max": float(np.clip(max(values), 0.0, 1.0)),
+            }
+        return bounds
+
+    def _profile_action_envelope_target_direction(
+        self,
+        row: Mapping[str, Any],
+        profile_shadow: Mapping[str, Any],
+    ) -> Dict[str, str]:
+        directions: Dict[str, str] = {}
+        pairs = (
+            ("target_temp", "baseline_target_temp"),
+            ("target_co2", "baseline_target_co2"),
+            ("target_rh", "baseline_target_rh"),
+        )
+        for target_key, baseline_key in pairs:
+            target_value = row.get(target_key)
+            baseline_value = profile_shadow.get(baseline_key)
+            if target_value is None or baseline_value is None:
+                directions[target_key] = "any"
+                continue
+            directions[target_key] = self._profile_action_envelope_direction(
+                self._profile_action_envelope_num(target_value) - self._profile_action_envelope_num(baseline_value)
+            )
+        return directions
+
+    def _profile_action_envelope_shadow_from_row(
+        self,
+        row: Mapping[str, Any],
+        profile_shadow: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        profile_name = str(row.get("name") or "").strip() or "unknown_profile"
+        raw_action = self._profile_action_candidate_control_terms(row.get("raw_control"))
+        post_tomato_action = self._profile_action_candidate_control_terms(row.get("safety_control"))
+        baseline_action = self._profile_action_candidate_control_terms(profile_shadow.get("baseline_safety_control"))
+        if baseline_action is None:
+            baseline_action = self._profile_action_candidate_control_terms(profile_shadow.get("baseline_control"))
+        if baseline_action is None and raw_action is not None:
+            baseline_action = dict(raw_action)
+
+        missing_action = raw_action is None or post_tomato_action is None or baseline_action is None
+        row_eligible = bool(row.get("eligible", False))
+        eligible = bool(row_eligible and not missing_action)
+        if missing_action:
+            rejection_reason = "missing_action_provenance"
+        elif eligible:
+            rejection_reason = ""
+        else:
+            rejection_reason = str(
+                row.get("ineligible_reason")
+                or row.get("rejection_reason")
+                or "ineligible_profile_candidate"
+            )
+
+        reasons = row.get("tomato_safety_v2_reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        projected_action = dict(post_tomato_action or {})
+        rewrite_delta = {}
+        if raw_action is not None and post_tomato_action is not None:
+            rewrite_delta = {
+                field: float(post_tomato_action[field] - raw_action[field])
+                for field in ("heat", "co2", "screen", "vent", "lamp", "shade")
+            }
+        action_bounds: Dict[str, Dict[str, float]] = {}
+        preferred_direction = {field: "any" for field in ("heat", "co2", "screen", "vent", "lamp", "shade")}
+        continuity_delta: Dict[str, float] = {}
+        if not missing_action and baseline_action is not None and post_tomato_action is not None and raw_action is not None:
+            action_bounds = self._profile_action_envelope_action_bounds(baseline_action, raw_action, post_tomato_action)
+            preferred_direction = {
+                field: self._profile_action_envelope_direction(post_tomato_action[field] - baseline_action[field])
+                for field in ("heat", "co2", "screen", "vent", "lamp", "shade")
+            }
+            continuity_delta = {
+                field: float(abs(post_tomato_action[field] - baseline_action[field]))
+                for field in ("heat", "co2", "screen", "vent", "lamp", "shade")
+            }
+
+        candidate_terms = self._profile_action_candidate_shadow_score_terms(row)
+        profile_target_error = self._profile_action_envelope_num(candidate_terms.get("profile_target_error"))
+        action_delta_penalty = self._profile_action_envelope_num(candidate_terms.get("action_delta_penalty"))
+        compatibility_penalty = self._profile_action_envelope_num(candidate_terms.get("compatibility_penalty"))
+        tomato_projection_delta = float(sum(abs(value) for value in rewrite_delta.values()))
+        envelope_width_penalty = float(
+            sum(abs(bound.get("max", 0.0) - bound.get("min", 0.0)) for bound in action_bounds.values())
+        )
+        score_terms = {
+            "profile_target_alignment": float(-profile_target_error),
+            "tomato_projection_delta": tomato_projection_delta,
+            "continuity_penalty": action_delta_penalty,
+            "envelope_width_penalty": envelope_width_penalty,
+            "compatibility_penalty": compatibility_penalty,
+            "selection_score": self._profile_action_envelope_num(candidate_terms.get("selection_score")),
+        }
+
+        max_rewrite = max((abs(value) for value in rewrite_delta.values()), default=0.0)
+        if missing_action:
+            compatibility_category = "contract_missing"
+        elif max_rewrite > 0.35:
+            compatibility_category = "tomato_safety_incompatible"
+        elif profile_target_error > 2.0:
+            compatibility_category = "profile_target_incompatible"
+        elif action_delta_penalty > 1.2:
+            compatibility_category = "action_continuity_incompatible"
+        elif not eligible:
+            compatibility_category = "contract_missing"
+        else:
+            compatibility_category = "compatibility_shadow_ready"
+
+        priority = row.get("priority", {})
+        if not isinstance(priority, Mapping):
+            priority = {}
+        constraints = row.get("constraints", {})
+        if not isinstance(constraints, Mapping):
+            constraints = {}
+
+        candidate: Dict[str, Any] = {
+            "name": f"profile_action_envelope:{profile_name}",
+            "profile_name": profile_name,
+            "candidate_source": "normal_path_profile_action_envelope",
+            "intent": str(row.get("intent") or row.get("regime") or profile_name),
+            "target_direction": self._profile_action_envelope_target_direction(row, profile_shadow),
+            "action_bounds": action_bounds,
+            "preferred_direction": preferred_direction,
+            "priority_terms": {
+                "profile_target_alignment": score_terms["profile_target_alignment"],
+                "tomato_safety_compatibility": 0.0 if bool(row.get("tomato_safety_v2_applied", False)) else 1.0,
+                "action_continuity": float(-action_delta_penalty),
+                "hard_safety_precedence": True,
+                "profile_priority": dict(priority),
+            },
+            "continuity_constraints": {
+                "previous_action_source": "baseline_safety_action",
+                "max_delta_from_previous_action": continuity_delta,
+                "profile_constraints": dict(constraints),
+            },
+            "tomato_safety_projection": {
+                "projection_required": True,
+                "projected_action": projected_action,
+                "projection_applied": bool(row.get("tomato_safety_v2_applied", False)),
+                "projection_reasons": [str(item) for item in reasons],
+                "rewrite_delta_by_field": rewrite_delta,
+            },
+            "projected_action": projected_action,
+            "score_terms": score_terms,
+            "eligible": bool(eligible),
+            "rejection_reason": str(rejection_reason),
+            "compatibility_category": compatibility_category,
+        }
+        for key in ("target_temp", "target_co2", "target_rh"):
+            value = row.get(key)
+            candidate[key] = None if value is None else float(value)
+        return candidate
+
+    def _compose_profile_action_envelopes_shadow(self, profile_shadow: Mapping[str, Any]) -> Dict[str, Any]:
+        if not isinstance(profile_shadow, Mapping) or not bool(profile_shadow.get("enabled", False)):
+            return {
+                "enabled": False,
+                "shadow_only": True,
+                "schema_version": "profile_action_envelope_shadow_v74",
+                "reason": str(profile_shadow.get("reason", "profile_rspc_shadow_unavailable"))
+                if isinstance(profile_shadow, Mapping)
+                else "profile_rspc_shadow_unavailable",
+                "final_action_changed": False,
+                "candidate_count": 0,
+                "eligible_candidate_count": 0,
+                "candidates": [],
+            }
+
+        try:
+            max_candidates = int(getattr(self.config, "profile_action_envelope_shadow_max_candidates", 5) or 0)
+        except Exception:
+            max_candidates = 5
+        max_candidates = max(0, max_candidates)
+        candidates: List[Dict[str, Any]] = []
+        seen_profiles = set()
+        for key in ("top_candidates", "raw_top_candidates"):
+            rows = profile_shadow.get(key, [])
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if len(candidates) >= max_candidates:
+                    break
+                if not isinstance(row, Mapping):
+                    continue
+                profile_name = str(row.get("name") or "").strip()
+                if not profile_name or profile_name in seen_profiles:
+                    continue
+                seen_profiles.add(profile_name)
+                candidates.append(self._profile_action_envelope_shadow_from_row(row, profile_shadow))
+            if len(candidates) >= max_candidates:
+                break
+
+        eligible_candidates = [item for item in candidates if bool(item.get("eligible", False))]
+        best = eligible_candidates[0] if eligible_candidates else (candidates[0] if candidates else {})
+        best_score = None
+        if isinstance(best, Mapping):
+            score_terms = best.get("score_terms", {})
+            if isinstance(score_terms, Mapping):
+                try:
+                    best_score = float(score_terms.get("selection_score", 0.0) or 0.0)
+                except Exception:
+                    best_score = None
+        return {
+            "enabled": True,
+            "shadow_only": True,
+            "schema_version": "profile_action_envelope_shadow_v74",
+            "candidate_source": "normal_path_profile_action_envelope",
+            "final_action_changed": False,
+            "candidate_count": int(len(candidates)),
+            "eligible_candidate_count": int(len(eligible_candidates)),
+            "best_name": str(best.get("name", "") or "") if isinstance(best, Mapping) else "",
+            "best_profile": str(best.get("profile_name", "") or "") if isinstance(best, Mapping) else "",
+            "best_score": best_score,
+            "best_eligible": bool(best.get("eligible", False)) if isinstance(best, Mapping) else False,
+            "best_rejection_reason": str(best.get("rejection_reason", "") or "") if isinstance(best, Mapping) else "",
+            "candidates": candidates,
+        }
+
+    def _compose_profile_action_candidates_shadow(self, profile_shadow: Mapping[str, Any]) -> Dict[str, Any]:
+        if not isinstance(profile_shadow, Mapping) or not bool(profile_shadow.get("enabled", False)):
+            return {
+                "enabled": False,
+                "shadow_only": True,
+                "schema_version": "profile_action_candidate_shadow_v69",
+                "reason": str(profile_shadow.get("reason", "profile_rspc_shadow_unavailable"))
+                if isinstance(profile_shadow, Mapping)
+                else "profile_rspc_shadow_unavailable",
+                "final_action_changed": False,
+                "candidate_count": 0,
+                "eligible_candidate_count": 0,
+                "candidates": [],
+            }
+
+        try:
+            max_candidates = int(getattr(self.config, "profile_action_candidate_shadow_max_candidates", 5) or 0)
+        except Exception:
+            max_candidates = 5
+        max_candidates = max(0, max_candidates)
+        candidates: List[Dict[str, Any]] = []
+        seen_profiles = set()
+        for key in ("top_candidates", "raw_top_candidates"):
+            rows = profile_shadow.get(key, [])
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if len(candidates) >= max_candidates:
+                    break
+                if not isinstance(row, Mapping):
+                    continue
+                profile_name = str(row.get("name") or "").strip()
+                if not profile_name or profile_name in seen_profiles:
+                    continue
+                seen_profiles.add(profile_name)
+                candidates.append(self._profile_action_candidate_shadow_from_row(row))
+            if len(candidates) >= max_candidates:
+                break
+
+        eligible_candidates = [item for item in candidates if bool(item.get("eligible", False))]
+        best = eligible_candidates[0] if eligible_candidates else (candidates[0] if candidates else {})
+        best_score = None
+        if isinstance(best, Mapping):
+            score_terms = best.get("score_terms", {})
+            if isinstance(score_terms, Mapping):
+                try:
+                    best_score = float(score_terms.get("selection_score", 0.0) or 0.0)
+                except Exception:
+                    best_score = None
+        return {
+            "enabled": True,
+            "shadow_only": True,
+            "schema_version": "profile_action_candidate_shadow_v69",
+            "candidate_source": "normal_path_profile_candidate",
+            "final_action_changed": False,
+            "candidate_count": int(len(candidates)),
+            "eligible_candidate_count": int(len(eligible_candidates)),
+            "best_name": str(best.get("name", "") or "") if isinstance(best, Mapping) else "",
+            "best_profile": str(best.get("profile_name", "") or "") if isinstance(best, Mapping) else "",
+            "best_score": best_score,
+            "best_eligible": bool(best.get("eligible", False)) if isinstance(best, Mapping) else False,
+            "best_rejection_reason": str(best.get("rejection_reason", "") or "") if isinstance(best, Mapping) else "",
+            "candidates": candidates,
+        }
 
     def _plan_control_step(self, state):
         plan = self.current_plan or {}
@@ -3542,6 +8915,8 @@ class RuleBasedLLMDirector:
                 ("rule_lean_blend", 0.25 * anchor_control + 0.75 * rule_control, 0.75),
                 ("rule", rule_control, 1.0),
             ]
+            for name, hot_dry_control, _rationale in self._build_rspc_hot_dry_candidates(state, nominal_blend):
+                candidate_controls.append((name, hot_dry_control, rule_weight))
             if expert_control is not None:
                 expert_blend = float(np.clip(getattr(self.config, "expert_candidate_blend", 0.55), 0.0, 1.0))
                 candidate_controls.extend(
@@ -3596,6 +8971,14 @@ class RuleBasedLLMDirector:
             for raw_score, name, clipped, candidate_rule_weight, details in raw_scored_candidates:
                 score = float(raw_score)
                 candidate_details: Dict[str, Any] = dict(details)
+                if bool(getattr(self.config, "profile_feasibility_gate_enabled", False)):
+                    adjustment, gate_score_details = self._profile_feasibility_candidate_adjustment(
+                        state,
+                        clipped,
+                        plan if isinstance(plan, Mapping) else {},
+                    )
+                    score += float(adjustment)
+                    candidate_details["profile_feasibility_gate_scoring"] = gate_score_details
                 if horizon_filter_enabled and str(name).startswith("humidity_memory"):
                     score, hem_eval = self._evaluate_humidity_memory_horizon(
                         state,
@@ -3614,6 +8997,17 @@ class RuleBasedLLMDirector:
                 scored_candidates.append((score, name, clipped, candidate_rule_weight, candidate_details))
             scored_candidates.sort(key=lambda item: item[0])
             _, selected_name, selected_control, selected_rule_weight, selected_details = scored_candidates[0]
+            rspc_action_scoring = self._rspc_action_scoring_diagnostics(
+                state,
+                scored_candidates,
+                plan=plan if isinstance(plan, Mapping) else {},
+                rh_debt=float(rh_debt),
+                dehumidify_mode=str(dehumidify_mode or "normal"),
+                lamp_budget_remaining=float(lamp_budget_remaining),
+                selected_name=str(selected_name),
+                selected_control=np.asarray(selected_control, dtype=np.float32),
+                selected_score=float(scored_candidates[0][0]),
+            )
             mc_sero_shadow = self._evaluate_mc_sero_shadow(
                 state,
                 rollout_candidates=[(name, control_item) for _score, name, control_item, _rw, _details in raw_scored_candidates],
@@ -3641,6 +9035,12 @@ class RuleBasedLLMDirector:
                     }
                 )
                 self.last_humidity_memory_prediction = humidity_memory_prediction
+            profile_gate_veto_count = 0
+            for item in scored_candidates:
+                details_for_veto = item[4] if len(item) > 4 and isinstance(item[4], Mapping) else {}
+                gate_scoring = details_for_veto.get("profile_feasibility_gate_scoring", {})
+                if isinstance(gate_scoring, Mapping) and gate_scoring.get("hard_safety_vetoed", False):
+                    profile_gate_veto_count += 1
             control = np.asarray(selected_control, dtype=np.float32)
             rule_weight = float(selected_rule_weight)
             self.last_rollout_selection = {
@@ -3650,25 +9050,21 @@ class RuleBasedLLMDirector:
                 "details": selected_details,
                 "candidates": [
                     {
-                        "name": name,
-                        "score": float(score) if np.isfinite(score) else None,
-                        "rule_weight": float(candidate_rule_weight),
-                        "humidity_memory_rejected": bool(
-                            isinstance(details.get("humidity_memory_horizon_filter"), dict)
-                            and details["humidity_memory_horizon_filter"].get("rejected", False)
-                        ),
-                        "humidity_memory_reject_reason": (
-                            details.get("humidity_memory_horizon_filter", {}).get("reject_reason", "")
-                            if isinstance(details.get("humidity_memory_horizon_filter"), dict)
-                            else ""
-                        ),
+                        "name": item.get("name", ""),
+                        "score": item.get("score"),
+                        "rule_weight": item.get("rule_weight", 0.0),
+                        "humidity_memory_rejected": item.get("humidity_memory_rejected", False),
+                        "humidity_memory_reject_reason": item.get("humidity_memory_reject_reason", ""),
                     }
-                    for score, name, _, candidate_rule_weight, details in scored_candidates
+                    for item in rspc_action_scoring.get("candidates", [])
+                    if isinstance(item, dict)
                 ],
+                "rspc_action_scoring": rspc_action_scoring,
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
                 "humidity_memory_prediction": humidity_memory_prediction,
                 "humidity_memory_horizon_filter": dict(best_memory_eval or {}),
                 "mc_sero_shadow": mc_sero_shadow,
+                "profile_feasibility_gate_hard_safety_veto_count": profile_gate_veto_count,
             }
         else:
             mc_sero_shadow = self._evaluate_mc_sero_shadow(
@@ -3686,10 +9082,68 @@ class RuleBasedLLMDirector:
                 "score": None,
                 "rule_weight": float(rule_weight),
                 "candidates": [],
+                "rspc_action_scoring": {
+                    "enabled": False,
+                    "shadow_only": True,
+                    "reason": "rollout_candidate_sharing_disabled",
+                    "candidate_count": 0,
+                },
                 "expert_prediction": dict(getattr(self, "last_expert_prediction", {})),
                 "humidity_memory_prediction": dict(getattr(self, "last_humidity_memory_prediction", {})),
                 "mc_sero_shadow": mc_sero_shadow,
             }
+
+        try:
+            profile_shadow = self._evaluate_profile_rspc_shadow(
+                state,
+                plan if isinstance(plan, Mapping) else {},
+                np.asarray(control, dtype=np.float32),
+            )
+        except Exception as exc:
+            profile_shadow = {
+                "enabled": False,
+                "shadow_only": True,
+                "reason": "profile_rspc_shadow_error",
+                "error": str(exc),
+            }
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            self.last_rollout_selection["profile_rspc_shadow"] = profile_shadow
+            if bool(getattr(self.config, "profile_action_candidate_shadow_enabled", False)) and bool(
+                getattr(self.config, "profile_action_candidate_shadow_record_provenance", True)
+            ):
+                try:
+                    profile_action_shadow = self._compose_profile_action_candidates_shadow(profile_shadow)
+                except Exception as exc:
+                    profile_action_shadow = {
+                        "enabled": False,
+                        "shadow_only": True,
+                        "schema_version": "profile_action_candidate_shadow_v69",
+                        "reason": "profile_action_candidate_shadow_error",
+                        "error": str(exc),
+                        "final_action_changed": False,
+                        "candidate_count": 0,
+                        "eligible_candidate_count": 0,
+                        "candidates": [],
+                    }
+                self.last_rollout_selection["profile_action_candidate_shadow"] = profile_action_shadow
+            if bool(getattr(self.config, "profile_action_envelope_shadow_enabled", False)) and bool(
+                getattr(self.config, "profile_action_envelope_shadow_record_provenance", True)
+            ):
+                try:
+                    profile_action_envelope_shadow = self._compose_profile_action_envelopes_shadow(profile_shadow)
+                except Exception as exc:
+                    profile_action_envelope_shadow = {
+                        "enabled": False,
+                        "shadow_only": True,
+                        "schema_version": "profile_action_envelope_shadow_v74",
+                        "reason": "profile_action_envelope_shadow_error",
+                        "error": str(exc),
+                        "final_action_changed": False,
+                        "candidate_count": 0,
+                        "eligible_candidate_count": 0,
+                        "candidates": [],
+                    }
+                self.last_rollout_selection["profile_action_envelope_shadow"] = profile_action_envelope_shadow
 
         target_temp = self._get_plan_target(plan, "target_temp", state)
         if target_temp is not None:
@@ -3874,12 +9328,15 @@ class RuleBasedLLMDirector:
         )
         if dry_side_risk:
             before = np.asarray(control, dtype=np.float32).copy()
+            hot_dry_features = self._rspc_hot_dry_features(state)
             if temp_air >= 28.0:
                 vent_cap = float(self.config.dry_hot_vent_cap)
             elif temp_air >= 24.0:
                 vent_cap = float(self.config.dry_warm_vent_cap)
             else:
                 vent_cap = float(self.config.dry_vent_cap)
+            if hot_dry_features["active"]:
+                vent_cap = max(vent_cap, self._rspc_hot_dry_vent_relief_floor(state, hot_dry_features))
             control[3] = min(control[3], vent_cap)
             control[1] = 0.0
             control[4] = 0.0
@@ -3900,11 +9357,40 @@ class RuleBasedLLMDirector:
                 "applied": True,
                 "rh_air": float(state.rh_air),
                 "vpd": float(vpd_now),
+                "hot_dry_vent_relief": bool(hot_dry_features["active"]),
+                "vent_cap": float(vent_cap),
                 "before": before.tolist(),
                 "after": np.asarray(control, dtype=np.float32).tolist(),
             }
+            self._record_post_guardrail_runtime_provenance(
+                state,
+                hook_id="dry_recovery_override",
+                source_function="_plan_control_step",
+                pre_rule_action=before,
+                post_rule_action=np.asarray(control, dtype=np.float32),
+                info=self.last_rollout_selection.get("dry_recovery_override", {}),
+            )
         else:
             self.last_rollout_selection.setdefault("dry_recovery_override", {"applied": False})
+
+        control = self._apply_hot_dry_proposer_control_access(
+            state,
+            np.asarray(control, dtype=np.float32),
+            (
+                self.last_rollout_selection.get("rspc_action_scoring", {})
+                if isinstance(getattr(self, "last_rollout_selection", None), dict)
+                else {}
+            ),
+        )
+
+        if isinstance(getattr(self, "last_rollout_selection", None), dict):
+            scoring_audit = self.last_rollout_selection.get("rspc_action_scoring", {})
+            reference_control = None
+            if isinstance(scoring_audit, Mapping):
+                reference_control = self._control_from_terms(scoring_audit.get("post_shape_selected_action", {}))
+                if reference_control is None:
+                    reference_control = self._control_from_terms(scoring_audit.get("selected_action", {}))
+            self._store_post_guardrail_final_risk_shadow(state, reference_control, np.asarray(control, dtype=np.float32))
 
         return (
             np.asarray(control, dtype=np.float32),
@@ -3998,6 +9484,208 @@ class RuleBasedLLMDirector:
             "critical_violations": critical_violations,
             "critical_level": critical_level,
         }
+
+    def _transition_gate_action_record(self, control: Sequence[float] | np.ndarray) -> Dict[str, float]:
+        values = np.asarray(control, dtype=np.float32).reshape(-1)
+        return {
+            name: float(values[idx]) if idx < int(values.size) else 0.0
+            for idx, name in enumerate(ACTION_NAMES)
+        }
+
+    def _transition_gate_load_soft_limits(self) -> Dict[str, Dict[str, float]]:
+        if self._transition_gate_soft_limits is not None:
+            return self._transition_gate_soft_limits
+
+        default_limits = {
+            "neutral_or_mild": {name: 0.20 for name in ("heating", "ventilation", "screen", "shading")}
+        }
+        path_text = str(getattr(self.config, "transition_gate_soft_limit_path", "") or "").strip()
+        if not path_text:
+            self._transition_gate_soft_limits = default_limits
+            self._transition_gate_soft_limit_source = "default_no_path"
+            self._transition_gate_soft_limit_error = ""
+            return self._transition_gate_soft_limits
+
+        try:
+            path = Path(path_text)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            limits: Dict[str, Dict[str, float]] = {}
+            for item in payload.get("transition_stats_by_regime", []) or []:
+                if str(item.get("label", "")) != "stable_positive":
+                    continue
+                regime = str(item.get("regime", "neutral_or_mild") or "neutral_or_mild")
+                stats = item.get("action_delta_stats", {}) or {}
+                limits.setdefault(regime, {})
+                for name in ("heating", "ventilation", "screen", "shading"):
+                    stat = stats.get(f"u_{name}", {}) or {}
+                    raw_limit = _pg_float(stat.get("p95"), 0.20)
+                    limits[regime][name] = float(max(0.02, min(raw_limit if raw_limit > 0 else 0.20, 0.20)))
+            self._transition_gate_soft_limits = limits or default_limits
+            self._transition_gate_soft_limit_source = str(path)
+            self._transition_gate_soft_limit_error = ""
+        except Exception as exc:
+            self._transition_gate_soft_limits = default_limits
+            self._transition_gate_soft_limit_source = path_text
+            self._transition_gate_soft_limit_error = str(exc)
+        return self._transition_gate_soft_limits
+
+    def _transition_gate_limit_for(self, regime: str, action_name: str) -> float:
+        limits = self._transition_gate_load_soft_limits()
+        if regime in limits and action_name in limits[regime]:
+            return float(limits[regime][action_name])
+        if "neutral_or_mild" in limits and action_name in limits["neutral_or_mild"]:
+            return float(limits["neutral_or_mild"][action_name])
+        return 0.20
+
+    def _transition_gate_regime(self, state: Any) -> str:
+        temp_air = _pg_state_float(state, "temp_air", 20.0)
+        rh_air = _pg_state_float(state, "rh_air", 70.0)
+        vpd = float(calculate_vpd_kpa(temp_air, rh_air))
+        dew_margin_air = _pg_state_float(state, "dew_margin_air", 3.0)
+        canopy_margin = _pg_state_float(state, "canopy_dew_margin", dew_margin_air)
+        if bool(getattr(state, "dew_risk", False)) or canopy_margin < 3.0:
+            return "dew_or_canopy_risk"
+        if bool(getattr(state, "dry_risk", False)) or (vpd >= 2.25 and rh_air <= 45.0):
+            return "hot_dry_pressure"
+        if rh_air >= 85.0:
+            return "high_humidity"
+        if temp_air >= 28.0:
+            return "warm_or_hot"
+        return "neutral_or_mild"
+
+    def _transition_gate_bypass_reasons(self, state: Any) -> List[str]:
+        if not bool(getattr(self.config, "transition_gate_hard_safety_bypass", True)):
+            return []
+        reasons: List[str] = []
+        tomato = getattr(self, "last_tomato_safety_v2", {}) or {}
+        if isinstance(tomato, Mapping) and bool(tomato.get("applied", False)):
+            reasons.append("tomato_safety_v2_applied")
+        if bool(getattr(state, "dew_risk", False)):
+            reasons.append("dew_risk")
+        dew_margin_air = _pg_state_float(state, "dew_margin_air", 3.0)
+        canopy_margin = _pg_state_float(state, "canopy_dew_margin", dew_margin_air)
+        if canopy_margin < 3.0:
+            reasons.append("canopy_dew_margin_lt3")
+        return reasons
+
+    def _transition_gate_recent_reversal(self, action_name: str, sign: int) -> bool:
+        if sign == 0:
+            return False
+        history = self._transition_gate_sign_history.get(action_name)
+        if history is None:
+            return False
+        return any(int(previous) != 0 and int(previous) != sign for previous in history)
+
+    def _transition_gate_update_sign_history(self, previous: np.ndarray, current: np.ndarray) -> None:
+        for idx, name in enumerate(ACTION_NAMES):
+            if idx >= len(previous) or idx >= len(current):
+                continue
+            delta = float(current[idx] - previous[idx])
+            sign = 1 if delta > 1e-6 else -1 if delta < -1e-6 else 0
+            if sign:
+                self._transition_gate_sign_history.setdefault(
+                    name,
+                    deque(maxlen=max(1, int(getattr(self.config, "transition_gate_reversal_window_steps", 6) or 6))),
+                ).append(sign)
+
+    def _apply_transition_gate(self, control: Sequence[float] | np.ndarray, state: Any) -> np.ndarray:
+        original = np.asarray(control, dtype=np.float32).reshape(-1).copy()
+        if not bool(getattr(self.config, "transition_gate_enabled", False)):
+            self.last_transition_gate = {
+                "enabled": False,
+                "applied": False,
+                "bypassed": False,
+            }
+            return original
+
+        action_size = max(len(ACTION_NAMES), int(original.size))
+        if int(original.size) < action_size:
+            padded = np.zeros(action_size, dtype=np.float32)
+            padded[: int(original.size)] = original
+            original = padded
+
+        if self._transition_gate_previous_action is None:
+            self._transition_gate_previous_action = original.copy()
+            self.last_transition_gate = {
+                "enabled": True,
+                "applied": False,
+                "bypassed": False,
+                "reason": "initial_action",
+                "regime": self._transition_gate_regime(state),
+                "before": self._transition_gate_action_record(original),
+                "after": self._transition_gate_action_record(original),
+                "soft_limit_source": self._transition_gate_soft_limit_source,
+                "soft_limit_error": self._transition_gate_soft_limit_error,
+            }
+            return original
+
+        previous = self._transition_gate_previous_action.copy()
+        bypass_reasons = self._transition_gate_bypass_reasons(state)
+        regime = self._transition_gate_regime(state)
+        adjusted = original.copy()
+        adjusted_fields: List[str] = []
+        reversal_fields: List[str] = []
+        delta_limited_count = 0
+        reversal_projected_count = 0
+
+        if bypass_reasons:
+            self._transition_gate_update_sign_history(previous, original)
+            self._transition_gate_previous_action = original.copy()
+            self.last_transition_gate = {
+                "enabled": True,
+                "applied": False,
+                "bypassed": True,
+                "bypass_reasons": list(bypass_reasons),
+                "regime": regime,
+                "before": self._transition_gate_action_record(original),
+                "after": self._transition_gate_action_record(original),
+                "soft_limit_source": self._transition_gate_soft_limit_source,
+                "soft_limit_error": self._transition_gate_soft_limit_error,
+            }
+            return original
+
+        for action_name in ("heating", "ventilation", "screen", "shading"):
+            idx = ACTION_NAMES.index(action_name)
+            desired_delta = float(original[idx] - previous[idx])
+            sign = 1 if desired_delta > 1e-6 else -1 if desired_delta < -1e-6 else 0
+            limit = self._transition_gate_limit_for(regime, action_name)
+            if self._transition_gate_recent_reversal(action_name, sign):
+                clipped_delta = 0.0
+                reversal_fields.append(action_name)
+                reversal_projected_count += 1
+            else:
+                clipped_delta = float(max(-limit, min(limit, desired_delta)))
+            if abs(clipped_delta - desired_delta) > 1e-9:
+                adjusted_fields.append(action_name)
+                delta_limited_count += 1
+            adjusted[idx] = float(np.clip(previous[idx] + clipped_delta, 0.0, 1.0))
+
+        for action_name in ("co2", "lighting"):
+            idx = ACTION_NAMES.index(action_name)
+            adjusted[idx] = original[idx]
+
+        self._transition_gate_update_sign_history(previous, adjusted)
+        self._transition_gate_previous_action = adjusted.copy()
+        applied = bool(np.max(np.abs(adjusted - original)) > 1e-9)
+        self.last_transition_gate = {
+            "enabled": True,
+            "applied": applied,
+            "bypassed": False,
+            "bypass_reasons": [],
+            "regime": regime,
+            "before": self._transition_gate_action_record(original),
+            "after": self._transition_gate_action_record(adjusted),
+            "adjusted_fields": adjusted_fields,
+            "reversal_fields": reversal_fields,
+            "delta_limited_count": int(delta_limited_count),
+            "reversal_projected_count": int(reversal_projected_count),
+            "reversal_window_steps": int(getattr(self.config, "transition_gate_reversal_window_steps", 6) or 6),
+            "soft_limit_source": self._transition_gate_soft_limit_source,
+            "soft_limit_error": self._transition_gate_soft_limit_error,
+        }
+        return adjusted.astype(np.float32)
     
     def step_with_rules(self) -> Dict:
         """
@@ -4012,18 +9700,27 @@ class RuleBasedLLMDirector:
 
         replan_reason = None
         self.last_tomato_safety_v2_suppressed_replan = {"applied": False}
+        self.last_strict_replay_suppressed_replan = {"applied": False}
         if not self._is_plan_active(int(state.timestep)):
             replan_reason = "init_plan" if self.current_plan is None else "plan_expired"
+        elif self._should_follow_strict_replay_frozen_replan_step(state):
+            replan_reason = "frozen_replan"
         elif self._should_emergency_replan(analysis, state):
-            if self._should_suppress_tomato_v2_replay_emergency_replan():
-                self.tomato_safety_v2_suppressed_replan_steps += 1
-                self.last_tomato_safety_v2_suppressed_replan = {
+            if (
+                self._should_suppress_strict_replay_emergency_replan()
+                and not self._has_strict_replay_plan_for_step(state)
+            ):
+                suppressed = {
                     "applied": True,
                     "step": int(state.timestep),
                     "reason": "emergency_replan",
                     "critical_level": str(analysis.get("critical_level", "normal")),
                     "critical_violations": list(analysis.get("critical_violations", [])),
                 }
+                self.last_strict_replay_suppressed_replan = dict(suppressed)
+                if bool(getattr(self.config, "tomato_safety_v2_enabled", False)):
+                    self.tomato_safety_v2_suppressed_replan_steps += 1
+                    self.last_tomato_safety_v2_suppressed_replan = dict(suppressed)
                 self.emergency_streak_steps = 0
                 self.rh_emergency_streak_steps = 0
             else:
@@ -4087,6 +9784,13 @@ class RuleBasedLLMDirector:
         control, rule_control, anchor_control, rule_weight = self._plan_control_step(state)
         buffered_control = self._buffer_control(control)
         final_control = self._flush_buffered_control(state)
+        final_control = self._apply_transition_gate(final_control, state)
+        self._run_cstcc_shadow_runtime_hook(
+            state,
+            final_control,
+            rule_control=rule_control,
+            anchor_control=anchor_control,
+        )
         
         # v2.1.2: 计算性能指标
         if self.current_plan is not None:
@@ -4100,6 +9804,30 @@ class RuleBasedLLMDirector:
             current_target_temp = self._get_plan_target(self.current_plan, "target_temp", state)
             current_target_co2 = self._get_plan_target(self.current_plan, "target_co2", state)
             current_target_rh = self._get_plan_target(self.current_plan, "target_rh", state)
+            current_target_temp, current_target_co2, current_target_rh, _gate_record = self._apply_profile_feasibility_gate_targets(
+                state,
+                np.asarray(final_control, dtype=np.float32),
+                current_target_temp,
+                current_target_co2,
+                current_target_rh,
+                source="plan_info_current_targets",
+                update_last=True,
+            )
+            current_target_temp, current_target_co2, current_target_rh, _template_record = self._apply_profile_template_patch_targets(
+                state,
+                np.asarray(final_control, dtype=np.float32),
+                current_target_temp,
+                current_target_co2,
+                current_target_rh,
+                source="plan_info_current_targets",
+                update_last=True,
+            )
+            if isinstance(getattr(self, "last_profile_feasibility_gate", None), dict):
+                self.last_profile_feasibility_gate["hard_safety_veto_count"] = int(
+                    self.last_rollout_selection.get("profile_feasibility_gate_hard_safety_veto_count", 0)
+                    if isinstance(getattr(self, "last_rollout_selection", None), dict)
+                    else 0
+                )
             plan_info = {
                 "created_timestep": int(self.current_plan.get("created_timestep", int(state.timestep))),
                 "expires_timestep": expires_timestep,
@@ -4113,11 +9841,31 @@ class RuleBasedLLMDirector:
                 "target_profile": self.current_plan.get("target_profile", {}),
                 "profile_contract": self.current_plan.get("profile_contract", {}),
                 "setpoint_contract": self.current_plan.get("setpoint_contract", {}),
+                "intent_contract": self.current_plan.get("intent_contract", {}),
+                "intent_contract_diagnostics": self.current_plan.get("intent_contract_diagnostics", {}),
+                "profile_candidates": self.current_plan.get("profile_candidates", []),
+                "profile_generator_diagnostics": self.current_plan.get("profile_generator_diagnostics", {}),
+                **(
+                    {
+                        "structured_anchor_profile_bridge": self.current_plan.get(
+                            "structured_anchor_profile_bridge",
+                            dict(getattr(self, "last_structured_anchor_profile_bridge", {})),
+                        ),
+                        "structured_anchor_profile_bridge_candidates": self.current_plan.get(
+                            "structured_anchor_profile_bridge_candidates",
+                            [],
+                        ),
+                    }
+                    if bool(getattr(self.config, "structured_anchor_profile_bridge_enabled", False))
+                    and bool(getattr(self.config, "structured_anchor_profile_bridge_record_provenance", True))
+                    else {}
+                ),
                 "rule_weight": rule_weight,
                 "reason": self.current_plan.get("reason"),
                 "anchor_source": self.current_plan.get("anchor_source", "unknown"),
                 "fallback_selection": self.current_plan.get("fallback_selection", {}),
                 "plan_cache_event": self.current_plan.get("plan_cache_event", dict(getattr(self, "last_plan_cache_event", {}))),
+                "structured_anchor": self.current_plan.get("structured_anchor", dict(getattr(self, "last_structured_anchor", {}))),
                 "rollout_selection": dict(getattr(self, "last_rollout_selection", {})),
                 "dehumidify_mode": self.dehumidify_mode,
                 "rh_violation_debt": self.rh_violation_debt,
@@ -4164,5 +9912,28 @@ class RuleBasedLLMDirector:
             "rule_control": rule_control.tolist(),
             "buffered_control": np.asarray(buffered_control, dtype=np.float32).tolist(),
             "applied_control": np.asarray(final_control, dtype=np.float32).tolist(),
+            "transition_gate": dict(getattr(self, "last_transition_gate", {})),
+            **(
+                {"profile_feasibility_gate": dict(getattr(self, "last_profile_feasibility_gate", {}))}
+                if bool(getattr(self.config, "profile_feasibility_gate_enabled", False))
+                else {}
+            ),
+            **(
+                {"profile_template_patch": dict(getattr(self, "last_profile_template_patch", {}))}
+                if bool(getattr(self.config, "profile_template_patch_record_provenance", True))
+                else {}
+            ),
+            "structured_anchor": dict(getattr(self, "last_structured_anchor", {})),
+            **(
+                {"structured_anchor_profile_bridge": dict(getattr(self, "last_structured_anchor_profile_bridge", {}))}
+                if bool(getattr(self.config, "structured_anchor_profile_bridge_enabled", False))
+                and bool(getattr(self.config, "structured_anchor_profile_bridge_record_provenance", True))
+                else {}
+            ),
+            **(
+                {"cstcc_shadow": dict(getattr(self, "last_cstcc_shadow", {}))}
+                if bool(getattr(self.config, "cstcc_shadow_enabled", False))
+                else {}
+            ),
             "fallback_selection": dict(self.last_fallback_selection),
         }

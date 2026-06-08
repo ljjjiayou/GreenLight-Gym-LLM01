@@ -76,16 +76,19 @@ class TestFrozenBenchmarkProtocol(unittest.TestCase):
                         "entries": {
                             "a": {
                                 "env_id": "TomatoEnv_y2010_d59_s42",
+                                "timestep": 0,
                                 "buffered_action": {"u_boil": 0.1},
                                 "parsed_plan": {"target_rh": 76.0},
                             },
                             "b": {
                                 "env_id": "TomatoEnv_y2010_d59_s42",
+                                "timestep": 12,
                                 "buffered_action": {"u_boil": 0.2},
                                 "parsed_plan": {"target_rh": 75.0},
                             },
                             "c": {
                                 "env_id": "TomatoEnv_y2010_d120_s42",
+                                "key_payload": {"state_summary": {"timestep": 24}},
                                 "llm_action_found": False,
                             },
                         },
@@ -110,6 +113,9 @@ class TestFrozenBenchmarkProtocol(unittest.TestCase):
         self.assertIn("TomatoEnv_y2010_d120_s42", result["low_coverage_envs"])
         self.assertEqual(result["written_empty_count"], 1)
         self.assertEqual(result["missing_buffered_action_count"], 1)
+        self.assertEqual(result["envs"]["TomatoEnv_y2010_d59_s42"]["timesteps"], [0, 12])
+        self.assertEqual(result["envs"]["TomatoEnv_y2010_d59_s42"]["max_timestep"], 12)
+        self.assertEqual(result["envs"]["TomatoEnv_y2010_d120_s42"]["timesteps"], [24])
 
     def test_validate_strict_replay_result_flags_cache_miss(self):
         result = {
@@ -130,6 +136,51 @@ class TestFrozenBenchmarkProtocol(unittest.TestCase):
         self.assertEqual(check["failure_count"], 1)
         self.assertIn("cache_not_hit_all_steps", check["failures"][0]["reasons"])
         self.assertIn("unknown_source_steps", check["failures"][0]["reasons"])
+
+    def test_validate_strict_replay_result_classifies_runtime_cache_miss(self):
+        result = {
+            "summaries": [
+                _summary(
+                    "y2020_d240_s44_n240",
+                    "llm_rspc_v2",
+                    steps=25,
+                    plan_cache_enabled_steps=25,
+                    plan_cache_hit_steps=24,
+                    source_counts={"anchor": 24, "runtime_error": 1},
+                    runtime_error_steps=1,
+                    strict_cache_miss_runtime_error_steps=1,
+                )
+            ]
+        }
+
+        check = validate_strict_replay_result(result)
+
+        self.assertFalse(check["ok"])
+        reasons = check["failures"][0]["reasons"]
+        self.assertNotIn("cache_not_enabled_all_steps", reasons)
+        self.assertIn("cache_not_hit_all_steps", reasons)
+        self.assertIn("runtime_error_steps", reasons)
+        self.assertIn("strict_cache_miss_runtime_error_steps", reasons)
+        self.assertNotIn("unknown_source_steps", reasons)
+        self.assertEqual(check["failures"][0]["runtime_error_steps"], 1)
+
+    def test_validate_strict_replay_result_accepts_clean_early_done(self):
+        result = {
+            "summaries": [
+                _summary(
+                    "y2015_d240_s44_n25",
+                    "llm",
+                    steps=25,
+                    plan_cache_enabled_steps=25,
+                    plan_cache_hit_steps=25,
+                    source_counts={"anchor": 25},
+                )
+            ]
+        }
+
+        check = validate_strict_replay_result(result)
+
+        self.assertTrue(check["ok"])
 
     def test_shadow_invariance_accepts_diagnostics_only(self):
         result = {

@@ -1,0 +1,8 @@
+bonus,conservative_risk_selected_count,conservative_risk_selected_rate,conservative_selected_count,nonrisk_conservative_selected_count,risk_row_count,row_count,selected_switch_count,selected_switch_rate,switch_from_other_to_conservative_count,switch_from_ppo_to_conservative_count,switch_from_previous_to_conservative_count,switch_from_rule_to_conservative_count
+0.0,0,0.0,0,0,126,720,248,0.34444444444444444,0,0,0,0
+0.02,0,0.0,0,0,126,720,248,0.34444444444444444,0,0,0,0
+0.04,0,0.0,0,0,126,720,248,0.34444444444444444,0,0,0,0
+0.06,46,0.36507936507936506,46,0,126,720,294,0.4083333333333333,0,0,46,0
+0.08,66,0.5238095238095238,66,0,126,720,314,0.4361111111111111,0,0,66,0
+0.1,77,0.6111111111111112,77,0,126,720,325,0.4513888888888889,0,0,77,0
+0.12,126,1.0,126,0,126,720,374,0.5194444444444445,0,0,126,0

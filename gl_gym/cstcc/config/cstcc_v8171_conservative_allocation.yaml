@@ -1,0 +1,137 @@
+version: v80
+controller_changed: false
+default_controller_changed: false
+final_action_changed: false
+online_llm_enabled: false
+prediction_level: 0
+score_validity: sequence_only_no_rollout
+
+semantic_state_machine:
+  allowed_regimes:
+    - NORMAL_BALANCED
+    - HEAT_ACCUMULATION
+    - HIGH_VPD_DRY_STRESS
+    - HUMIDITY_EXCESS_DISEASE_RISK
+    - LOW_LIGHT_ENERGY_SAVING
+    - CO2_VENTILATION_CONFLICT
+    - SOLVER_SENSITIVE_EMERGENCY
+  confidence_threshold: 0.70
+  emergency_regimes:
+    - SOLVER_SENSITIVE_EMERGENCY
+  min_hold_steps:
+    NORMAL_BALANCED: 6
+    HEAT_ACCUMULATION: 6
+    HIGH_VPD_DRY_STRESS: 8
+    HUMIDITY_EXCESS_DISEASE_RISK: 8
+    LOW_LIGHT_ENERGY_SAVING: 12
+    CO2_VENTILATION_CONFLICT: 4
+    SOLVER_SENSITIVE_EMERGENCY: 1
+
+weight_governor:
+  alpha_max: 0.30
+  confidence_mode: min
+  default_weight_profile: balanced
+  weight_bounds:
+    temperature_tracking: [0.10, 0.45]
+    humidity_recovery: [0.05, 0.35]
+    vpd_risk: [0.20, 0.55]
+    energy: [0.05, 0.25]
+    action_smoothness: [0.10, 0.35]
+    rewrite_pressure: [0.05, 0.30]
+    solver_risk: [0.05, 0.35]
+  default_weights:
+    temperature_tracking: 0.20
+    humidity_recovery: 0.15
+    vpd_risk: 0.25
+    energy: 0.10
+    action_smoothness: 0.15
+    rewrite_pressure: 0.10
+    solver_risk: 0.05
+
+temporal_context:
+  delta_t_hours: 0.08333333333333333
+  short_window_hours: 0.5
+  medium_window_hours: 2.0
+  long_window_hours: 6.0
+  gamma: 0.94
+  debt_refs:
+    vpd_debt_kpa_h: 0.60
+    heat_debt_c_h: 2.00
+    dryness_debt_rh_h: 12.00
+
+prior_confidence:
+  min_conf: 0.05
+  max_conf: 1.0
+  emergency_zero_priors:
+    - ppo_prior
+    - previous_plan_prior
+  candidate_count_bins:
+    - [0.00, 0]
+    - [0.10, 1]
+    - [0.30, 2]
+    - [0.60, 3]
+    - [0.85, 4]
+
+candidate_allocation:
+  conservative_risk_candidate_floor:
+    enabled: true
+    floor_count: 1
+    trigger_flags:
+      - any_risk
+
+sequence_generation:
+  horizon: 12
+  max_candidates: 20
+  templates:
+    - hold_all
+    - previous_shift_all
+    - ventilation_ramp_limited
+    - heating_smooth_recover
+    - co2_vent_conflict_reduce
+    - screen_dwell_hold
+    - ppo_follow_limited
+    - conservative_stabilize
+
+constraints:
+  action_min: 0.0
+  action_max: 1.0
+  max_delta:
+    u_heating: 0.20
+    u_co2: 0.25
+    u_screen: 0.20
+    u_ventilation: 0.20
+    u_lighting: 0.30
+    u_shading: 0.20
+  conflict_thresholds:
+    high_ventilation: 0.75
+    high_heating: 0.60
+    high_co2: 0.50
+
+scoring:
+  level: 0
+  use_predictive_rollout: false
+  prior_confidence_score_weight: 0.08
+  risk_static_hold_penalty: 0.25
+  risk_static_hold_divergence_threshold: 0.10
+  rewrite_penalty_enabled: true
+  lambda_rewrite: 0.25
+  lambda_reason:
+    minor: 0.02
+    medium: 0.05
+    high: 0.10
+    critical: 0.20
+
+diagnostics:
+  scorer_diagnostic_enabled: true
+  scorer_component_audit_enabled: true
+  scorer_diagnostic_log_mode: diagnostic_full
+  debug_full_metadata: false
+  compact_metadata: true
+
+audit:
+  enabled: true
+  sample_rate: 1.0
+  save_full_candidates: false
+  save_raw_sequences: false
+  save_projected_sequences: false
+  max_sequence_dump: 20

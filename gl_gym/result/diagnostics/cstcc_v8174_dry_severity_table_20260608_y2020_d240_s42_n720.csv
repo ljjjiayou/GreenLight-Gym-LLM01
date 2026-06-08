@@ -1,0 +1,49 @@
+dry_risk_age_steps,dry_severity,dry_severity_rank,dry_severity_reasons,dry_vent_age_steps,hour_of_day,resolved_risk_family,rh_air,risk_combo_id,step,strong_guard_allowed,vpd_air
+1,moderate,2,"[""dry_vent_not_severe"", ""high_vpd_flag"", ""rh_lt_65"", ""vpd_ge_1_15""]",1,12.75,dry_vent,61.295667010719875,dry_vent+dry_or_high_vpd,147,False,1.2047857653139369
+2,moderate,2,"[""dry_vent_not_severe"", ""high_vpd_flag"", ""rh_lt_65"", ""vpd_ge_1_15""]",2,13.0,dry_vent,58.33907553642014,dry_vent+dry_or_high_vpd,148,False,1.3962148257163356
+3,moderate,2,"[""dry_vent_not_severe"", ""high_vpd_flag"", ""rh_lt_65"", ""vpd_ge_1_15""]",3,13.25,dry_vent,57.73331210615125,dry_vent+dry_or_high_vpd,149,False,1.4480664926274105
+4,severe,3,"[""sustained_dry_vent_age_ge_4""]",4,13.5,dry_vent,58.95467966631317,dry_vent+dry_or_high_vpd,150,True,1.365927385989567
+5,severe,3,"[""sustained_dry_vent_age_ge_4""]",5,13.75,dry_vent,60.15452053990635,dry_vent+dry_or_high_vpd,151,True,1.2807424431579622
+1,moderate,2,"[""rh_lt_65"", ""vpd_ge_1_15""]",0,9.75,dry_or_high_vpd,54.403473946942555,dry_or_high_vpd,327,False,1.1683724760271632
+2,severe,3,"[""dry_vent_and_rh_le_54""]",1,10.0,dry_vent,53.458179694769285,dry_vent+dry_or_high_vpd,328,True,1.4527875555007945
+3,severe,3,"[""vpd_ge_1_50"", ""dry_vent_and_rh_le_54""]",2,10.25,dry_vent,51.87587327345088,dry_vent+dry_or_high_vpd,329,True,1.5513566063180169
+4,severe,3,"[""vpd_ge_1_50"", ""dry_vent_and_rh_le_54""]",3,10.5,dry_vent,51.686250794621095,dry_vent+dry_or_high_vpd,330,True,1.592277385998778
+5,severe,3,"[""vpd_ge_1_50"", ""dry_vent_and_rh_le_54"", ""sustained_dry_vent_age_ge_4""]",4,10.75,dry_vent,51.695405871901585,dry_vent+dry_or_high_vpd,331,True,1.6275083589275892
+6,severe,3,"[""vpd_ge_1_50"", ""dry_vent_and_rh_le_54"", ""sustained_dry_vent_age_ge_4""]",5,11.0,dry_vent,51.74183604493684,dry_vent+dry_or_high_vpd,332,True,1.6620371174397184
+7,severe,3,"[""vpd_ge_1_50"", ""dry_vent_and_rh_le_54"", ""sustained_dry_vent_age_ge_4""]",6,11.25,dry_vent,51.79783594592986,dry_vent+dry_or_high_vpd,333,True,1.695578869261264
+8,severe,3,"[""vpd_ge_1_50"", ""dry_vent_and_rh_le_54"", ""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",7,11.5,dry_vent,53.36330045573909,dry_vent+dry_or_high_vpd,334,True,1.5901324920779896
+9,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",8,11.75,dry_vent,54.90178649761487,dry_vent+dry_or_high_vpd,335,True,1.4771644616794477
+10,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",9,12.0,dry_vent,56.55553498059691,dry_vent+dry_or_high_vpd,336,True,1.358580712124477
+11,severe,3,"[""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,12.25,dry_or_high_vpd,58.38812310006019,dry_or_high_vpd,337,True,1.2350918615288222
+1,moderate,2,"[""rh_lt_65""]",0,14.75,dry_or_high_vpd,54.543955133982806,dry_or_high_vpd,347,False,1.033350685721216
+1,moderate,2,"[""rh_lt_65""]",0,15.25,dry_or_high_vpd,52.6799345212631,dry_or_high_vpd,349,False,1.0954030044238166
+1,moderate,2,"[""rh_lt_65""]",0,15.75,dry_or_high_vpd,53.59656707650643,dry_or_high_vpd,351,False,1.0624972137768702
+1,moderate,2,"[""rh_lt_65""]",0,16.25,dry_or_high_vpd,54.583727892648966,dry_or_high_vpd,353,False,1.0251511466794947
+1,moderate,2,"[""rh_lt_65"", ""vpd_ge_1_15""]",0,8.25,dry_or_high_vpd,54.340651978632344,dry_or_high_vpd,417,False,1.1641077763240355
+2,moderate,2,"[""dry_vent_not_severe"", ""high_vpd_flag"", ""rh_lt_65"", ""vpd_ge_1_15""]",1,8.5,dry_vent,57.641921711275685,dry_vent+dry_or_high_vpd,418,False,1.2767945703295254
+1,moderate,2,"[""high_vpd_flag"", ""rh_lt_65"", ""vpd_ge_1_15""]",0,8.75,dry_or_high_vpd,55.69450189657129,dry_or_high_vpd,515,False,1.2757504453085513
+2,severe,3,"[""vpd_ge_1_50""]",1,9.0,canopy_dew_lt0,56.48044449802184,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,516,True,1.6204413170818737
+3,severe,3,"[""vpd_ge_1_50""]",0,9.25,canopy_dew_lt0,57.79677524120706,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,517,True,1.6477359430766803
+4,severe,3,"[""vpd_ge_1_50""]",1,9.5,canopy_dew_lt0,56.246076591047284,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,518,True,1.5893294871831878
+5,severe,3,"[""vpd_ge_1_50""]",0,9.75,canopy_dew_lt0,57.88361818482696,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,519,True,1.6505964533360913
+6,severe,3,"[""vpd_ge_1_50""]",1,10.0,canopy_dew_lt0,57.119653847492,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,520,True,1.568312406336445
+7,severe,3,"[""vpd_ge_1_50""]",0,10.25,canopy_dew_lt0,58.81320447398285,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,521,True,1.6171236359402499
+8,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",1,10.5,canopy_dew_lt0,56.82644935479121,dry_vent+canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,522,True,1.6166821087162488
+9,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,10.75,canopy_dew_lt0,57.381410614229004,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,523,True,1.758871570127371
+10,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,11.0,canopy_dew_lt0,55.21030446494242,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,524,True,1.758468468511252
+11,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,11.25,canopy_dew_lt0,53.36645335382814,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,525,True,1.8563522470299416
+12,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,11.5,canopy_dew_lt0,53.16310885178364,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,526,True,1.8459028888199025
+13,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,11.75,canopy_dew_lt1,53.10321559963851,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,527,True,1.8270162345894612
+14,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,12.0,canopy_dew_lt1,53.070604710145524,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,528,True,1.805809918055912
+15,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,12.25,canopy_dew_lt1,53.54282700115008,canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,529,True,1.8066311050764385
+16,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",1,12.5,dry_vent,54.801782048047585,dry_vent+dry_or_high_vpd,530,True,1.6611314003850348
+17,severe,3,"[""vpd_ge_1_50"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",0,12.75,canopy_dew_lt0,57.906522029309336,canopy_dew_lt0+dew_or_humidity+dry_or_high_vpd,531,True,1.6194635221056515
+18,severe,3,"[""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",1,13.0,dry_vent,58.930541446226904,dry_vent+dry_or_high_vpd,532,True,1.4098647145616452
+19,severe,3,"[""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",2,13.25,canopy_dew_lt1,61.566475965704385,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,533,True,1.3547738199084725
+20,severe,3,"[""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",3,13.5,canopy_dew_lt1,62.639719977665806,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,534,True,1.3101870978034946
+21,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",4,13.75,canopy_dew_lt1,62.47828254260211,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,535,True,1.303815118226582
+22,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",5,14.0,canopy_dew_lt1,61.796673711750884,dry_vent+canopy_dew_lt1+dew_or_humidity+dry_or_high_vpd,536,True,1.3149287833734555
+23,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",6,14.25,dry_vent,60.96543617664871,dry_vent+dry_or_high_vpd,537,True,1.3318965541448506
+24,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",7,14.5,dry_vent,61.22351602925321,dry_vent+dry_or_high_vpd,538,True,1.2887484309372215
+25,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",8,14.75,dry_vent,61.50166011290346,dry_vent+dry_or_high_vpd,539,True,1.246242296639482
+26,severe,3,"[""sustained_dry_vent_age_ge_4"", ""sustained_dry_risk_age_ge_8_with_vpd_ge_1_20""]",9,15.0,dry_vent,61.76805588947125,dry_vent+dry_or_high_vpd,540,True,1.2066323865284543

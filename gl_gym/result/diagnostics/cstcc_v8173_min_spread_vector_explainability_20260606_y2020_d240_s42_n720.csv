@@ -1,0 +1,3 @@
+conservative_risk_selected_rate,mixed_risk_combo_spread,nonrisk_conservative_selected_count,previous_rule_ppo_suppression_detected,risk_type_switch_spread,rule_suppression_detected,selection_reason,vector_id,vector_role,why_not_selected
+0.8412698412698413,0.0,0,False,0.44999999999999996,False,viable_rate_with_low_combined_family_and_combo_spread,dry=0.06|dry_vent=0.06|dew=0.10|canopy=0.12,best_balanced_vector,
+0.0,0.0,0,False,0.0,False,,dry=0.00|dry_vent=0.00|dew=0.00|canopy=0.00,min_spread_vector,min_spread_vector_conservative_risk_selected_rate_outside_viable_range

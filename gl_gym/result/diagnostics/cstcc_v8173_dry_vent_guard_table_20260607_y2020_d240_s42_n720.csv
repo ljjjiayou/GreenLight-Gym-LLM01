@@ -1,0 +1,2 @@
+mean_action_delta_u_heating,mean_action_delta_u_ventilation,mean_current_ventilation,mean_delta_vpd_hat,mean_dry_vent_relief_hat,mean_dry_vent_worsening_hat,policy,risk_family,row_count
+0.0,0.06,0.18000000715255737,0.3375,0.0,0.45999999999999996,canopy_dew_first_v1,dry_vent,21
